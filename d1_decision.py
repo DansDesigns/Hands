@@ -366,10 +366,24 @@ def stop_server() -> None:
 
 
 def status() -> dict[str, Any]:
+    """Return cheap local status for the high-frequency settings paint loop.
+
+    Do not make an HTTP /health request here: this function is called while
+    painting the Engine settings page, and a stopped/unresponsive server could
+    otherwise block the UI thread for up to 500 ms on every repaint. Startup
+    workers perform readiness probes asynchronously; here we only inspect the
+    child process handle and model-file metadata.
+    """
     key = selected_model()
     model, projector = model_paths(key)
     with _lock:
-        alive = (_server_process is not None and _server_process.poll() is None) or _server_ready()
+        proc = _server_process
+        process_alive = proc is not None and proc.poll() is None
+        # When we launched the server ourselves, its process handle is the
+        # cheapest reliable liveness check. For externally-owned servers, retain
+        # the last asynchronously-confirmed readiness state without probing HTTP
+        # from the UI thread.
+        alive = process_alive or (_ready and proc is None)
         return {"ready": bool(_ready and alive), "loading": _loading_server,
                 "downloading": _downloading, "error": _error, "model": key,
                 "label": MODELS[key]["label"], "model_exists": model.is_file() and projector.is_file(),
