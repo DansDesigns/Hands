@@ -123,7 +123,10 @@ def install_update(source_root: str | Path, destination: str | Path | None = Non
     copied = 0
     for item in source_root.rglob("*"):
         relative = item.relative_to(source_root)
+        # version.txt is user-maintained locally; use the staged copy only to
+        # validate the update version, never overwrite the installed copy.
         if (any(part in protected_dirs for part in relative.parts) or item.name in protected_names
+                or item.name == "version.txt"
                 or item.name.startswith("local_search_index.sqlite3")):
             continue
         if item.is_dir():

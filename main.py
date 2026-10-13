@@ -1305,6 +1305,7 @@ class SpatialDesktop(QWidget):
         self.update_download_path = None
         self.update_action_running = False
         self.update_action_mode = ""
+        self.update_installed = False
         self.update_check_signals = UpdateCheckSignals(self)
         self.update_check_signals.finished.connect(self._on_update_check_finished)
         self.update_check_signals.action_finished.connect(self._on_update_action_finished)
@@ -1846,6 +1847,26 @@ class SpatialDesktop(QWidget):
             self._begin_menu_transition(now)
         return changed
 
+    def _restart_spatial_desktop(self):
+        """Launch a fresh instance, then close this instance."""
+        try:
+            command = [sys.executable, *sys.argv]
+            options = {"cwd": str(ROOT), "close_fds": True}
+            if os.name == "nt":
+                options["creationflags"] = (getattr(subprocess, "DETACHED_PROCESS", 0x00000008)
+                                             | getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0x00000200))
+            else:
+                options["start_new_session"] = True
+            subprocess.Popen(command, **options)
+            self.status = "Restarting Spatial Desktop…"
+            self.update_status = self.status
+            self.update()
+            QTimer.singleShot(250, QApplication.instance().quit)
+        except Exception as exc:
+            self.status = f"Could not restart automatically: {str(exc)[:120]}"
+            self.update_status = self.status
+            self.update()
+
     def _start_update_check(self):
         """One-button update flow: check version, then automatically download if newer."""
         if self.update_check_running or self.update_action_running:
@@ -1959,6 +1980,7 @@ class SpatialDesktop(QWidget):
         if result == "installed":
             self.update_download_path = None
             self.update_available = False
+            self.update_installed = True
         elif result:
             self.update_download_path = result
         elif finished_mode == "download":
@@ -2962,7 +2984,9 @@ class SpatialDesktop(QWidget):
             if self.settings_page == "update":
                 action_button = QRectF(cx-320*scale, cy-170*scale, 290*scale, 46*scale)
                 if action_button.contains(point) and not self.update_action_running and not self.update_check_running:
-                    if self.update_download_path:
+                    if self.update_installed:
+                        self._restart_spatial_desktop()
+                    elif self.update_download_path:
                         self._start_update_install()
                     else:
                         self._start_update_check()
@@ -8275,6 +8299,8 @@ class SpatialDesktop(QWidget):
                     downloading = self.update_action_running and self.update_action_mode == "download"
                     if self.update_action_running:
                         action_label = "INSTALLING…" if self.update_action_mode == "install" else ""
+                    elif self.update_installed:
+                        action_label = "RESTART"
                     elif self.update_download_path:
                         action_label = "INSTALL"
                     else:
