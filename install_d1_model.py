@@ -63,7 +63,10 @@ def _windows_cpu_features() -> tuple[str, bool]:
 def _asset_rank(name: str, arch: str, avx2: bool) -> int:
     """Rank Windows llama.cpp archives, tolerating upstream asset naming changes."""
     n = name.lower()
-    if not n.endswith(".zip") or "win" not in n:
+    # Official asset names currently look like llama-bNNNNN-bin-win-cpu-x64.zip.
+    # Keep a little tolerance for "windows"/renamed release assets, but never
+    # select a clearly non-Windows archive.
+    if not n.endswith(".zip") or not any(token in n for token in ("win", "windows")):
         return -1
     if any(x in n for x in ("cuda", "cudart", "vulkan", "sycl", "opencl", "hip", "rocm", "metal", "kompute")):
         return -1
@@ -100,6 +103,15 @@ def _find_existing_llama_server() -> Path | None:
     import os
     import shutil
     candidates: list[Path] = []
+    explicit = os.environ.get("SPATIAL_DESKTOP_LLAMA_SERVER", "").strip().strip('"')
+    if explicit:
+        explicit_path = Path(os.path.expandvars(explicit)).expanduser()
+        if explicit_path.is_dir():
+            explicit_path = explicit_path / "llama-server.exe"
+        if explicit_path.is_file():
+            candidates.append(explicit_path)
+        else:
+            print(f"WARNING: SPATIAL_DESKTOP_LLAMA_SERVER does not point to a file: {explicit_path}")
     for command in ("llama-server.exe", "llama-server"):
         found = shutil.which(command)
         if found:
@@ -114,7 +126,14 @@ def _find_existing_llama_server() -> Path | None:
         Path(os.environ.get("PROGRAMFILES", r"C:\\Program Files")) / "LM Studio",
         Path(os.environ.get("PROGRAMFILES(X86)", r"C:\\Program Files (x86)")) / "LM Studio",
     ]
-    # Search only likely runtime locations and cap traversal cost.
+    # Also search common development/project folders. Users often have a working
+    # llama.cpp executable inside a different project's venv/tools directory.
+    for name in ("Documents", "Desktop", "source", "Projects", "Development", "Code", "GitHub", "repos"):
+        candidate_root = home / name
+        if candidate_root.is_dir():
+            roots.append(candidate_root)
+    # Search likely runtime/project locations and cap total traversal cost.
+    visited_dirs = 0
     for root in roots:
         try:
             if not root.is_dir():
@@ -127,8 +146,11 @@ def _find_existing_llama_server() -> Path | None:
                 if "llama-server.exe" in files:
                     candidates.append(Path(base) / "llama-server.exe")
                 count += 1
-                if count >= 2500:
+                visited_dirs += 1
+                if count >= 2500 or visited_dirs >= 6000:
                     break
+            if visited_dirs >= 6000:
+                break
         except (OSError, PermissionError):
             continue
 
@@ -183,22 +205,32 @@ def _adopt_existing_llama_server(source_exe: Path, dest: Path) -> bool:
         return False
 
 
-def _probe_llama_server(exe: Path) -> bool:
-    """Reject HTML/error downloads, wrong-architecture executables and missing DLLs."""
-    if not exe.is_file() or exe.stat().st_size < 100_000:
+def _probe_llama_server(exe: Path, verbose: bool = False) -> bool:
+    """Check that a server can launch; optionally print the actual Windows loader error."""
+    if not exe.is_file():
+        if verbose: print(f"    Probe failed: executable not found: {exe}")
         return False
     try:
+        if exe.stat().st_size < 100_000:
+            if verbose: print(f"    Probe failed: executable is unexpectedly small ({exe.stat().st_size} bytes)")
+            return False
         import subprocess
-        result = subprocess.run([str(exe), "--version"], capture_output=True,
-                                text=True, timeout=15,
-                                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
-        output = ((result.stdout or "") + (result.stderr or "")).lower()
-        # llama.cpp versions normally return 0, but accept version output from
-        # builds that use a non-zero status for --version.
-        return result.returncode == 0 and bool(output.strip()) and (
+        result = subprocess.run(
+            [str(exe), "--version"], cwd=str(exe.parent), capture_output=True,
+            text=True, timeout=20,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+        stdout = (result.stdout or "").strip()
+        stderr = (result.stderr or "").strip()
+        output = (stdout + "\n" + stderr).lower()
+        okay = result.returncode == 0 and bool(output.strip()) and (
             "version" in output or "llama" in output or "build" in output
         )
-    except (OSError, subprocess.TimeoutExpired, Exception):
+        if verbose and not okay:
+            print(f"    Probe failed: exit code {result.returncode}; stdout={stdout[:500]!r}; stderr={stderr[:1000]!r}")
+        return okay
+    except Exception as exc:
+        if verbose:
+            print(f"    Probe could not launch executable: {type(exc).__name__}: {exc}")
         return False
 
 
@@ -248,7 +280,7 @@ def install_llama_server(force: bool = False) -> bool:
     headers = {"User-Agent": "SpatialDesktop-installer", "Accept": "application/vnd.github+json"}
     api_urls = [
         "https://api.github.com/repos/ggml-org/llama.cpp/releases/latest",
-        "https://api.github.com/repos/ggml-org/llama.cpp/releases?per_page=5",
+        "https://api.github.com/repos/ggml-org/llama.cpp/releases?per_page=20",
     ]
     releases = []
     last_error = None
@@ -289,9 +321,10 @@ def install_llama_server(force: bool = False) -> bool:
                 asset_name = asset.get("name", "")
                 if asset_name:
                     seen_assets.append(asset_name)
-        print("ERROR: No compatible official Windows CPU archive was found in the release assets returned by GitHub.")
-        print("Release assets seen: " + (", ".join(seen_assets[:12]) if seen_assets else "(none)"))
-        print("A local llama-server was not found either. Check https://github.com/ggml-org/llama.cpp/releases and retry.")
+        print("ERROR: GitHub returned releases, but the installer could not select a Windows CPU archive.")
+        print("Release assets seen: " + (", ".join(seen_assets[:30]) if seen_assets else "(none)"))
+        print("If llama-server.exe is already installed elsewhere, set SPATIAL_DESKTOP_LLAMA_SERVER to its full path and rerun this installer.")
+        print("Official releases: https://github.com/ggml-org/llama.cpp/releases")
         return False
 
     archive = ROOT / "tools" / "llama-cpp-windows.zip"
@@ -304,39 +337,57 @@ def install_llama_server(force: bool = False) -> bool:
             download_file(url, archive)
             with zipfile.ZipFile(archive) as zf:
                 infos = zf.infolist()
-                matches = [i for i in infos if i.filename.lower().endswith("llama-server.exe")]
+                matches = [i for i in infos if i.filename.lower().replace("\\", "/").endswith("llama-server.exe")]
                 if not matches:
                     raise RuntimeError("archive does not contain llama-server.exe")
-                # Prefer the server and DLLs from the same directory as the exe.
+                # Keep every runtime DLL from the archive, not only files that happen
+                # to sit beside the server in this release's ZIP layout. Flattening
+                # runtime files into the server directory avoids missing-DLL launch
+                # failures across upstream packaging changes.
                 chosen = matches[0]
-                prefix = chosen.filename.rsplit("/", 1)[0] if "/" in chosen.filename else ""
+                chosen_parts = chosen.filename.replace("\\", "/").split("/")
+                # Use the archive's build root rather than only the executable's
+                # immediate directory: some releases place runtime DLLs one level up.
+                archive_root = chosen_parts[0] if len(chosen_parts) > 1 else ""
                 stage = dest.with_name(dest.name + ".staging")
                 shutil.rmtree(stage, ignore_errors=True)
                 stage.mkdir(parents=True, exist_ok=True)
+                extracted_server = False
                 for info in infos:
                     if info.is_dir():
                         continue
-                    name_in_zip = info.filename
-                    if prefix:
-                        if not name_in_zip.startswith(prefix + "/"):
+                    name_in_zip = info.filename.replace("\\", "/")
+                    if archive_root:
+                        if not name_in_zip.startswith(archive_root + "/"):
                             continue
-                        relative = name_in_zip[len(prefix) + 1:]
+                        relative = name_in_zip[len(archive_root) + 1:]
                     else:
                         relative = name_in_zip
-                    if not relative or "/" in relative:
+                    if not relative:
                         continue
                     low = relative.lower()
-                    # Preserve all DLLs and EXEs shipped alongside the server;
-                    # ggml backends and runtime DLLs are required by some builds.
-                    if low.endswith((".dll", ".exe", ".json", ".bin")):
-                        target = stage / relative
-                        with zf.open(info) as src, target.open("wb") as out:
-                            shutil.copyfileobj(src, out)
+                    if not low.endswith((".dll", ".exe", ".json", ".bin")):
+                        continue
+                    # Preserve subfolders as well, but also copy runtime files to
+                    # the root so Windows can resolve dependencies beside the server.
+                    target = stage / relative
+                    target.parent.mkdir(parents=True, exist_ok=True)
+                    with zf.open(info) as src, target.open("wb") as out:
+                        shutil.copyfileobj(src, out)
+                    if name_in_zip == chosen.filename.replace("\\", "/"):
+                        root_server = stage / "llama-server.exe"
+                        if target != root_server:
+                            shutil.copy2(target, root_server)
+                        extracted_server = True
+                    elif low.endswith(".dll") and target.parent != stage:
+                        root_copy = stage / target.name
+                        if not root_copy.exists():
+                            shutil.copy2(target, root_copy)
                 staged_exe = stage / "llama-server.exe"
-                if not staged_exe.exists():
+                if not extracted_server or not staged_exe.exists():
                     raise RuntimeError("server executable was not extracted")
-                if not _probe_llama_server(staged_exe):
-                    raise RuntimeError("downloaded server failed its --version compatibility probe")
+                if not _probe_llama_server(staged_exe, verbose=True):
+                    raise RuntimeError("downloaded server failed its --version compatibility probe (see launch diagnostics above)")
                 # Swap only after the staged executable passes verification.
                 backup = dest.with_name(dest.name + ".old")
                 shutil.rmtree(backup, ignore_errors=True)

@@ -123,8 +123,8 @@ def install_update(source_root: str | Path, destination: str | Path | None = Non
     copied = 0
     for item in source_root.rglob("*"):
         relative = item.relative_to(source_root)
-        # version.txt is user-maintained locally; use the staged copy only to
-        # validate the update version, never overwrite the installed copy.
+        # version.txt is handled explicitly after the application files are copied:
+        # the installed copy must reflect the GitHub version that was just installed.
         if (any(part in protected_dirs for part in relative.parts) or item.name in protected_names
                 or item.name == "version.txt"
                 or item.name.startswith("local_search_index.sqlite3")):
@@ -142,6 +142,13 @@ def install_update(source_root: str | Path, destination: str | Path | None = Non
             shutil.copy2(target, backup)
         shutil.copy2(item, target)
         copied += 1
+    # Commit the version marker only after copying the application payload. This
+    # fixes stale local version.txt files while keeping version.txt out of release ZIPs.
+    staged_version = source_root / "version.txt"
+    if staged_version.is_file():
+        version_text = read_version(staged_version)
+        version_target = destination / "version.txt"
+        version_target.write_text(version_text + "\n", encoding="utf-8")
     if copied == 0 or not (destination / "main.py").is_file():
         raise RuntimeError("No application files were installed")
     return backup_root
