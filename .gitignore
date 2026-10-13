@@ -1,0 +1,28 @@
+# Python bytecode and test/build caches
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Virtual environments and packaging output
+.venv/
+venv/
+build/
+dist/
+*.egg-info/
+
+# Runtime logs, temporary downloads and generated calibration/cache data
+*.log
+*.tmp
+face_models/
+models/
+llama.cpp/
+llama-server*
+*.gguf
+*.onnx
+*.bin
+local_search_index.sqlite3*
+tli_calibration.json
+hand_calibration.json
+custom_gestures.json

@@ -1,0 +1,121 @@
+# FIST PRIORITY: a detected fist/grip wins over a noisy pinch classification; pinch/menu recognition is suppressed until the hand releases the fist.
+# MOUSE DETACH: hold the peace pose (index/middle raised, ring/pinky folded, thumb tucked into palm) to detach/reattach that hand from OS mouse movement; TLI and glass/menu gestures remain live.
+# LEFT MODIFIER: hold LEFT fist; quick RIGHT pinch/release = right-click/context menu; held RIGHT grip = drag a native window (OS) or virtual canvas/app (3D).
+# Modifier gestures suppress the regular Pinch Menu timer; open RIGHT hand to release a modifier drag.
+# DOUBLE-CLICK: two quick pinches near the same point are snapped to the first point for a steadier native double-click.
+# SPATIAL DESKTOP — HAND GESTURE SETTINGS
+# One setting_name=value per line. Blank lines and lines beginning with # are ignored.
+# Colours must be #RRGGBB. Numeric values may contain decimals.
+#
+# POINTER / TLI
+# The large glowing TLI and activation point share one point: a saved palm-relative calibration when available, otherwise the thumb/index fingertip midpoint.
+# CALIBRATE: open Settings -> Interaction -> CALIBRATE LEFT/RIGHT TLI; release the selecting pinch, then hold a fresh thumb/index pinch steady.
+# Each hand is calibrated independently. Twelve stable frames are averaged and saved in tli_calibration.json beside main.py.
+# cursor_lock_priority selects which physical hand owns the idle cursor and gets first refusal for new gestures; active actions stay with their owner.
+#
+# QUICK CLICKS
+# QUICK GRIP CLICK: quick fist/grip, then open hand; click uses the TLI point where the fist began.
+# QUICK PINCH CLICK: brief thumb/index pinch, then release; click uses the pinch-start TLI position.
+# DOUBLE-CLICK: two short pinches at nearly the same point generate two native clicks within the OS double-click interval. A release gap as short as one tracked frame can complete the first click.
+#
+# TIMED PINCH / PINCH MENU
+# DO NOT REMOVE: the fixed 0.8-second continuous pinch-confirmation buffer is separate from release cooldown.
+# Pinch Menu and peace-sign gestures show a ring and numeric countdown. Right-fist scrolling has no circle timer. A timed pinch must stay held through the 0.8-second confirmation buffer.
+# PINCH MENU / EXIT MODE: the circle stays empty during a continuous 0.8-second pinch confirmation. Releasing before that expires cancels the sequence, so quick/double pinches cannot accumulate. After confirmation, the circle fills only while the pinch is held; release gaps never advance it.
+# The Pinch Menu has RIGHT-CLICK MENU, GLASS MENU, DICTATE, and STT; DICTATE and STT sit side by side. Scrolling is a grip gesture, not a menu option. Pinch recognition tolerates more landmark jitter while still requiring two extended non-index fingers.
+# Release the opening pinch, then use a fresh grab or pinch over an option to select it.
+# Once selection-ready, a fresh pinch or grip with the TLI OUTSIDE the popup closes the popup.
+# That outside gesture is consumed; it will not click, drag, or start another timer.
+#
+# PEACE-SIGN MOUSE-DETACH TOGGLE
+# Hold an index+middle V-sign for 1.5 seconds to detach/reattach that hand from native OS mouse movement; a countdown ring appears.
+# Detachment affects only OS mouse movement. The hand continues updating its TLI and can still interact with glass controls and Pinch Menus.
+# A detached-hand notice persists until reattached. No tracking-toggle TTS is queued.
+#
+# FIST / DRAG / SCROLL
+# A quick fist -> open clicks (or right-clicks when Right-click Mode is active).
+# RIGHT-only fist + deliberate vertical movement starts smooth scrolling without a timer.
+# The LEFT fist remains the modifier; a LEFT fist + RIGHT grip is still the dedicated drag action.
+# Two fists remain available for the separate intentional window-drag gesture.
+# Scrolling clamps tracking spikes, smooths each frame and ramps up only during sustained movement.
+# An open hand must remain stable for 0.20 seconds to release active drag/scroll; Pinch Menu confirmation requires a continuous 0.8-second pinch hold.
+# Opening the hand stops active drag/scroll; a long gesture cannot also click on release.
+#
+# SETTINGS SLIDERS
+# Fist OR thumb/index pinch near a slider snaps the TLI to its knob and starts slider dragging immediately (no timer).
+# The value is preserved at pickup. Slider travel is scaled to 0.42x cursor travel for fine control. One-frame cursor jumps are rejected; large new positions must persist for three frames.
+#
+# CAMERA MAPPING
+# Camera X 0.20–0.80 and Y 0.16–0.84 map to the full display. Positions outside clamp to the edges.
+#
+# SETTING SYNTAX AND RANGES
+# hand_visual_scale: 0.3–1.0; hand skeleton / TLI visual size and position are scaled together.
+# skin_tone_darkness: 0–100; higher values darken the skin-like palm/finger mesh.
+# finger_thickness: 0.8–10.0; default 4.24; every rounded mesh width uses the same direct palm-size factor (closer = thicker; farther = thinner).
+# hand_tracking_sensitivity: 0.5–1.5; drag and scroll movement gain.
+# scroll_acceleration: 0.5–10.0x; higher ramps scrolling speed faster with distance from the drag anchor (default 1.0x).
+# cursor_smoothing: 0.0–0.95; higher values damp small pointer jitter.
+# click_debounce_seconds: 0.04–0.25; minimum quick-grip duration accepted as a click.
+# menu_pinch_hold_seconds: 0.5–5.0; circle-fill duration after the 0.8-second confirmation delay (default 0.6).
+# left_click_color / right_click_color: #RRGGBB. Default LEFT TLI is red; RIGHT TLI is blue.
+
+hand_visual_scale=0.30
+hand_contact_band_ratio=0.02
+hand_tracking_sensitivity=1.50
+scroll_acceleration=1.00
+scroll_deadzone=70.0
+custom_gesture_hold_seconds=0.50
+custom_gesture_tolerance=0.180
+cursor_smoothing=0.90
+click_debounce_seconds=0.085
+left_click_color=#ff5555
+right_click_color=#5091ff
+menu_pinch_hold_seconds=0.60
+
+invert_scroll=true
+# invert_scroll: true reverses vertical scroll direction; false is normal.
+
+# HAND FILTER: low-confidence/degenerate detections are rejected; no cached landmarks are drawn after loss. Side-on exception requires strong depth and confidence.
+# GLASS: main menu, Pinch Menu and Settings use a translucent frosted treatment with soft edge blur.
+
+# HAND DETECTION: conservative MediaPipe confidence, three consistent detections, no stale landmark display; side-on exception requires high confidence and depth support.
+# PHYSICAL SIDES: MediaPipe handedness labels are normalized once in the camera tracker.
+# GLASS UI: translucent frosted panels have soft, layered halo edges.
+
+# GLASS: stronger Gaussian blur improves contrast behind the menu. Modifier notice uses notification placement settings.
+
+# GLASS: stronger Gaussian blur improves contrast behind the menu. Modifier notice uses notification placement settings.
+
+# HAND VISUAL: the linked mannequin model is not rigged/textured, so the live skeleton is drawn as rounded, skin-toned capsules with a softly shaded palm.
+# PINCH RE-ARM: after a fist, a stable pinch or a full open hand rearms Pinch Menu recognition; the 0.8-second soft timeout prevents a stuck lockout.
+
+skin_tone_darkness=0.0
+finger_thickness=4.24
+
+# HAND CONTACT: wrist pivots keep individual grips stable; as two hands approach, a wider contact zone blends the pivots toward the nearest real fingertips so scaled hands do not separate at contact.
+
+palm_width_scale=1.26
+hand_skin_effect=true
+skin_use_skeleton_color=false
+hand_transparency=100.0
+tli_glow_enabled=false
+tli_glow_intensity=0.00
+tli_colour_shift_degrees=0.0
+tli_border_thickness=1.00
+
+tli_diameter=30.0
+skeleton_line_thickness=1.50
+
+# TLI appearance: diameter=12–96px (default 30px), border thickness=1–8px, colour shift=0–360 degrees.
+# Skeleton line thickness: 0.5–4.0x, only applied when skeleton rendering is selected.
+# Glass and Pinch Menu panels use a lightly transparent background (15%).
+
+# PINCH DRAG: in OS Desktop mode, pinch and move more than about 22 screen pixels before the circle timer finishes to hold the left mouse button and drag/drop the item; release the pinch to drop it.
+# PINCH MENU: keep the pinch stationary until the timer completes to open the Pinch Menu. Movement before completion chooses drag instead of menu.
+# HAND ONBOARDING: first launch calibrates the screen-touch anchor, palm size and two-hand fingertip proximity.
+# Extend an arm and touch just below the camera, then tilt the wrist so the palm faces the camera.
+# Show both hands and bring fingertips together for the proximity capture. Hold still until each sample completes.
+# Hand calibration is stored in hand_calibration.json and can be rerun from Settings -> Hands.
+# Scroll uses native wheel input at the current tracked cursor so the active child control receives wheel events.
+# RIGHT-CLICK: hold the LEFT fist modifier, then quick RIGHT pinch/release to right-click; release modifier by opening LEFT hand.
+palm_attract_acceleration=0.33
