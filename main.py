@@ -115,6 +115,15 @@ TLI_CALIBRATION_FILE = ROOT / "tli_calibration.json"
 HAND_CALIBRATION_FILE = ROOT / "hand_calibration.json"
 CUSTOM_GESTURES_FILE = ROOT / "custom_gestures.json"
 NOTIFICATION_POSITIONS = ("top-left", "top-center", "top-right", "bottom-left", "bottom-center", "bottom-right")
+# Settings -> Notify rows: (ui preference key, label, default position).
+NOTIFICATION_SETTING_ROWS = (
+    ("paused_notice_position", "GESTURE LEGEND LOCATION", "bottom-center"),
+    ("heard_bar_position", "HEARD / TRANSCRIPT BAR", "bottom-center"),
+    ("left_status_position", "LEFT HAND STATUS", "bottom-left"),
+    ("right_status_position", "RIGHT HAND STATUS", "bottom-right"),
+    ("dictation_indicator_position", "DICTATION INDICATOR", "top-left"),
+    ("stt_indicator_position", "STT INDICATOR", "top-right"),
+)
 TTS_VOICE_OPTIONS = ("bf_alice", "bf_emma", "bf_isabella", "bf_lily", "bm_daniel", "bm_fable", "bm_george", "bm_lewis", "af_heart", "af_bella", "af_sarah", "am_adam", "am_michael")
 
 def load_ui_preferences() -> dict:
@@ -554,9 +563,38 @@ class Tracker:
     def _loop(self):
         last_frame_time = 0.0
         frame_interval = 1.0 / 30.0
+        # While no hand has been seen for a moment, run inference at a lower rate; the
+        # first detection immediately restores 30 FPS (the 3-frame confirmation below
+        # then completes at full rate). While hand tracking is paused, frames are only
+        # needed for the optional ~1 Hz face welcome check.
+        idle_frame_interval = 1.0 / 15.0
+        paused_frame_interval = 1.0 / 5.0
+        idle_after_seconds = 1.0
+        last_hand_seen = 0.0
         while self.running:
-            ok, frame = self.cap.read()
-            if not ok:
+            # grab() waits for the next camera frame without decoding it; frames that
+            # are skipped below are never decoded/converted, which saves CPU.
+            ok = self.cap.grab()
+            frame = None
+            now = time.monotonic()
+            if ok:
+                if not self.hand_tracking_enabled:
+                    interval = paused_frame_interval
+                elif now - last_hand_seen > idle_after_seconds:
+                    interval = idle_frame_interval
+                else:
+                    interval = frame_interval
+                elapsed = now - last_frame_time
+                if elapsed < interval:
+                    # Do not busy-spin while waiting for the next inference slot.
+                    # Camera reads can return much faster than the inference cadence;
+                    # without yielding here this loop can consume a full CPU core even
+                    # when gesture handling is disabled. Sleep only for the remaining
+                    # interval (capped) so shutdown and camera responsiveness stay quick.
+                    time.sleep(min(interval - elapsed, 0.005))
+                    continue
+                ok, frame = self.cap.retrieve()
+            if not ok or frame is None:
                 # A camera read failure must not leave the previous frame's hands on screen.
                 with self.lock:
                     self.hands_data = []
@@ -564,16 +602,6 @@ class Tracker:
                 self._candidate_center = {"left": None, "right": None}
                 self._candidate_misses = {"left": 0, "right": 0}
                 time.sleep(0.02)
-                continue
-            now = time.monotonic()
-            elapsed = now - last_frame_time
-            if elapsed < frame_interval:
-                # Do not busy-spin while waiting for the next 30 FPS inference slot.
-                # Camera reads can return much faster than the inference cadence;
-                # without yielding here this loop can consume a full CPU core even
-                # when gesture handling is disabled. Sleep only for the remaining
-                # interval (capped) so shutdown and camera responsiveness stay quick.
-                time.sleep(min(frame_interval - elapsed, 0.005))
                 continue
             last_frame_time = now
             frame = cv2.flip(frame, 1)
@@ -617,6 +645,8 @@ class Tracker:
                         # appear. A single jittering/background hit must never be rendered.
                         if self._candidate_streak[label] >= 3:
                             found.append((label, points, score))
+                    if raw_seen:
+                        last_hand_seen = time.monotonic()
                     for side in ("left", "right"):
                         if side not in raw_seen:
                             # Remember the detection history across one dropped frame, but
@@ -709,6 +739,11 @@ class SearchHandOverlay(QWidget):
         dialog = owner.search_dialog
         should_show = bool(dialog is not None and dialog.isVisible() and
                            not owner.hand_tracking_paused)
+        # Poll slowly while Search is closed; the launcher also triggers an immediate
+        # sync when it opens, so the fast cadence resumes without a visible delay.
+        wanted_interval = 24 if should_show else 150
+        if self.sync_timer.interval() != wanted_interval:
+            self.sync_timer.setInterval(wanted_interval)
         if not should_show:
             if self.isVisible():
                 self.hide()
@@ -746,7 +781,14 @@ class SearchHandOverlay(QWidget):
         owner = self.owner
         if not (owner.search_dialog is not None and owner.search_dialog.isVisible()):
             return
-        painter = QPainter(self)
+        # Native video windows can temporarily invalidate the transparent overlay surface
+        # while Windows is moving/resizing them. Skip that frame instead of issuing
+        # follow-on drawing calls against an inactive painter.
+        if not self.isVisible() or self.width() <= 0 or self.height() <= 0:
+            return
+        painter = QPainter()
+        if not painter.begin(self):
+            return
         painter.setRenderHint(QPainter.Antialiasing, True)
         now = time.monotonic()
         # This overlay is the sole hand-visual owner while Search is visible; the main
@@ -873,7 +915,14 @@ class TliCalibrationWindow(QWidget):
         self.update()
 
     def paintEvent(self, _event):
-        painter = QPainter(self)
+        # Native video windows can temporarily invalidate the transparent overlay surface
+        # while Windows is moving/resizing them. Skip that frame instead of issuing
+        # follow-on drawing calls against an inactive painter.
+        if not self.isVisible() or self.width() <= 0 or self.height() <= 0:
+            return
+        painter = QPainter()
+        if not painter.begin(self):
+            return
         painter.setRenderHint(QPainter.Antialiasing, True)
         whole = QRectF(self.rect()).adjusted(2, 2, -2, -2)
         # Draw only the outline plus compact header/footer plates. The target interior
@@ -1025,7 +1074,14 @@ class HandCalibrationWizard(QWidget):
         return self._primary_rect, self._secondary_rect
 
     def paintEvent(self, _event):
-        painter = QPainter(self)
+        # Native video windows can temporarily invalidate the transparent overlay surface
+        # while Windows is moving/resizing them. Skip that frame instead of issuing
+        # follow-on drawing calls against an inactive painter.
+        if not self.isVisible() or self.width() <= 0 or self.height() <= 0:
+            return
+        painter = QPainter()
+        if not painter.begin(self):
+            return
         painter.setRenderHint(QPainter.Antialiasing, True)
         whole = QRectF(self.rect()).adjusted(2, 2, -2, -2)
         painter.setPen(QPen(QColor(80, 235, 250, 235), 2.3))
@@ -1682,7 +1738,15 @@ class SpatialDesktop(QWidget):
         painter.save()
         painter.setClipPath(path)
         painter.setOpacity(painter.opacity()*min(1.0, max(0.0, float(opacity))))
-        painter.drawImage(QRectF(0, 0, self.width(), self.height()), image)
+        # Only blit the part of the full-screen image behind the panel. Drawing the
+        # whole screen-sized image every frame and relying on the clip made each
+        # repaint far more expensive than the visible glass area requires.
+        target = rect.intersected(QRectF(0, 0, self.width(), self.height()))
+        if not target.isEmpty():
+            sx = image.width()/max(1.0, float(self.width()))
+            sy = image.height()/max(1.0, float(self.height()))
+            source = QRectF(target.x()*sx, target.y()*sy, target.width()*sx, target.height()*sy)
+            painter.drawImage(target, image, source)
         painter.restore()
 
     def _main_menu_close_rect(self, cx=None, cy=None, scale=None):
@@ -1695,14 +1759,130 @@ class SpatialDesktop(QWidget):
                       350.0*scale, 36.0*scale)
 
     def _tli_calibration_button_rects(self, cx=None, cy=None, scale=None):
-        """Leave a clear, consistent gap between the left and right TLI buttons."""
+        """Left/right TLI calibration buttons, taken from the shared Hands-page layout."""
+        rects = self._settings_control_rects(cx, cy, scale, page="hands")
+        return {"left": rects["calibrate_left"], "right": rects["calibrate_right"]}
+
+    # ---- Settings page layout -------------------------------------------------
+    # One geometry source for every Settings page. Painting, click hit-testing,
+    # hover glow and pressed glow all read these rectangles, so what is drawn is
+    # exactly what can be pressed. Units are logical (before menu scaling) and
+    # relative to the panel centre. Buttons sit in the left column, sliders in the
+    # right column, and the panel height is derived from the taller column.
+    SETTINGS_LEFT_X = -320.0
+    SETTINGS_RIGHT_X = 20.0
+    SETTINGS_COLUMN_W = 300.0
+    SETTINGS_BUTTON_H = 38.0
+    SETTINGS_BUTTON_GAP = 10.0
+    SETTINGS_GROUP_GAP = 12.0
+    SETTINGS_SLIDER_PITCH = 52.0
+    SETTINGS_CONTENT_TOP = 85.0     # distance from panel top: clears the tab strip
+    SETTINGS_CONTENT_BOTTOM = 62.0  # distance from panel bottom: clears Back
+    SETTINGS_INFO_CONTENT_TOP = 78.0
+    SETTINGS_MIN_HEIGHT = 400.0
+    SETTINGS_INFO_PAGE_HEIGHT = 500.0
+
+    def _settings_layout(self, page=None):
+        """Logical layout of one Settings page (see the constants above)."""
+        page = self.settings_page if page is None else page
+        L, R, W = self.SETTINGS_LEFT_X, self.SETTINGS_RIGHT_X, self.SETTINGS_COLUMN_W
+        bh, gap, group = self.SETTINGS_BUTTON_H, self.SETTINGS_BUTTON_GAP, self.SETTINGS_GROUP_GAP
+        buttons, texts = {}, {}
+        y = 0.0
+
+        def stack(name, h=bh, after=gap):
+            nonlocal y
+            buttons[name] = (L, y, W, h)
+            y += h + after
+
+        right_h = 0.0
+        if page == "interaction":
+            stack("scroll_toggle")
+            stack("priority_toggle")
+        elif page == "hands":
+            stack("skin_effect")
+            stack("skin_tint")
+            y += group
+            stack("calibrate_left")
+            stack("calibrate_right")
+            y += group
+            stack("hand_setup")
+        elif page == "tli":
+            stack("glow_toggle")
+            y += 6.0
+            half = (W-gap)*0.5
+            buttons["swatch_left"] = (L, y, half, 70.0)
+            buttons["swatch_right"] = (L+half+gap, y, half, 70.0)
+            y += 70.0 + gap
+        elif page == "notifications":
+            for key, _label, _default in NOTIFICATION_SETTING_ROWS:
+                stack("notify:" + key)
+            texts["help"] = (L, y, W, 40.0)
+            y += 40.0 + gap
+        elif page == "voice":
+            stack("tts_toggle")
+            stack("voice_cycle")
+            y += group
+            stack("test_voice")
+            stack("face_welcome")
+            texts["status"] = (L, y, W, 48.0)
+            y += 48.0 + gap
+        elif page == "update":
+            stack("update_action", h=46.0, after=14.0)
+            # Status and description span both columns: this page has no sliders.
+            texts["status"] = (L, y, 2*W+(R-(L+W)), 72.0)
+            y += 80.0
+            texts["about"] = (L, y, 2*W+(R-(L+W)), 44.0)
+            y += 44.0 + gap
+        elif page == "d1":
+            stack("d1_model", h=44.0)
+            half = (W-gap)*0.5
+            buttons["d1_start"] = (L, y, half, 42.0)
+            buttons["d1_stop"] = (L+half+gap, y, half, 42.0)
+            y += 42.0 + gap
+            stack("d1_retry", h=42.0)
+            texts["state"] = (R, 0.0, W, 22.0)
+            texts["about"] = (R, 26.0, W, 40.0)
+            texts["log"] = (R, 72.0, W, 122.0)
+            right_h = 72.0 + 122.0
+        elif page == "gestures":
+            y = 394.0  # see _custom_gesture_layout
+        left_h = max(0.0, y - gap)
+
+        sliders = []
+        for index, row in enumerate(self._settings_slider_rows(page)):
+            name = row[0]
+            row_top = index*self.SETTINGS_SLIDER_PITCH
+            track_left, track_right = R+12.0, R+W-12.0
+            if name == "scroll_notch_hue":
+                track_right -= 30.0  # room for the colour swatch at the track end
+            sliders.append({"name": name, "y": row_top+12.0, "left": track_left, "right": track_right,
+                            "label": (R, row_top+22.0, W, 18.0)})
+        if sliders:
+            right_h = max(right_h, len(sliders)*self.SETTINGS_SLIDER_PITCH - 12.0)
+
+        if page in ("gesture_map", "speech_commands"):
+            height = self.SETTINGS_INFO_PAGE_HEIGHT
+            top = -height*0.5 + self.SETTINGS_INFO_CONTENT_TOP
+        else:
+            height = max(self.SETTINGS_MIN_HEIGHT,
+                         self.SETTINGS_CONTENT_TOP + max(left_h, right_h) + self.SETTINGS_CONTENT_BOTTOM)
+            top = -height*0.5 + self.SETTINGS_CONTENT_TOP
+        return {"page": page, "height": height, "top": top,
+                "buttons": buttons, "texts": texts, "sliders": sliders}
+
+    def _settings_control_rects(self, cx=None, cy=None, scale=None, page=None, kind="buttons"):
+        """Scaled overlay rectangles for a page's buttons (or text areas)."""
         cx = self.hub_pos.x()*self.width() if cx is None else cx
         cy = self.hub_pos.y()*self.height() if cy is None else cy
         scale = self.menu_ui_scale() if scale is None else scale
-        return {
-            "left": QRectF(cx-320.0*scale, cy+35.0*scale, 290.0*scale, 36.0*scale),
-            "right": QRectF(cx-320.0*scale, cy+82.0*scale, 290.0*scale, 36.0*scale),
-        }
+        layout = self._settings_layout(page)
+        top = layout["top"]
+        return {name: QRectF(cx+x*scale, cy+(top+y)*scale, w*scale, h*scale)
+                for name, (x, y, w, h) in layout[kind].items()}
+
+    def _settings_text_rects(self, cx=None, cy=None, scale=None, page=None):
+        return self._settings_control_rects(cx, cy, scale, page=page, kind="texts")
 
     def _settings_back_rect(self, cx=None, cy=None, scale=None):
         """One shared bottom-centred Back button geometry for every settings page."""
@@ -2005,21 +2185,9 @@ class SpatialDesktop(QWidget):
         """Return logical menu size for a settings page, before display scaling."""
         if not self.settings_open:
             return 490.0, 430.0
-        heights = {
-            "interaction": 630.0,
-            # Heights follow the actual content extents so tabs and Back remain
-            # inside the glass while avoiding large blank bands.
-            "hands": 650.0,
-            "tli": 440.0,
-            "gestures": 660.0,
-            "notifications": 570.0,
-            "voice": 500.0,
-            "d1": 520.0,
-            "update": 560.0,
-            "gesture_map": 660.0,
-            "speech_commands": 660.0,
-        }
-        return 720.0, heights.get(self.settings_page if page is None else page, 620.0)
+        # Heights follow each page's laid-out content, so tabs and Back remain
+        # inside the glass while avoiding large blank bands.
+        return 720.0, self._settings_layout(page)["height"]
 
     def menu_ui_scale(self):
         base = max(0.4, self.hub_scale*self.object_depth_scale)
@@ -2041,67 +2209,91 @@ class SpatialDesktop(QWidget):
         return (cx-half_width <= point.x() <= cx+half_width and
                 cy-half_height <= point.y() <= cy+half_height)
 
-    def _settings_slider_specs(self):
-        """Single source of truth for slider values, ranges, labels and hit-test rows."""
-        if self.settings_page == "voice":
-            return [("tts_speed", 0, float(self.tts.settings["speed"]), 0.7, 1.5, "TTS SPEED")]
-        if self.settings_page == "interaction":
+    def _settings_slider_rows(self, page=None):
+        """Slider values, ranges and labels per page, in top-to-bottom order."""
+        page = self.settings_page if page is None else page
+        if page == "voice":
+            return [("tts_speed", float(self.tts.settings["speed"]), 0.7, 1.5, "SPEECH SPEED")]
+        if page == "interaction":
             return [
-                ("sensitivity", -200, self.hand_tracking_sensitivity, 0.5, 1.5, "DRAG/SCROLL SENSITIVITY"),
-                ("smoothing", -150, self.cursor_smoothing, 0.0, 0.95, "CURSOR SMOOTHING"),
-                ("default_gesture_hold_seconds", -100, self.default_gesture_hold_seconds, 0.5, 5.0, "DEFAULT GESTURE HOLD TIMER"),
-                ("scroll_acceleration", -50, self.scroll_acceleration, 0.5, 10.0, "SCROLL ACCELERATION"),
-                ("scroll_deadzone", 0, self.scroll_deadzone, 4.0, 120.0, "SCROLL DEAD ZONE"),
-                ("scroll_backdrop_opacity", 50, self.scroll_backdrop_opacity, 0.0, 100.0, "SCROLL CIRCLE TRANSPARENCY"),
-                ("scroll_backdrop_hue", 100, self.scroll_backdrop_hue, 0.0, 255.0, "SCROLL CIRCLE GREY SHADE"),
-                ("scroll_notch_hue", 150, self.scroll_notch_hue, 0.0, 360.0, "SCROLL NOTCH COLOUR"),
+                ("sensitivity", self.hand_tracking_sensitivity, 0.5, 1.5, "DRAG/SCROLL SENSITIVITY"),
+                ("smoothing", self.cursor_smoothing, 0.0, 0.95, "CURSOR SMOOTHING"),
+                ("default_gesture_hold_seconds", self.default_gesture_hold_seconds, 0.5, 5.0, "DEFAULT GESTURE HOLD TIMER"),
+                ("scroll_acceleration", self.scroll_acceleration, 0.5, 10.0, "SCROLL ACCELERATION"),
+                ("scroll_deadzone", self.scroll_deadzone, 4.0, 120.0, "SCROLL DEAD ZONE"),
+                ("scroll_backdrop_opacity", self.scroll_backdrop_opacity, 0.0, 100.0, "SCROLL CIRCLE TRANSPARENCY"),
+                ("scroll_backdrop_hue", self.scroll_backdrop_hue, 0.0, 255.0, "SCROLL CIRCLE GREY SHADE"),
+                ("scroll_notch_hue", self.scroll_notch_hue, 0.0, 360.0, "SCROLL NOTCH COLOUR"),
             ]
-        if self.settings_page == "tli":
+        if page == "tli":
             return [
-                ("tli_glow_intensity", -105, self.tli_glow_intensity, 0.0, 2.5, "TLI GLOW INTENSITY"),
-                ("tli_colour_shift_degrees", -55, self.tli_colour_shift_degrees, 0.0, 360.0, "TLI COLOUR / HUE"),
-                ("tli_border_thickness", -5, self.tli_border_thickness, 1.5, 8.0, "TLI BORDER THICKNESS"),
-                ("tli_diameter", 15, self.tli_diameter, 12.0, 96.0, "TLI DIAMETER"),
+                ("tli_glow_intensity", self.tli_glow_intensity, 0.0, 2.5, "TLI GLOW INTENSITY"),
+                ("tli_colour_shift_degrees", self.tli_colour_shift_degrees, 0.0, 360.0, "TLI COLOUR / HUE"),
+                ("tli_border_thickness", self.tli_border_thickness, 1.5, 8.0, "TLI BORDER THICKNESS"),
+                ("tli_diameter", self.tli_diameter, 12.0, 96.0, "TLI DIAMETER"),
             ]
-        if self.settings_page == "notifications":
-            return [("detached_notice_opacity", 100, self.detached_notice_opacity, 0.0, 100.0,
+        if page == "notifications":
+            return [("detached_notice_opacity", self.detached_notice_opacity, 0.0, 100.0,
                      "DETACHED NOTICE FADES TO"),
-                    ("ui_font_scale", 150, self.ui_font_scale * 100.0, 70.0, 140.0,
+                    ("ui_font_scale", self.ui_font_scale * 100.0, 70.0, 140.0,
                      "UI FONT SIZE")]
-        if self.settings_page == "gestures":
+        if page == "gestures":
             return [
-                ("custom_gesture_hold_seconds", 180, self.custom_gesture_hold_seconds, 0.2, 1.5, "HOLD TIME"),
-                ("custom_gesture_tolerance", 225, self.custom_gesture_tolerance, 0.08, 0.40, "MATCH TOLERANCE"),
+                ("custom_gesture_hold_seconds", self.custom_gesture_hold_seconds, 0.2, 1.5, "HOLD TIME"),
+                ("custom_gesture_tolerance", self.custom_gesture_tolerance, 0.08, 0.40, "MATCH TOLERANCE"),
             ]
-        if self.settings_page == "hands":
-            # Every slider-based settings page uses a uniform 50-unit row rhythm.
-            # The nine hand controls span -200..200; buttons sit below this sequence.
+        if page == "hands":
             return [
-                ("hand_scale", -210, self.hand_visual_scale, 0.3, 1.0, "HAND SCALE"),
-                ("hand_recognition_threshold", -160, self.hand_recognition_threshold, 0.30, 0.90, "HAND RECOGNITION THRESHOLD"),
-                ("finger_thickness", -110, self.finger_thickness, 0.8, 10.0, "FINGER THICKNESS"),
-                ("palm_width_scale", -60, self.palm_width_scale, 0.65, 1.8, "PALM WIDTH"),
-                ("skin_tone_darkness", -10, self.skin_tone_darkness, 0.0, 100.0, "SKIN TONE DARKNESS"),
-                ("skeleton_line_thickness", 40, self.skeleton_line_thickness, 0.5, 4.0, "SKELETON LINE THICKNESS"),
-                ("hand_transparency", 90, self.hand_transparency, 10.0, 100.0, "HAND OPACITY"),
-                ("hand_contact_band_ratio", 140, self.hand_contact_band_ratio, 0.0, 0.9, "PALM ATTRACT DISTANCE"),
-                ("palm_attract_acceleration", 190, self.palm_attract_acceleration, 0.2, 5.0, "PALM ATTRACT ACCELERATION"),
+                ("hand_scale", self.hand_visual_scale, 0.3, 1.0, "HAND SCALE"),
+                ("hand_recognition_threshold", self.hand_recognition_threshold, 0.30, 0.90, "HAND RECOGNITION THRESHOLD"),
+                ("finger_thickness", self.finger_thickness, 0.8, 10.0, "FINGER THICKNESS"),
+                ("palm_width_scale", self.palm_width_scale, 0.65, 1.8, "PALM WIDTH"),
+                ("skin_tone_darkness", self.skin_tone_darkness, 0.0, 100.0, "SKIN TONE DARKNESS"),
+                ("skeleton_line_thickness", self.skeleton_line_thickness, 0.5, 4.0, "SKELETON LINE THICKNESS"),
+                ("hand_transparency", self.hand_transparency, 10.0, 100.0, "HAND OPACITY"),
+                ("hand_contact_band_ratio", self.hand_contact_band_ratio, 0.0, 0.9, "PALM ATTRACT DISTANCE"),
+                ("palm_attract_acceleration", self.palm_attract_acceleration, 0.2, 5.0, "PALM ATTRACT ACCELERATION"),
             ]
         return []
+
+    def _settings_slider_specs(self):
+        """Single source of truth for slider values, ranges, labels and hit-test rows.
+
+        Each entry is (name, y_offset, value, minimum, maximum, label); y_offset is the
+        track centre relative to the panel centre, taken from the shared page layout.
+        """
+        layout = self._settings_layout()
+        top = layout["top"]
+        offsets = {slider["name"]: top+slider["y"] for slider in layout["sliders"]}
+        return [(name, offsets.get(name, 0.0), value, minimum, maximum, label)
+                for name, value, minimum, maximum, label in self._settings_slider_rows()]
+
+    def _settings_slider_layouts(self, cx=None, cy=None, scale=None):
+        """Scaled slider geometry for the current page: name -> (left, right, y, label_rect)."""
+        cx = self.hub_pos.x()*self.width() if cx is None else cx
+        cy = self.hub_pos.y()*self.height() if cy is None else cy
+        scale = self.menu_ui_scale() if scale is None else scale
+        layout = self._settings_layout()
+        top = layout["top"]
+        result = {}
+        for slider in layout["sliders"]:
+            lx, ly, lw, lh = slider["label"]
+            result[slider["name"]] = (cx+slider["left"]*scale, cx+slider["right"]*scale,
+                                      cy+(top+slider["y"])*scale,
+                                      QRectF(cx+lx*scale, cy+(top+ly)*scale, lw*scale, lh*scale))
+        return result
 
     def _canvas_slider_geometry(self, name):
         """Return slider track geometry and the current knob point in overlay coordinates."""
         if not self.settings_open or not self.menu_open or not self.hub_visible:
             return None
-        cx, cy = self.hub_pos.x()*self.width(), self.hub_pos.y()*self.height()
-        scale = self.menu_ui_scale()
-        left, right = cx+70*scale, cx+250*scale
         definition = next((item for item in self._settings_slider_specs() if item[0] == name), None)
-        if definition is None:
+        geometry = self._settings_slider_layouts().get(name)
+        if definition is None or geometry is None:
             return None
-        _, offset, value, minimum, maximum, _label = definition
+        _, _offset, value, minimum, maximum, _label = definition
+        left, right, y, _label_rect = geometry
         ratio = min(1.0, max(0.0, (value-minimum)/max(1e-6, maximum-minimum)))
-        y = cy+offset*scale
         knob = QPointF(left+ratio*(right-left), y)
         return left, right, y, knob
 
@@ -2111,15 +2303,12 @@ class SpatialDesktop(QWidget):
             return None
         if self.settings_page == "gestures" and self.custom_gesture_dropdown is not None:
             return None  # the open action list covers the sliders
-        cx, cy = self.hub_pos.x()*self.width(), self.hub_pos.y()*self.height()
         scale = self.menu_ui_scale()
-        x_center = cx+160*scale
-        x_limit = (112 if for_grab else 98)*scale
+        x_margin = (28 if for_grab else 14)*scale
         y_limit = (30 if for_grab else 26)*scale
-        if abs(point.x()-x_center) > x_limit:
-            return None
-        candidates = [(abs(point.y()-(cy+offset*scale)), name)
-                      for name, offset, _value, _minimum, _maximum, _label in self._settings_slider_specs()]
+        candidates = [(abs(point.y()-y), name)
+                      for name, (left, right, y, _label_rect) in self._settings_slider_layouts().items()
+                      if left-x_margin <= point.x() <= right+x_margin]
         if not candidates:
             return None
         distance, name = min(candidates)
@@ -2707,14 +2896,13 @@ class SpatialDesktop(QWidget):
         self.update()
 
     def _update_canvas_slider(self, name, point):
-        cx, cy = self.hub_pos.x()*self.width(), self.hub_pos.y()*self.height()
-        scale = self.menu_ui_scale()
-        left, right = cx+70*scale, cx+250*scale
-        ratio = min(1.0, max(0.0, (point.x()-left)/max(1.0, right-left)))
         definition = next((item for item in self._settings_slider_specs() if item[0] == name), None)
-        if definition is None:
+        geometry = self._settings_slider_layouts().get(name)
+        if definition is None or geometry is None:
             return QPointF(point)
-        _name, offset, _old_value, minimum, maximum, _label = definition
+        left, right, track_y, _label_rect = geometry
+        ratio = min(1.0, max(0.0, (point.x()-left)/max(1.0, right-left)))
+        _name, _offset, _old_value, minimum, maximum, _label = definition
         value = minimum+ratio*(maximum-minimum)
         if name == "ui_font_scale":
             value /= 100.0
@@ -2765,7 +2953,7 @@ class SpatialDesktop(QWidget):
                     self.update()
                 else:
                     self.schedule_gesture_settings_save()
-        return QPointF(left+ratio*(right-left), cy+offset*scale)
+        return QPointF(left+ratio*(right-left), track_y)
 
     def _cycle_hand_colour(self, side):
         palette = ["#5091ff", "#ff5555", "#ffb347", "#65dd8a", "#d78bff", "#ffffff"]
@@ -2878,14 +3066,18 @@ class SpatialDesktop(QWidget):
                 self.tli_overrides[side] = ("slider", reticle)
                 return
 
+            controls = self._settings_control_rects(cx, cy, scale)
+
+            def pressed(name):
+                rect = controls.get(name)
+                return rect is not None and rect.contains(point)
+
             if self.settings_page == "interaction":
-                scroll_toggle = QRectF(cx-320*scale, cy+195*scale, 290*scale, 34*scale)
-                priority_toggle = QRectF(cx-320*scale, cy+237*scale, 290*scale, 34*scale)
-                if scroll_toggle.contains(point):
+                if pressed("scroll_toggle"):
                     self.invert_scroll = not self.invert_scroll
                     self.schedule_gesture_settings_save()
                     self.status = "Scroll direction inverted" if self.invert_scroll else "Scroll direction normal"
-                elif priority_toggle.contains(point):
+                elif pressed("priority_toggle"):
                     self.cursor_lock_priority = "left" if self.cursor_lock_priority == "right" else "right"
                     self.schedule_gesture_settings_save()
                     self.status = f"Cursor lock priority: {self.cursor_lock_priority.title()} hand"
@@ -2894,22 +3086,13 @@ class SpatialDesktop(QWidget):
             if self.settings_page == "tli":
                 # Per-hand TLI colour swatches live on this page, away from the
                 # crowded Hands-page recognition threshold and calibration controls.
-                if abs(point.y()-(cy-95*scale)) <= 22*scale:
-                    if abs(point.x()-(cx-250*scale)) <= 25*scale:
-                        self._cycle_hand_colour("left")
-                        self.status = "Left TLI colour changed"
-                    elif abs(point.x()-(cx-130*scale)) <= 25*scale:
-                        self._cycle_hand_colour("right")
-                        self.status = "Right TLI colour changed"
-                    else:
-                        glow_toggle = QRectF(cx-320*scale, cy-170*scale, 290*scale, 34*scale)
-                        if glow_toggle.contains(point):
-                            self.tli_glow_enabled = not self.tli_glow_enabled
-                            self.schedule_gesture_settings_save()
-                            self.status = "TLI glow enabled" if self.tli_glow_enabled else "TLI glow disabled"
-                    return
-                glow_toggle = QRectF(cx-320*scale, cy-170*scale, 290*scale, 34*scale)
-                if glow_toggle.contains(point):
+                if pressed("swatch_left"):
+                    self._cycle_hand_colour("left")
+                    self.status = "Left TLI colour changed"
+                elif pressed("swatch_right"):
+                    self._cycle_hand_colour("right")
+                    self.status = "Right TLI colour changed"
+                elif pressed("glow_toggle"):
                     self.tli_glow_enabled = not self.tli_glow_enabled
                     self.schedule_gesture_settings_save()
                     self.status = "TLI glow enabled" if self.tli_glow_enabled else "TLI glow disabled"
@@ -2920,14 +3103,12 @@ class SpatialDesktop(QWidget):
                 return
 
             if self.settings_page == "hands":
-                skin_effect_toggle = QRectF(cx-320*scale, cy-170*scale, 290*scale, 38*scale)
-                if skin_effect_toggle.contains(point):
+                if pressed("skin_effect"):
                     self.hand_skin_effect_enabled = not self.hand_skin_effect_enabled
                     self.schedule_gesture_settings_save()
                     self.status = "Hand rendering: skin effect" if self.hand_skin_effect_enabled else "Hand rendering: skeleton"
                     return
-                tint_toggle = QRectF(cx-320*scale, cy-122*scale, 290*scale, 32*scale)
-                if tint_toggle.contains(point):
+                if pressed("skin_tint"):
                     self.skin_use_skeleton_color = not self.skin_use_skeleton_color
                     self.schedule_gesture_settings_save()
                     self.status = "Skin uses skeleton colour" if self.skin_use_skeleton_color else "Skin uses natural colour"
@@ -2936,37 +3117,23 @@ class SpatialDesktop(QWidget):
                     if calibration_rect.contains(point):
                         self._arm_tli_calibration(calibration_side)
                         return
-                hand_setup_rect = QRectF(cx-320*scale, cy+135*scale, 290*scale, 28*scale)
-                if hand_setup_rect.contains(point):
+                if pressed("hand_setup"):
                     self._start_hand_onboarding(first_run=False)
                     return
                 return
 
             if self.settings_page == "notifications":
-                notification_rows = (
-                    ("paused_notice_position", -125),
-                    ("heard_bar_position", -70),
-                    ("left_status_position", -15),
-                    ("right_status_position", 40),
-                    ("dictation_indicator_position", 85),
-                    ("stt_indicator_position", 130),
-                )
-                for row_index, (key, yoff) in enumerate(notification_rows):
-                    rect = QRectF(cx-320*scale, cy+(-165+row_index*47)*scale, 290*scale, 36*scale)
-                    if rect.contains(point):
+                for key, _label, _default in NOTIFICATION_SETTING_ROWS:
+                    if pressed("notify:" + key):
                         self._cycle_notification_position(key)
                         break
                 return
 
             if self.settings_page == "voice":
-                tts_toggle = QRectF(cx-320*scale, cy-170*scale, 290*scale, 38*scale)
-                voice_button = QRectF(cx-320*scale, cy-120*scale, 290*scale, 38*scale)
-                test_button = QRectF(cx-320*scale, cy-60*scale, 290*scale, 38*scale)
-                face_button = QRectF(cx-320*scale, cy-10*scale, 290*scale, 38*scale)
-                if tts_toggle.contains(point):
+                if pressed("tts_toggle"):
                     self.tts.set_enabled(not self.tts.enabled)
                     self.status = "Local TTS " + ("enabled" if self.tts.enabled else "disabled")
-                elif voice_button.contains(point):
+                elif pressed("voice_cycle"):
                     current = self.tts.settings.get("voice", "bf_emma")
                     try:
                         next_index = (TTS_VOICE_OPTIONS.index(current)+1) % len(TTS_VOICE_OPTIONS)
@@ -2974,16 +3141,15 @@ class SpatialDesktop(QWidget):
                         next_index = 0
                     self.tts.set_voice(TTS_VOICE_OPTIONS[next_index])
                     self.status = f"TTS voice set to {TTS_VOICE_OPTIONS[next_index]}"
-                elif test_button.contains(point):
+                elif pressed("test_voice"):
                     if not self.tts.speak("Hello. This is a test of your selected local voice."):
                         self.status = f"TTS is not ready: {self.tts.status}"
-                elif face_button.contains(point):
+                elif pressed("face_welcome"):
                     self.manage_face_welcome()
                 return
 
             if self.settings_page == "update":
-                action_button = QRectF(cx-320*scale, cy-170*scale, 290*scale, 46*scale)
-                if action_button.contains(point) and not self.update_action_running and not self.update_check_running:
+                if pressed("update_action") and not self.update_action_running and not self.update_check_running:
                     if self.update_installed:
                         self._restart_spatial_desktop()
                     elif self.update_download_path:
@@ -2993,11 +3159,7 @@ class SpatialDesktop(QWidget):
                 return
 
             if self.settings_page == "d1":
-                model_button = QRectF(cx-320*scale, cy-170*scale, 290*scale, 44*scale)
-                runtime_button = QRectF(cx-320*scale, cy-110*scale, 140*scale, 42*scale)
-                stop_button = QRectF(cx-170*scale, cy-110*scale, 140*scale, 42*scale)
-                retry_button = QRectF(cx-320*scale, cy-50*scale, 290*scale, 42*scale)
-                if model_button.contains(point):
+                if pressed("d1_model"):
                     # Keep the supported default pinned to d1-omni-600M Q8.
                     # Clicking this row ensures the default model is selected/downloaded;
                     # the larger Q4 option is intentionally unavailable for now.
@@ -3006,15 +3168,15 @@ class SpatialDesktop(QWidget):
                     self.status = (f"d1 model selected: {spec['label']}" if ready else
                                    f"Downloading {spec['estimated']} d1 model in background.")
                     self._log_d1_ui("Model ensured: " + ("available" if ready else "download requested"))
-                elif runtime_button.contains(point):
+                elif pressed("d1_start"):
                     start_d1_server()
                     self.status = "Starting local d1 runtime."
                     self._log_d1_ui("Start / ensure running requested")
-                elif stop_button.contains(point):
+                elif pressed("d1_stop"):
                     stop_d1_server()
                     self.status = "Local d1 runtime stopped."
                     self._log_d1_ui("Stop local server requested")
-                elif retry_button.contains(point):
+                elif pressed("d1_retry"):
                     start_d1_loading()
                     self.status = "Checking d1 model and runtime; download/start requested."
                     self._log_d1_ui("Download / retry / start requested")
@@ -3387,7 +3549,7 @@ class SpatialDesktop(QWidget):
             name = " ".join(getpass.getuser().replace("_", " ").replace(".", " ").split()).title() or "there"
         self.tts.speak(f"{greeting}, {name}.")
 
-    def _remember_external_foreground_window(self):
+    def _remember_external_foreground_window(self, force=False):
         """Remember the last focused non-Spatial-Desktop window on the current OS."""
         if sys.platform.startswith("win"):
             try:
@@ -3405,6 +3567,16 @@ class SpatialDesktop(QWidget):
         elif sys.platform.startswith("linux"):
             # Optional xdotool support lets us close the external active window by ID
             # rather than sending Alt+F4 blindly to the fullscreen overlay.
+            # This runs from the 30 Hz scene timer, and each check launches two
+            # processes, so look up xdotool once and poll at most twice a second.
+            now = time.monotonic()
+            if not force and now - getattr(self, "_last_foreground_poll", 0.0) < 0.5:
+                return
+            self._last_foreground_poll = now
+            if not hasattr(self, "_xdotool_available"):
+                self._xdotool_available = shutil.which("xdotool") is not None
+            if not self._xdotool_available:
+                return
             try:
                 active = subprocess.check_output(["xdotool", "getactivewindow"], text=True,
                                                  stderr=subprocess.DEVNULL, timeout=0.25).strip()
@@ -3522,7 +3694,7 @@ class SpatialDesktop(QWidget):
             self.search_dialog.speak_requested.connect(self.speak_search_result)
         dialog = self.search_dialog
         if not dialog.isVisible():
-            self._remember_external_foreground_window()
+            self._remember_external_foreground_window(force=True)
             self.search_return_hwnd = self.last_external_foreground_hwnd
             self.search_return_window_id = self.last_external_window_id
         dialog.show()
@@ -4919,27 +5091,33 @@ class SpatialDesktop(QWidget):
 
     def _custom_gesture_layout(self, cx, cy, scale):
         """Single source of truth for Gestures-page geometry (drawing and hit-testing)."""
+        # Positioned in the shared left Settings column, starting below the tab strip
+        # (the page layout reserves 394 logical units for this block).
+        top = self._settings_layout("gestures")["top"]
+        L, W = self.SETTINGS_LEFT_X, self.SETTINGS_COLUMN_W
+
         def r(x, y, w, h):
-            return QRectF(cx+x*scale, cy+y*scale, w*scale, h*scale)
+            return QRectF(cx+x*scale, cy+(top+y)*scale, w*scale, h*scale)
         rows = []
         for index in range(CUSTOM_GESTURE_MAX):
-            y = -72 + index*40
+            y = 156 + index*40
             rows.append({
-                "row": r(-338, y, 318, 38),
-                "side": r(-336, y+3, 42, 32),
-                "timer": r(-292, y+3, 42, 32),
-                "label": r(-248, y+3, 62, 32),
-                "action": r(-184, y+3, 144, 32),
-                "delete": r(-38, y+3, 16, 32),
+                "row": r(L, y, W, 38),
+                "side": r(L+2, y+3, 40, 32),
+                "timer": r(L+44, y+3, 42, 32),
+                "label": r(L+88, y+3, 56, 32),
+                "action": r(L+146, y+3, 128, 32),
+                "delete": r(L+277, y+3, 20, 32),
             })
+        half = (W-8)*0.5
         return {
             # Keep the instruction text clearly below the tab row, with distinct
             # vertical gaps before recording controls and the gesture list.
-            "intro": r(-338, -220, 318, 32),
-            "record_left": r(-338, -182, 154, 32),
-            "record_right": r(-176, -182, 154, 32),
-            "overlap": r(-338, -144, 318, 30),
-            "message": r(-338, -110, 318, 24),
+            "intro": r(L, 0, W, 34),
+            "record_left": r(L, 40, half, 32),
+            "record_right": r(L+half+8, 40, half, 32),
+            "overlap": r(L, 80, W, 30),
+            "message": r(L, 116, W, 34),
             "rows": rows,
         }
 
@@ -5216,7 +5394,8 @@ class SpatialDesktop(QWidget):
         columns = len(CUSTOM_GESTURE_ACTION_GROUPS)
         width = columns*col_w + (columns-1)*gap + 16.0
         lines = max(sum(1 + len(ids) for _title, ids in column) for column in CUSTOM_GESTURE_ACTION_GROUPS)
-        top = -150.0
+        # Open just below the tab strip so the list never covers the Back button.
+        top = self._settings_layout("gestures")["top"]
         height = 34.0 + lines*line_h + 8.0
         panel = QRectF(cx-width*0.5*scale, cy+top*scale, width*scale, height*scale)
         headings, items = [], []
@@ -5318,10 +5497,11 @@ class SpatialDesktop(QWidget):
         border = QPen(QColor(125, 235, 245, 210), 1.5*scale)
 
         painter.setPen(QColor(195, 235, 242))
-        painter.setFont(font(8, QFont.Normal))
-        painter.drawText(layout["intro"], Qt.AlignCenter,
-                         "Record a hand pose, then pick its action from the ▾ list.\n"
-                         "Hold the pose for the hold time to trigger it.")
+        self._draw_fitted_button_label(painter, layout["intro"],
+                                       "Record a hand pose, then pick its action from the ▾ list.\n"
+                                       "Hold the pose for the hold time to trigger it.",
+                                       base_size=max(6, int(8*scale)), min_size=6,
+                                       weight=QFont.Normal, inset=2)
 
         recording = self.custom_gesture_recording
         for side in ("left", "right"):
@@ -5331,22 +5511,23 @@ class SpatialDesktop(QWidget):
             painter.setPen(border)
             painter.drawRoundedRect(rect, 9*scale, 9*scale)
             painter.setPen(QColor(240, 255, 255))
-            painter.setFont(font(8))
-            painter.drawText(rect, Qt.AlignCenter, ("● RECORDING " if active else "● RECORD ") + side.upper() + " HAND")
+            self._draw_fitted_button_label(painter, rect,
+                                           ("● RECORDING " if active else "● RECORD ") + side.upper() + " HAND",
+                                           base_size=max(6, int(8*scale)), min_size=6, inset=6*scale)
 
         # Built-in gestures are listed for reference only; they can't be edited here.
         painter.setBrush(QBrush(QColor(10, 37, 55, 140)))
         painter.setPen(QPen(QColor(125, 235, 245, 90), 1.0*scale, Qt.DashLine))
         painter.drawRoundedRect(layout["overlap"], 9*scale, 9*scale)
         painter.setPen(QColor(195, 235, 242))
-        painter.setFont(font(7))
-        painter.drawText(layout["overlap"], Qt.AlignCenter,
-                         "BUILT-IN: OVERLAP BOTH TLIs AND HOLD → GLASS MENU")
+        self._draw_fitted_button_label(painter, layout["overlap"],
+                                       "BUILT-IN: OVERLAP BOTH TLIs AND HOLD → GLASS MENU",
+                                       base_size=max(6, int(7*scale)), min_size=6, inset=8*scale)
 
         if self.custom_gesture_message:
             painter.setPen(QColor(255, 225, 150) if recording is not None else QColor(170, 245, 220))
-            painter.setFont(font(8))
-            painter.drawText(layout["message"], Qt.AlignCenter, self.custom_gesture_message)
+            self._draw_wrapped_fitted_text(painter, layout["message"], self.custom_gesture_message,
+                                           base_size=max(6, int(8*scale)), min_size=6)
 
         for index, row in enumerate(layout["rows"]):
             if index >= len(self.custom_gestures):
@@ -5509,8 +5690,119 @@ class SpatialDesktop(QWidget):
                     and metrics.height()*len(lines) <= available_height):
                 break
             size -= 1
-        painter.setFont(self._ui_font(max(min_size, size), weight))
+        font = self._ui_font(max(min_size, size), weight)
+        painter.setFont(font)
+        # Last resort at the minimum size: elide rather than spill past the button edge.
+        metrics = QFontMetricsF(font)
+        if max((metrics.horizontalAdvance(line) for line in lines), default=0.0) > available_width:
+            text = "\n".join(metrics.elidedText(line, Qt.ElideRight, available_width) for line in lines)
         painter.drawText(rect.adjusted(inset, 1, -inset, -1), Qt.AlignCenter, text)
+
+    def _draw_wrapped_fitted_text(self, painter, rect, text, base_size=8, min_size=6,
+                                  weight=QFont.Normal, align=Qt.AlignCenter):
+        """Word-wrap text inside rect, shrinking the font until the wrapped block fits."""
+        text = str(text)
+        flags = int(align) | int(Qt.TextWordWrap)
+        size = int(base_size)
+        while size > min_size:
+            metrics = QFontMetricsF(self._ui_font(size, weight))
+            bounds = metrics.boundingRect(QRectF(0, 0, rect.width(), 10000.0), flags, text)
+            if bounds.height() <= rect.height() and bounds.width() <= rect.width()+0.5:
+                break
+            size -= 1
+        painter.setFont(self._ui_font(max(min_size, size), weight))
+        painter.save()
+        painter.setClipRect(rect.adjusted(-2, -2, 2, 2))
+        painter.drawText(rect, flags, text)
+        painter.restore()
+
+    @staticmethod
+    def _settings_slider_value_text(name, value):
+        if name == "smoothing":
+            return f"{value:.2f}"
+        if name == "pinch_timer":
+            return f"{value:.1f}s"
+        if name == "custom_gesture_hold_seconds":
+            return f"{value:.2f}s"
+        if name == "custom_gesture_tolerance":
+            return f"{value:.2f}"
+        if name == "hand_contact_band_ratio":
+            return f"{value:.2f} PALM"
+        if name == "palm_attract_acceleration":
+            return f"{value:.2f}x"
+        if name in ("skin_tone_darkness", "hand_transparency", "scroll_backdrop_opacity",
+                    "detached_notice_opacity", "ui_font_scale"):
+            return f"{value:.0f}%"
+        if name in ("finger_thickness", "hand_scale", "palm_width_scale", "tli_glow_intensity", "skeleton_line_thickness"):
+            return f"{value:.2f}x"
+        if name == "tli_colour_shift_degrees":
+            return f"{value:.0f}°"
+        if name == "scroll_backdrop_hue":
+            return f"{value:.0f}/255"
+        if name in ("tli_border_thickness", "tli_diameter", "scroll_deadzone"):
+            return f"{value:.1f}px"
+        if name == "scroll_notch_hue":
+            notch = QColor.fromHsv(int(value) % 360, 190, 255)
+            return f"RGB {notch.red()}, {notch.green()}, {notch.blue()}"
+        return f"{value:.2f}x"
+
+    def _paint_settings_sliders(self, painter, cx, cy, scale):
+        """Draw every slider on the current page from the shared layout."""
+        geometry = self._settings_slider_layouts(cx, cy, scale)
+        for name, _offset, value, minimum, maximum, label in self._settings_slider_specs():
+            if name not in geometry:
+                continue
+            left, right, yy, label_rect = geometry[name]
+            painter.setPen(QPen(QColor(100, 190, 205, 180), 12*scale, Qt.SolidLine, Qt.RoundCap))
+            painter.drawLine(QPointF(left, yy), QPointF(right, yy))
+            painter.setPen(QPen(QColor(125, 245, 250, 245), 4*scale, Qt.SolidLine, Qt.RoundCap))
+            painter.drawLine(QPointF(left, yy), QPointF(right, yy))
+            ratio = min(1.0, max(0.0, (value-minimum)/max(1e-6, maximum-minimum)))
+            painter.setBrush(QBrush(QColor(80, 255, 150, 230)))
+            painter.setPen(QPen(QColor(220, 255, 245), 2*scale))
+            painter.drawEllipse(QPointF(left+ratio*(right-left), yy), 8*scale, 8*scale)
+            if name == "scroll_notch_hue":
+                # Colour swatch at the end of its (shortened) track, centred on it.
+                painter.setPen(QPen(QColor(225, 250, 255, 235), 1.5*scale))
+                painter.setBrush(QBrush(QColor.fromHsv(int(value) % 360, 190, 255)))
+                painter.drawEllipse(QPointF(right+20*scale, yy), 10*scale, 10*scale)
+            painter.setPen(QColor(210, 245, 240))
+            self._draw_fitted_button_label(painter, label_rect,
+                                           f"{label}  ·  {self._settings_slider_value_text(name, value)}",
+                                           base_size=max(7, int(8*scale)), min_size=6, inset=2)
+
+    def _paint_reference_columns(self, painter, columns, cx, cy, scale):
+        """Two-column Gesture Map / Speech Commands reference with one font size per role."""
+        layout = self._settings_layout()
+        col_w = self.SETTINGS_COLUMN_W*scale
+        x_starts = (cx+self.SETTINGS_LEFT_X*scale, cx+self.SETTINGS_RIGHT_X*scale)
+        top_y = cy+layout["top"]*scale
+        line_h = 17.0*scale
+        usable = col_w-8*scale
+
+        def fitted(base, weight, texts):
+            size = max(7, int(base*scale))
+            while size > 6:
+                metrics = QFontMetricsF(self._ui_font(size, weight))
+                if all(metrics.horizontalAdvance(t) <= usable for t in texts):
+                    break
+                size -= 1
+            return self._ui_font(size, weight)
+
+        all_entries = [entry for column in columns for entry in column if entry[0]]
+        heading_font = fitted(8.8, QFont.DemiBold, [t for t, heading in all_entries if heading])
+        body_font = fitted(8.3, QFont.Normal, [t for t, heading in all_entries if not heading])
+        for col_index, entries in enumerate(columns):
+            yy = top_y
+            for text, is_heading in entries:
+                if not text:
+                    yy += 7*scale
+                    continue
+                painter.setFont(heading_font if is_heading else body_font)
+                painter.setPen(QColor(135, 245, 250, 245) if is_heading else QColor(232, 248, 252, 238))
+                text_rect = QRectF(x_starts[col_index], yy, col_w, line_h+2*scale)
+                painter.drawText(text_rect, Qt.AlignLeft | Qt.AlignVCenter, text)
+                yy += line_h
 
     def _hand_visual_transform(self, points, side=None):
         """Return one consistent fixed-scale transform for landmarks and the TLI.
@@ -6372,6 +6664,57 @@ class SpatialDesktop(QWidget):
         except Exception:
             pass
 
+    # Repaint interval used while nothing on screen is moving (see _scene_is_idle).
+    IDLE_REPAINT_INTERVAL = 0.1
+
+    def _scene_is_idle(self, now):
+        """True when no hand is in view and nothing is animating.
+
+        Repainting the full-screen translucent overlay is the most expensive part of
+        each frame, so idle frames are repainted at a lower rate. Any visible hand,
+        gesture, drag, transition or press feedback restores the full frame rate.
+        """
+        try:
+            if any(now-float(seen or 0.0) < 0.6 for seen in self.hand_last_seen.values()):
+                return False
+            if any(self.active_action.values()) or any(self.pinch_drag_active.values()):
+                return False
+            if any(self.fist_action_menu_open.values()):
+                return False
+            for effect in self.gesture_timer_fade.values():
+                if effect and now-float(effect.get("started_at", 0.0)) < 0.3:
+                    return False
+            if now-self.menu_transition_started < self.menu_transition_duration+0.1:
+                return False
+            if (self.settings_open and self.settings_page_transition_started and
+                    self._settings_page_transition_progress(now) < 1.0):
+                return False
+            if self.settings_page_pending is not None:
+                return False
+            if now < float(getattr(self, "heard_popup_shake_until", 0.0)) or now < self.click_flash_until:
+                return False
+            if now-float(getattr(self, "_glass_pressed_at", 0.0)) < 0.35:
+                return False
+            for animation in self.pinch_menu_animation.values():
+                if now-float(animation.get("started_at", 0.0)) < float(animation.get("duration", 0.2))+0.05:
+                    return False
+            for marker in self.fist_scroll_markers.values():
+                if marker and now <= float(marker.get("until", 0.0)):
+                    return False
+            if (self.hand_calibration_active or self.tli_calibration_active_side is not None or
+                    self.custom_gesture_recording is not None or self.active_slider is not None):
+                return False
+        except Exception:
+            return False
+        return True
+
+    def _request_scene_repaint(self, now):
+        if (self._scene_is_idle(now) and
+                now-getattr(self, "_last_scene_repaint", 0.0) < self.IDLE_REPAINT_INTERVAL):
+            return
+        self._last_scene_repaint = now
+        self.update()
+
     def update_scene(self):
         """Mutually-exclusive quick clicks, direct fist manipulation, and Pinch Menu gestures."""
         # Track which hand toggled this frame so only that hand's gesture processing pauses.
@@ -6395,7 +6738,7 @@ class SpatialDesktop(QWidget):
             if self._applied_desktop_mode != self.desktop_mode or getattr(self, "_applied_menu_state", None) != menu_state:
                 self.apply_desktop_mode()
             self.depth += (self.target_depth-self.depth)*0.16
-            self.update()
+            self._request_scene_repaint(now)
             return
         detected_hands, _frame_id = self.tracker.snapshot()
         hands_by_side = {}
@@ -6716,7 +7059,7 @@ class SpatialDesktop(QWidget):
                 if mouse_side in cursor_points:
                     self._set_os_pointer(cursor_points[mouse_side])
             self.depth += (self.target_depth-self.depth)*0.16
-            self.update()
+            self._request_scene_repaint(now)
             return
 
         preferred = self.cursor_lock_priority if self.cursor_lock_priority in ("left", "right") else "right"
@@ -7537,7 +7880,7 @@ class SpatialDesktop(QWidget):
                 self._set_os_pointer(cursor_points[mouse_side])
 
         self.depth += (self.target_depth-self.depth)*0.16
-        self.update()
+        self._request_scene_repaint(now)
 
     def closeEvent(self, event):
         if getattr(self, "hand_calibration_window", None) is not None:
@@ -7680,7 +8023,14 @@ class SpatialDesktop(QWidget):
             super().keyPressEvent(event)
 
     def paintEvent(self, event):
-        painter = QPainter(self)
+        # Native video windows can temporarily invalidate the transparent overlay surface
+        # while Windows is moving/resizing them. Skip that frame instead of issuing
+        # follow-on drawing calls against an inactive painter.
+        if not self.isVisible() or self.width() <= 0 or self.height() <= 0:
+            return
+        painter = QPainter()
+        if not painter.begin(self):
+            return
         painter.setRenderHint(QPainter.Antialiasing, True)
         width, height = self.width(), self.height()
         now = time.monotonic()
@@ -7879,7 +8229,8 @@ class SpatialDesktop(QWidget):
                     page_titles = {"gesture_map": "GESTURE MAP", "speech_commands": "SPEECH COMMANDS"}
                     painter.setPen(QColor(235, 255, 255))
                     painter.setFont(self._ui_font(16, QFont.DemiBold))
-                    painter.drawText(QRectF(cx-200*scale, cy-350*scale, 400*scale, 32*scale),
+                    title_top = -self._settings_layout()["height"]*0.5 + 26.0
+                    painter.drawText(QRectF(cx-200*scale, cy+title_top*scale, 400*scale, 32*scale),
                                      Qt.AlignCenter | Qt.AlignVCenter, page_titles[self.settings_page])
                 back = self._settings_back_rect(cx, cy, scale)
                 painter.setBrush(QBrush(QColor(35, 105, 125, 225)))
@@ -7957,30 +8308,7 @@ class SpatialDesktop(QWidget):
                             ("Use Speech Commands for the full list.", False),
                         ],
                     ]
-                    col_w = 211*scale
-                    line_h = 15.8*scale
-                    x_starts = (cx-222*scale, cx+11*scale)
-                    top_y = cy-174*scale
-                    for col_index, entries in enumerate(columns):
-                        yy = top_y
-                        for text, is_heading in entries:
-                            if not text:
-                                yy += 6*scale
-                                continue
-                            font = self._ui_font(max(7, int((8.3 if not is_heading else 8.8)*scale)),
-                                         QFont.DemiBold if is_heading else QFont.Normal)
-                            # Keep each entry on its own row; shrink long labels slightly instead
-                            # of wrapping into and obscuring the next gesture/command.
-                            while font.pointSize() > 6:
-                                painter.setFont(font)
-                                if painter.fontMetrics().horizontalAdvance(text) <= col_w-8*scale:
-                                    break
-                                font.setPointSize(font.pointSize()-1)
-                            painter.setFont(font)
-                            painter.setPen(QColor(135, 245, 250, 245) if is_heading else QColor(232, 248, 252, 238))
-                            text_rect = QRectF(x_starts[col_index], yy, col_w, line_h+2*scale)
-                            painter.drawText(text_rect, Qt.AlignLeft | Qt.AlignVCenter, text)
-                            yy += line_h
+                    self._paint_reference_columns(painter, columns, cx, cy, scale)
 
                 elif self.settings_page == "speech_commands":
                     columns = [
@@ -8032,91 +8360,22 @@ class SpatialDesktop(QWidget):
                             ("depend on your OS and active app.", False),
                         ],
                     ]
-                    col_w = 211*scale
-                    line_h = 15.8*scale
-                    x_starts = (cx-222*scale, cx+11*scale)
-                    top_y = cy-174*scale
-                    for col_index, entries in enumerate(columns):
-                        yy = top_y
-                        for text, is_heading in entries:
-                            if not text:
-                                yy += 6*scale
-                                continue
-                            font = self._ui_font(max(7, int((8.2 if not is_heading else 8.8)*scale)),
-                                         QFont.DemiBold if is_heading else QFont.Normal)
-                            # Long command aliases remain a single line and never collide with
-                            # the next row in this compact two-column in-menu reference.
-                            while font.pointSize() > 6:
-                                painter.setFont(font)
-                                if painter.fontMetrics().horizontalAdvance(text) <= col_w-8*scale:
-                                    break
-                                font.setPointSize(font.pointSize()-1)
-                            painter.setFont(font)
-                            painter.setPen(QColor(135, 245, 250, 245) if is_heading else QColor(232, 248, 252, 238))
-                            text_rect = QRectF(x_starts[col_index], yy, col_w, line_h+2*scale)
-                            painter.drawText(text_rect, Qt.AlignLeft | Qt.AlignVCenter, text)
-                            yy += line_h
+                    self._paint_reference_columns(painter, columns, cx, cy, scale)
 
-                elif self.settings_page in ("interaction", "hands", "tli", "gestures"):
+                elif self.settings_page in ("interaction", "hands", "tli", "gestures",
+                                            "notifications", "voice", "update", "d1"):
+                    # Every control below is placed by _settings_layout(), the same
+                    # geometry used for click hit-testing and hover/press feedback.
+                    controls = self._settings_control_rects(cx, cy, scale)
+                    text_rects = self._settings_text_rects(cx, cy, scale)
+                    label_size = max(7, int(8*scale))
                     if self.settings_page == "gestures":
                         self._paint_custom_gestures_page(painter, cx, cy, scale, now)
-                    for name, oy, value, minimum, maximum, label in self._settings_slider_specs():
-                        yy = cy+oy*scale
-                        left, right = cx+70*scale, cx+250*scale
-                        painter.setPen(QPen(QColor(100, 190, 205, 180), 12*scale, Qt.SolidLine, Qt.RoundCap))
-                        painter.drawLine(QPointF(left, yy), QPointF(right, yy))
-                        painter.setPen(QPen(QColor(125, 245, 250, 245), 4*scale, Qt.SolidLine, Qt.RoundCap))
-                        painter.drawLine(QPointF(left, yy), QPointF(right, yy))
-                        ratio = min(1.0, max(0.0, (value-minimum)/max(1e-6, maximum-minimum)))
-                        painter.setBrush(QBrush(QColor(80, 255, 150, 230)))
-                        painter.setPen(QPen(QColor(220, 255, 245), 2*scale))
-                        painter.drawEllipse(QPointF(left+ratio*(right-left), yy), 8*scale, 8*scale)
-                        painter.setPen(QColor(210, 245, 240))
-                        painter.setFont(self._ui_font(max(7, int(8*scale)), QFont.DemiBold))
-                        if name == "smoothing":
-                            display_value = f"{value:.2f}"
-                        elif name == "pinch_timer":
-                            display_value = f"{value:.1f}s"
-                        elif name == "custom_gesture_hold_seconds":
-                            display_value = f"{value:.2f}s"
-                        elif name == "custom_gesture_tolerance":
-                            display_value = f"{value:.2f}"
-                        elif name == "hand_contact_band_ratio":
-                            display_value = f"{value:.2f} PALM"
-                        elif name == "palm_attract_acceleration":
-                            display_value = f"{value:.2f}x"
-                        elif name in ("skin_tone_darkness",):
-                            display_value = f"{value:.0f}%"
-                        elif name in ("finger_thickness", "hand_scale", "palm_width_scale", "tli_glow_intensity", "skeleton_line_thickness"):
-                            display_value = f"{value:.2f}x"
-                        elif name == "tli_colour_shift_degrees":
-                            display_value = f"{value:.0f}°"
-                        elif name == "scroll_backdrop_opacity":
-                            display_value = f"{value:.0f}%"
-                        elif name == "scroll_backdrop_hue":
-                            display_value = f"{value:.0f}/255"
-                        elif name in ("tli_border_thickness", "tli_diameter", "scroll_deadzone"):
-                            display_value = f"{value:.1f}px"
-                        else:
-                            display_value = f"{value:.2f}x"
-                        if name == "scroll_notch_hue":
-                            notch_preview = QColor.fromHsv(int(value) % 360, 190, 255)
-                            display_value = f"RGB {notch_preview.red()}, {notch_preview.green()}, {notch_preview.blue()}"
-                            # Keep the colour swatch beside the track, aligned to its centre.
-                            preview_center = QPointF(cx+270*scale, yy)
-                            painter.setPen(QPen(QColor(225, 250, 255, 235), 1.5*scale))
-                            painter.setBrush(QBrush(notch_preview))
-                            painter.drawEllipse(preview_center, 10*scale, 10*scale)
-                            painter.setPen(QColor(210, 245, 240))
-                            painter.drawText(QRectF(cx+55*scale, yy+10*scale, 250*scale, 18*scale),
-                                             Qt.AlignCenter, f"{label}  ·  {display_value}")
-                        else:
-                            painter.drawText(QRectF(cx+55*scale, yy+10*scale, 250*scale, 18*scale),
-                                             Qt.AlignCenter, f"{label}  ·  {display_value}")
+                    self._paint_settings_sliders(painter, cx, cy, scale)
 
                     if self.settings_page == "interaction":
-                        scroll = QRectF(cx-320*scale, cy+195*scale, 290*scale, 34*scale)
-                        priority = QRectF(cx-320*scale, cy+237*scale, 290*scale, 34*scale)
+                        scroll = controls["scroll_toggle"]
+                        priority = controls["priority_toggle"]
                         painter.setBrush(QBrush(QColor(55, 145, 82, 225) if self.invert_scroll else QColor(75, 80, 89, 205)))
                         painter.setPen(QPen(QColor(155, 245, 180, 220) if self.invert_scroll else QColor(155, 162, 172, 200), 1.5*scale))
                         painter.drawRoundedRect(scroll, 10*scale, 10*scale)
@@ -8124,47 +8383,45 @@ class SpatialDesktop(QWidget):
                         painter.setPen(QPen(QColor(125, 235, 245, 200), 1.5*scale))
                         painter.drawRoundedRect(priority, 10*scale, 10*scale)
                         painter.setPen(QColor(225, 250, 250))
-                        painter.setFont(self._ui_font(max(7, int(8*scale)), QFont.DemiBold))
-                        self._draw_fitted_button_label(painter, scroll, "SCROLL  ·  "+("INVERTED" if self.invert_scroll else "NORMAL"), base_size=8, min_size=6, inset=12*scale)
-                        self._draw_fitted_button_label(painter, priority, "CURSOR PRIORITY  ·  "+self.cursor_lock_priority.upper(), base_size=8, min_size=6, inset=12*scale)
+                        self._draw_fitted_button_label(painter, scroll, "SCROLL  ·  "+("INVERTED" if self.invert_scroll else "NORMAL"), base_size=label_size, min_size=6, inset=12*scale)
+                        self._draw_fitted_button_label(painter, priority, "CURSOR PRIORITY  ·  "+self.cursor_lock_priority.upper(), base_size=label_size, min_size=6, inset=12*scale)
 
                     elif self.settings_page == "tli":
-                        glow_toggle = QRectF(cx-320*scale, cy-170*scale, 290*scale, 34*scale)
+                        glow_toggle = controls["glow_toggle"]
                         painter.setBrush(QBrush(QColor(55, 145, 82, 225) if self.tli_glow_enabled else QColor(75, 80, 89, 205)))
                         painter.setPen(QPen(QColor(155, 245, 180, 220) if self.tli_glow_enabled else QColor(155, 162, 172, 200), 1.5*scale))
-                        painter.drawRoundedRect(glow_toggle, 9*scale, 9*scale)
+                        painter.drawRoundedRect(glow_toggle, 10*scale, 10*scale)
                         painter.setPen(QColor(225, 250, 250))
-                        painter.setFont(self._ui_font(max(7, int(8*scale)), QFont.DemiBold))
-                        self._draw_fitted_button_label(painter, glow_toggle, "TLI GLOW  ·  "+("ON" if self.tli_glow_enabled else "OFF"), base_size=8, min_size=6, inset=12*scale)
+                        self._draw_fitted_button_label(painter, glow_toggle, "TLI GLOW  ·  "+("ON" if self.tli_glow_enabled else "OFF"), base_size=label_size, min_size=6, inset=12*scale)
 
                         # Independent left/right TLI colour swatches are grouped here.
-                        for label, x_offset, color in (("LEFT TLI", -250, self.left_click_color),
-                                                       ("RIGHT TLI", -130, self.right_click_color)):
-                            ox = cx+x_offset*scale
+                        for label, key, color in (("LEFT TLI", "swatch_left", self.left_click_color),
+                                                  ("RIGHT TLI", "swatch_right", self.right_click_color)):
+                            swatch = controls[key]
+                            centre = QPointF(swatch.center().x(), swatch.top()+24*scale)
                             painter.setBrush(QBrush(color))
                             painter.setPen(QPen(QColor(225, 250, 255, 230), 2*scale))
-                            painter.drawEllipse(QPointF(ox, cy-95*scale), 14*scale, 14*scale)
+                            painter.drawEllipse(centre, 14*scale, 14*scale)
                             painter.setPen(QColor(210, 245, 240))
-                            painter.setFont(self._ui_font(max(7, int(8*scale)), QFont.DemiBold))
-                            painter.drawText(QRectF(ox-42*scale, cy-78*scale, 84*scale, 16*scale),
-                                             Qt.AlignCenter, label)
+                            self._draw_fitted_button_label(
+                                painter, QRectF(swatch.left(), swatch.top()+42*scale, swatch.width(), 20*scale),
+                                label, base_size=label_size, min_size=6, inset=2)
 
                     elif self.settings_page == "hands":
-                        skin_effect = QRectF(cx-320*scale, cy-170*scale, 290*scale, 38*scale)
+                        skin_effect = controls["skin_effect"]
                         painter.setBrush(QBrush(QColor(55, 145, 82, 225) if self.hand_skin_effect_enabled
                                                 else QColor(75, 80, 89, 205)))
                         painter.setPen(QPen(QColor(125, 235, 245, 210), 1.5*scale))
                         painter.drawRoundedRect(skin_effect, 10*scale, 10*scale)
                         painter.setPen(QColor(235, 255, 255))
-                        painter.setFont(self._ui_font(max(7, int(8*scale)), QFont.DemiBold))
-                        self._draw_fitted_button_label(painter, skin_effect, "RENDER STYLE  ·  "+("SKIN EFFECT" if self.hand_skin_effect_enabled else "SKELETON"), base_size=8, min_size=6, inset=12*scale)
+                        self._draw_fitted_button_label(painter, skin_effect, "RENDER STYLE  ·  "+("SKIN EFFECT" if self.hand_skin_effect_enabled else "SKELETON"), base_size=label_size, min_size=6, inset=12*scale)
 
-                        tint_toggle = QRectF(cx-320*scale, cy-122*scale, 290*scale, 32*scale)
+                        tint_toggle = controls["skin_tint"]
                         painter.setBrush(QBrush(QColor(55, 145, 82, 225) if self.skin_use_skeleton_color else QColor(75, 80, 89, 205)))
                         painter.setPen(QPen(QColor(125, 235, 245, 210), 1.5*scale))
-                        painter.drawRoundedRect(tint_toggle, 9*scale, 9*scale)
+                        painter.drawRoundedRect(tint_toggle, 10*scale, 10*scale)
                         painter.setPen(QColor(235, 255, 255))
-                        self._draw_fitted_button_label(painter, tint_toggle, "SKIN COLOUR  ·  "+("SKELETON COLOUR" if self.skin_use_skeleton_color else "NATURAL"), base_size=8, min_size=6, inset=12*scale)
+                        self._draw_fitted_button_label(painter, tint_toggle, "SKIN COLOUR  ·  "+("SKELETON COLOUR" if self.skin_use_skeleton_color else "NATURAL"), base_size=label_size, min_size=6, inset=12*scale)
 
                         # Each hand's independent calibration opens a temporary target window.
                         for calibration_side, rect in self._tli_calibration_button_rects(cx, cy, scale).items():
@@ -8189,231 +8446,184 @@ class SpatialDesktop(QWidget):
                                 fill = QColor(10, 47, 67, 225)
                             painter.setBrush(QBrush(fill))
                             painter.setPen(QPen(QColor(125, 235, 245, 210), 1.5*scale))
-                            painter.drawRoundedRect(rect, 9*scale, 9*scale)
+                            painter.drawRoundedRect(rect, 10*scale, 10*scale)
                             painter.setPen(QColor(235, 255, 255))
-                            painter.setFont(self._ui_font(max(6, int(8*scale)), QFont.DemiBold))
-                            painter.drawText(rect, Qt.AlignCenter, label)
+                            self._draw_fitted_button_label(painter, rect, label, base_size=label_size, min_size=6, inset=12*scale)
 
-                        hand_setup_rect = QRectF(cx-320*scale, cy+135*scale, 290*scale, 28*scale)
+                        hand_setup_rect = controls["hand_setup"]
                         painter.setBrush(QBrush(QColor(18, 80, 93, 235)))
                         painter.setPen(QPen(QColor(115, 242, 250, 220), 1.4*scale))
-                        painter.drawRoundedRect(hand_setup_rect, 8*scale, 8*scale)
+                        painter.drawRoundedRect(hand_setup_rect, 10*scale, 10*scale)
                         painter.setPen(QColor(235, 255, 255))
-                        painter.setFont(self._ui_font(max(7, int(9*scale)), QFont.DemiBold))
-                        painter.drawText(hand_setup_rect, Qt.AlignCenter, "RUN HAND SCALE & PROXIMITY CALIBRATION")
+                        self._draw_fitted_button_label(painter, hand_setup_rect, "RUN HAND SCALE & PROXIMITY CALIBRATION",
+                                                       base_size=label_size, min_size=6, inset=12*scale)
+
+                    elif self.settings_page == "notifications":
+                        for key, label, default in NOTIFICATION_SETTING_ROWS:
+                            rect = controls["notify:" + key]
+                            painter.setBrush(QBrush(QColor(10, 47, 67, 225)))
+                            painter.setPen(QPen(QColor(140, 230, 240, 210), 1.5*scale))
+                            painter.drawRoundedRect(rect, 10*scale, 10*scale)
+                            position = self.ui_preferences.get(key, default)
+                            painter.setPen(QColor(237, 252, 255))
+                            self._draw_fitted_button_label(painter, rect, f"{label}  ·  {position.upper().replace('-', ' ')}",
+                                                           base_size=max(7, int(8.5*scale)), min_size=6, inset=12*scale)
+                        painter.setPen(QColor(185, 225, 235))
+                        self._draw_wrapped_fitted_text(painter, text_rects["help"],
+                                                       "Select a row to cycle through six screen positions.\nChanges save automatically.",
+                                                       base_size=max(7, int(8*scale)), min_size=6)
+
+                    elif self.settings_page == "voice":
+                        tts_toggle = controls["tts_toggle"]
+                        voice_button = controls["voice_cycle"]
+                        painter.setBrush(QBrush(QColor(55, 145, 82, 225) if self.tts.enabled else QColor(75, 80, 89, 205)))
+                        painter.setPen(QPen(QColor(155, 245, 180, 220) if self.tts.enabled else QColor(155, 162, 172, 200), 1.5*scale))
+                        painter.drawRoundedRect(tts_toggle, 10*scale, 10*scale)
+                        painter.setBrush(QBrush(QColor(25, 95, 115, 225)))
+                        painter.setPen(QPen(QColor(140, 230, 240, 215), 1.5*scale))
+                        painter.drawRoundedRect(voice_button, 10*scale, 10*scale)
+                        painter.setPen(QColor(240, 253, 255))
+                        self._draw_fitted_button_label(painter, tts_toggle, "LOCAL TTS  ·  "+("ON" if self.tts.enabled else "OFF"), base_size=label_size, min_size=6, inset=12*scale)
+                        self._draw_fitted_button_label(painter, voice_button, "VOICE  ·  "+str(self.tts.settings.get("voice", "bf_emma")).upper()+"  ·  CLICK TO CHANGE", base_size=label_size, min_size=6, inset=12*scale)
+
+                        test_button = controls["test_voice"]
+                        face_button = controls["face_welcome"]
+                        for rect in (test_button, face_button):
+                            painter.setBrush(QBrush(QColor(10, 47, 67, 225)))
+                            painter.setPen(QPen(QColor(140, 230, 240, 210), 1.5*scale))
+                            painter.drawRoundedRect(rect, 10*scale, 10*scale)
+                        painter.setPen(QColor(240, 253, 255))
+                        self._draw_fitted_button_label(painter, test_button, "TEST VOICE", base_size=label_size, min_size=6, inset=12*scale)
+                        face_label = ("FACE WELCOME  ·  " + self.face_welcome.profile_name() + "  ·  MANAGE" if self.face_welcome.has_profile()
+                                      else "ENROL FACE FOR WELCOME-BACK")
+                        self._draw_fitted_button_label(painter, face_button, face_label, base_size=label_size, min_size=6, inset=12*scale)
+                        painter.setPen(QColor(170, 215, 225, 230))
+                        voice_status = f"{self.tts.status}  ·  {self.face_enrollment_status}"
+                        self._draw_wrapped_fitted_text(painter, text_rects["status"], voice_status[:150],
+                                                       base_size=max(6, int(7*scale)), min_size=6)
+
+                    elif self.settings_page == "update":
+                        action_button = controls["update_action"]
+                        downloading = self.update_action_running and self.update_action_mode == "download"
+                        if self.update_action_running:
+                            action_label = "INSTALLING…" if self.update_action_mode == "install" else ""
+                        elif self.update_installed:
+                            action_label = "RESTART"
+                        elif self.update_download_path:
+                            action_label = "INSTALL"
+                        else:
+                            action_label = "UPDATE"
+                        painter.setBrush(QBrush(QColor(10, 47, 67, 225)))
+                        painter.setPen(QPen(QColor(140, 230, 240, 210), 1.5*scale))
+                        painter.drawRoundedRect(action_button, 10*scale, 10*scale)
+                        if downloading:
+                            inner = action_button.adjusted(3*scale, 3*scale, -3*scale, -3*scale)
+                            painter.setPen(Qt.NoPen)
+                            painter.setBrush(QBrush(QColor(48, 132, 76, 245)))
+                            if self.update_progress_total > 0:
+                                fraction = min(1.0, max(0.0, self.update_progress_current / self.update_progress_total))
+                                fill = QRectF(inner.x(), inner.y(), inner.width()*fraction, inner.height())
+                                painter.drawRoundedRect(fill, 7*scale, 7*scale)
+                            painter.setPen(QColor(240, 253, 255))
+                            progress_text = (f"{min(100, int(100*self.update_progress_current/self.update_progress_total))}%"
+                                             if self.update_progress_total > 0 else "DOWNLOADING…")
+                            self._draw_fitted_button_label(painter, action_button, progress_text, base_size=max(7, int(9*scale)), min_size=6, inset=12*scale)
+                        else:
+                            painter.setPen(QColor(240, 253, 255))
+                            self._draw_fitted_button_label(painter, action_button, action_label, base_size=max(7, int(9*scale)), min_size=6, inset=12*scale)
+                        painter.setPen(QColor(185, 225, 232))
+                        self._draw_wrapped_fitted_text(painter, text_rects["status"], self.update_status,
+                                                       base_size=max(7, int(8*scale)), min_size=6,
+                                                       align=Qt.AlignHCenter | Qt.AlignTop)
+                        self._draw_wrapped_fitted_text(painter, text_rects["about"],
+                                                       "Checks GitHub version.txt, downloads a newer release, then lets you install it while preserving settings and calibration. Restart after installation.",
+                                                       base_size=max(6, int(7*scale)), min_size=6,
+                                                       align=Qt.AlignHCenter | Qt.AlignTop)
+
+                    elif self.settings_page == "d1":
+                        info = d1_status()
+                        model_key = selected_d1_model()
+                        model_button = controls["d1_model"]
+                        runtime_button = controls["d1_start"]
+                        stop_button = controls["d1_stop"]
+                        retry_button = controls["d1_retry"]
+                        running = bool(info.get("ready") or info.get("loading"))
+                        model_active = bool(info.get("model_exists"))
+                        retry_active = bool(info.get("error") or info.get("downloading") or not model_active)
+                        button_states = (
+                            (model_button, model_active),
+                            (runtime_button, running),
+                            (stop_button, running),
+                            (retry_button, retry_active),
+                        )
+                        for rect, active in button_states:
+                            fill = QColor(48, 132, 76, 230) if active else QColor(72, 78, 88, 210)
+                            edge = QColor(155, 245, 180, 230) if active else QColor(155, 165, 178, 190)
+                            painter.setBrush(QBrush(fill))
+                            painter.setPen(QPen(edge, 1.5*scale))
+                            painter.drawRoundedRect(rect, 10*scale, 10*scale)
+                        painter.setPen(QColor(240, 253, 255))
+                        self._draw_fitted_button_label(painter, model_button,
+                                                       "MODEL  ·  " + D1_MODELS[model_key]["label"].upper() + "  ·  DEFAULT / ENSURE",
+                                                       base_size=label_size, min_size=6, inset=10*scale)
+                        self._draw_fitted_button_label(painter, runtime_button, "START / ENSURE RUNNING", base_size=label_size, min_size=6, inset=8*scale)
+                        self._draw_fitted_button_label(painter, stop_button, "STOP LOCAL SERVER", base_size=label_size, min_size=6, inset=8*scale)
+                        self._draw_fitted_button_label(painter, retry_button, "DOWNLOAD / RETRY / START", base_size=label_size, min_size=6, inset=10*scale)
+                        painter.setPen(QColor(185, 225, 232))
+                        if info.get("downloading"):
+                            state = "DOWNLOADING MODEL FILES…"
+                        elif info.get("loading"):
+                            state = "STARTING LLAMA.CPP SERVER…"
+                        elif info.get("ready"):
+                            state = "LOCAL SERVER: RUNNING"
+                        elif info.get("error"):
+                            state = "STATUS: " + str(info.get("error"))[:90]
+                        else:
+                            state = "LOCAL SERVER: STOPPED / NOT READY"
+                        self._draw_wrapped_fitted_text(painter, text_rects["state"], state,
+                                                       base_size=max(7, int(8*scale)), min_size=6)
+                        self._draw_wrapped_fitted_text(painter, text_rects["about"],
+                                                       "Runs locally through llama.cpp. No separate terminal is needed. "
+                                                       "The larger model downloads only after you select it.",
+                                                       base_size=max(6, int(7*scale)), min_size=6)
+                        # Compact in-panel event log beneath the status text.
+                        log_rect = text_rects["log"]
+                        painter.setBrush(QBrush(QColor(3, 10, 20, 220)))
+                        painter.setPen(QPen(QColor(90, 170, 190, 190), 1.0*scale))
+                        painter.drawRoundedRect(log_rect, 8*scale, 8*scale)
+                        signature = (bool(info.get("ready")), bool(info.get("loading")),
+                                     bool(info.get("downloading")), str(info.get("error") or ""),
+                                     bool(info.get("model_exists")))
+                        if signature != self._last_d1_log_signature:
+                            self._last_d1_log_signature = signature
+                            if info.get("error"):
+                                self._log_d1_ui("ERROR: " + str(info.get("error"))[:120])
+                            elif info.get("downloading"):
+                                self._log_d1_ui("Downloading model files…")
+                            elif info.get("loading"):
+                                self._log_d1_ui("Starting local runtime…")
+                            elif info.get("ready"):
+                                self._log_d1_ui("Local server ready")
+                            elif info.get("model_exists"):
+                                self._log_d1_ui("Model files available; server stopped")
+                            else:
+                                self._log_d1_ui("Model files missing; use Download / Retry / Start")
+                        painter.setPen(QColor(185, 225, 232))
+                        painter.setFont(self._ui_font(7, QFont.DemiBold))
+                        painter.drawText(log_rect.adjusted(9*scale, 4*scale, -9*scale, -4*scale),
+                                         Qt.AlignLeft | Qt.AlignTop, "ENGINE LOG")
+                        log_lines = self.d1_ui_log[-5:]
+                        log_text = "\n".join(log_lines)
+                        painter.save()
+                        painter.setClipRect(log_rect.adjusted(2*scale, 2*scale, -2*scale, -2*scale))
+                        painter.setFont(self._ui_font(7, QFont.Normal))
+                        painter.drawText(log_rect.adjusted(9*scale, 21*scale, -9*scale, -5*scale),
+                                         Qt.AlignLeft | Qt.AlignTop | Qt.TextWordWrap, log_text)
+                        painter.restore()
 
                     if self.settings_page == "gestures" and self.custom_gesture_dropdown is not None:
                         # Painted after the sliders so the open list sits on top of them.
                         self._paint_custom_gesture_dropdown(painter, cx, cy, scale)
-
-                elif self.settings_page == "notifications":
-                    notification_rows = (
-                        ("paused_notice_position", "GESTURE LEGEND LOCATION", -125),
-                        ("heard_bar_position", "HEARD / TRANSCRIPT BAR", -70),
-                        ("left_status_position", "LEFT HAND STATUS", -15),
-                        ("right_status_position", "RIGHT HAND STATUS", 40),
-                        ("dictation_indicator_position", "DICTATION INDICATOR", 85),
-                        ("stt_indicator_position", "STT INDICATOR", 130),
-                    )
-                    for row_index, (key, label, yoff) in enumerate(notification_rows):
-                        rect = QRectF(cx-320*scale, cy+(-165+row_index*47)*scale, 290*scale, 36*scale)
-                        painter.setBrush(QBrush(QColor(10, 47, 67, 225)))
-                        painter.setPen(QPen(QColor(140, 230, 240, 210), 1.5))
-                        painter.drawRoundedRect(rect, 10*scale, 10*scale)
-                        defaults = {"paused_notice_position": "bottom-center", "heard_bar_position": "bottom-center",
-                                    "left_status_position": "bottom-left", "right_status_position": "bottom-right",
-                                    "dictation_indicator_position": "top-left", "stt_indicator_position": "top-right"}
-                        position = self.ui_preferences.get(key, defaults[key])
-                        painter.setPen(QColor(237, 252, 255))
-                        painter.setFont(self._ui_font(max(7, int(8.5*scale)), QFont.DemiBold))
-                        painter.drawText(rect, Qt.AlignCenter, f"{label}  ·  {position.upper().replace('-', ' ')}")
-                    painter.setPen(QColor(185, 225, 235))
-                    painter.setFont(self._ui_font(9))
-                    painter.drawText(QRectF(cx-320*scale, cy+125*scale, 290*scale, 34*scale),
-                                     Qt.AlignCenter, "Select a row to cycle through six screen positions.\nChanges save automatically.")
-                    for name, oy, value, minimum, maximum, label in self._settings_slider_specs():
-                        yy = cy+oy*scale
-                        left, right = cx+70*scale, cx+250*scale
-                        painter.setPen(QPen(QColor(100, 190, 205, 180), 12*scale, Qt.SolidLine, Qt.RoundCap))
-                        painter.drawLine(QPointF(left, yy), QPointF(right, yy))
-                        painter.setPen(QPen(QColor(125, 245, 250, 245), 4*scale, Qt.SolidLine, Qt.RoundCap))
-                        painter.drawLine(QPointF(left, yy), QPointF(right, yy))
-                        ratio = min(1.0, max(0.0, (value-minimum)/max(1e-6, maximum-minimum)))
-                        painter.setBrush(QBrush(QColor(80, 255, 150, 230)))
-                        painter.setPen(QPen(QColor(220, 255, 245), 2*scale))
-                        painter.drawEllipse(QPointF(left+ratio*(right-left), yy), 8*scale, 8*scale)
-                        painter.setPen(QColor(210, 245, 240))
-                        painter.setFont(self._ui_font(max(7, int(8*scale)), QFont.DemiBold))
-                        painter.drawText(QRectF(cx+45*scale, yy+10*scale, 270*scale, 18*scale),
-                                         Qt.AlignCenter, f"{label}  ·  {value:.0f}%")
-
-                elif self.settings_page == "voice":
-                    tts_toggle = QRectF(cx-320*scale, cy-170*scale, 290*scale, 38*scale)
-                    voice_button = QRectF(cx-320*scale, cy-120*scale, 290*scale, 38*scale)
-                    painter.setBrush(QBrush(QColor(55, 145, 82, 225) if self.tts.enabled else QColor(75, 80, 89, 205)))
-                    painter.setPen(QPen(QColor(155, 245, 180, 220) if self.tts.enabled else QColor(155, 162, 172, 200), 1.5*scale))
-                    painter.drawRoundedRect(tts_toggle, 10*scale, 10*scale)
-                    painter.setBrush(QBrush(QColor(25, 95, 115, 225)))
-                    painter.setPen(QPen(QColor(140, 230, 240, 215), 1.5))
-                    painter.drawRoundedRect(voice_button, 10*scale, 10*scale)
-                    painter.setPen(QColor(240, 253, 255))
-                    painter.setFont(self._ui_font(9, QFont.DemiBold))
-                    self._draw_fitted_button_label(painter, tts_toggle, "LOCAL TTS  ·  "+("ON" if self.tts.enabled else "OFF"), base_size=9, min_size=6, inset=12*scale)
-                    self._draw_fitted_button_label(painter, voice_button, "VOICE  ·  "+str(self.tts.settings.get("voice", "bf_emma")).upper()+"  ·  CLICK TO CHANGE", base_size=9, min_size=6, inset=12*scale)
-
-                    left, right = cx+70*scale, cx+250*scale
-                    yy = cy
-                    speed = float(self.tts.settings.get("speed", 1.0))
-                    ratio = min(1.0, max(0.0, (speed-0.7)/0.8))
-                    painter.setPen(QPen(QColor(100, 190, 205, 180), 12, Qt.SolidLine, Qt.RoundCap))
-                    painter.drawLine(QPointF(left, yy), QPointF(right, yy))
-                    painter.setPen(QPen(QColor(125, 245, 250, 245), 4, Qt.SolidLine, Qt.RoundCap))
-                    painter.drawLine(QPointF(left, yy), QPointF(right, yy))
-                    painter.setBrush(QBrush(QColor(80, 255, 150, 230)))
-                    painter.setPen(QPen(QColor(220, 255, 245), 2))
-                    painter.drawEllipse(QPointF(left+ratio*(right-left), yy), 8*scale, 8*scale)
-                    painter.setPen(QColor(210, 245, 240))
-                    painter.setFont(self._ui_font(8, QFont.DemiBold))
-                    painter.drawText(QRectF(cx+45*scale, cy+10*scale, 270*scale, 18*scale), Qt.AlignCenter, f"SPEECH SPEED  ·  {speed:.2f}x")
-
-                    test_button = QRectF(cx-320*scale, cy-60*scale, 290*scale, 38*scale)
-                    face_button = QRectF(cx-320*scale, cy-10*scale, 290*scale, 38*scale)
-                    for rect in (test_button, face_button):
-                        painter.setBrush(QBrush(QColor(10, 47, 67, 225)))
-                        painter.setPen(QPen(QColor(140, 230, 240, 210), 1.5))
-                        painter.drawRoundedRect(rect, 10*scale, 10*scale)
-                    painter.setPen(QColor(240, 253, 255))
-                    painter.setFont(self._ui_font(9, QFont.DemiBold))
-                    self._draw_fitted_button_label(painter, test_button, "TEST VOICE", base_size=9, min_size=6, inset=12*scale)
-                    face_label = ("FACE WELCOME  ·  " + self.face_welcome.profile_name() + "  ·  MANAGE" if self.face_welcome.has_profile()
-                                  else "ENROL FACE FOR WELCOME-BACK")
-                    self._draw_fitted_button_label(painter, face_button, face_label, base_size=9, min_size=5, inset=12*scale)
-                    painter.setPen(QColor(170, 215, 225, 230))
-                    painter.setFont(self._ui_font(7, QFont.Normal))
-                    voice_status = f"{self.tts.status}  ·  {self.face_enrollment_status}"
-                    painter.drawText(QRectF(cx-320*scale, cy+45*scale, 290*scale, 50*scale), Qt.AlignCenter,
-                                     voice_status[:150])
-
-                elif self.settings_page == "update":
-                    action_button = QRectF(cx-320*scale, cy-170*scale, 290*scale, 46*scale)
-                    downloading = self.update_action_running and self.update_action_mode == "download"
-                    if self.update_action_running:
-                        action_label = "INSTALLING…" if self.update_action_mode == "install" else ""
-                    elif self.update_installed:
-                        action_label = "RESTART"
-                    elif self.update_download_path:
-                        action_label = "INSTALL"
-                    else:
-                        action_label = "UPDATE"
-                    painter.setBrush(QBrush(QColor(10, 47, 67, 225)))
-                    painter.setPen(QPen(QColor(140, 230, 240, 210), 1.5*scale))
-                    painter.drawRoundedRect(action_button, 10*scale, 10*scale)
-                    if downloading:
-                        inner = action_button.adjusted(3*scale, 3*scale, -3*scale, -3*scale)
-                        painter.setPen(Qt.NoPen)
-                        painter.setBrush(QBrush(QColor(48, 132, 76, 245)))
-                        if self.update_progress_total > 0:
-                            fraction = min(1.0, max(0.0, self.update_progress_current / self.update_progress_total))
-                            fill = QRectF(inner.x(), inner.y(), inner.width()*fraction, inner.height())
-                            painter.drawRoundedRect(fill, 7*scale, 7*scale)
-                        painter.setPen(QColor(240, 253, 255))
-                        painter.setFont(self._ui_font(9, QFont.DemiBold))
-                        progress_text = (f"{min(100, int(100*self.update_progress_current/self.update_progress_total))}%"
-                                         if self.update_progress_total > 0 else "DOWNLOADING…")
-                        painter.drawText(action_button, Qt.AlignCenter, progress_text)
-                    else:
-                        painter.setPen(QColor(240, 253, 255))
-                        painter.setFont(self._ui_font(9, QFont.DemiBold))
-                        painter.drawText(action_button, Qt.AlignCenter, action_label)
-                    painter.setPen(QColor(185, 225, 232))
-                    painter.setFont(self._ui_font(8, QFont.Normal))
-                    status_rect = QRectF(cx-320*scale, cy-110*scale, 610*scale, 110*scale)
-                    painter.drawText(status_rect, Qt.AlignHCenter | Qt.AlignTop | Qt.TextWordWrap,
-                                     self.update_status)
-                    painter.setFont(self._ui_font(7, QFont.Normal))
-                    painter.drawText(QRectF(cx-320*scale, cy+10*scale, 610*scale, 95*scale),
-                                     Qt.AlignHCenter | Qt.AlignTop | Qt.TextWordWrap,
-                                     "Checks GitHub version.txt, downloads a newer release, then lets you install it while preserving settings and calibration. Restart after installation.")
-
-                elif self.settings_page == "d1":
-                    info = d1_status()
-                    model_key = selected_d1_model()
-                    model_button = QRectF(cx-320*scale, cy-170*scale, 290*scale, 44*scale)
-                    runtime_button = QRectF(cx-320*scale, cy-110*scale, 140*scale, 42*scale)
-                    stop_button = QRectF(cx-170*scale, cy-110*scale, 140*scale, 42*scale)
-                    retry_button = QRectF(cx-320*scale, cy-50*scale, 290*scale, 42*scale)
-                    running = bool(info.get("ready") or info.get("loading"))
-                    model_active = bool(info.get("model_exists"))
-                    retry_active = bool(info.get("error") or info.get("downloading") or not model_active)
-                    button_states = (
-                        (model_button, model_active),
-                        (runtime_button, running),
-                        (stop_button, running),
-                        (retry_button, retry_active),
-                    )
-                    for rect, active in button_states:
-                        fill = QColor(48, 132, 76, 230) if active else QColor(72, 78, 88, 210)
-                        edge = QColor(155, 245, 180, 230) if active else QColor(155, 165, 178, 190)
-                        painter.setBrush(QBrush(fill))
-                        painter.setPen(QPen(edge, 1.5*scale))
-                        painter.drawRoundedRect(rect, 10*scale, 10*scale)
-                    painter.setPen(QColor(240, 253, 255))
-                    painter.setFont(self._ui_font(8, QFont.DemiBold))
-                    painter.drawText(model_button, Qt.AlignCenter,
-                                     "MODEL  ·  " + D1_MODELS[model_key]["label"].upper() + "  ·  DEFAULT / ENSURE")
-                    painter.drawText(runtime_button, Qt.AlignCenter, "START / ENSURE RUNNING")
-                    painter.drawText(stop_button, Qt.AlignCenter, "STOP LOCAL SERVER")
-                    painter.drawText(retry_button, Qt.AlignCenter, "DOWNLOAD / RETRY / START")
-                    painter.setPen(QColor(185, 225, 232))
-                    painter.setFont(self._ui_font(8, QFont.Normal))
-                    if info.get("downloading"):
-                        state = "DOWNLOADING MODEL FILES…"
-                    elif info.get("loading"):
-                        state = "STARTING LLAMA.CPP SERVER…"
-                    elif info.get("ready"):
-                        state = "LOCAL SERVER: RUNNING"
-                    elif info.get("error"):
-                        state = "STATUS: " + str(info.get("error"))[:90]
-                    else:
-                        state = "LOCAL SERVER: STOPPED / NOT READY"
-                    painter.drawText(QRectF(cx+45*scale, cy-145*scale, 270*scale, 40*scale),
-                                     Qt.AlignCenter | Qt.TextWordWrap, state)
-                    painter.setFont(self._ui_font(7, QFont.Normal))
-                    painter.drawText(QRectF(cx+45*scale, cy-130*scale, 270*scale, 48*scale),
-                                     Qt.AlignCenter | Qt.TextWordWrap,
-                                     "Runs locally through llama.cpp. No separate terminal is needed. "
-                                     "The larger model downloads only after you select it.")
-                    # Compact in-panel event log beneath Download / Retry / Start.
-                    log_rect = QRectF(cx+45*scale, cy-75*scale, 270*scale, 115*scale)
-                    painter.setBrush(QBrush(QColor(3, 10, 20, 220)))
-                    painter.setPen(QPen(QColor(90, 170, 190, 190), 1.0*scale))
-                    painter.drawRoundedRect(log_rect, 8*scale, 8*scale)
-                    signature = (bool(info.get("ready")), bool(info.get("loading")),
-                                 bool(info.get("downloading")), str(info.get("error") or ""),
-                                 bool(info.get("model_exists")))
-                    if signature != self._last_d1_log_signature:
-                        self._last_d1_log_signature = signature
-                        if info.get("error"):
-                            self._log_d1_ui("ERROR: " + str(info.get("error"))[:120])
-                        elif info.get("downloading"):
-                            self._log_d1_ui("Downloading model files…")
-                        elif info.get("loading"):
-                            self._log_d1_ui("Starting local runtime…")
-                        elif info.get("ready"):
-                            self._log_d1_ui("Local server ready")
-                        elif info.get("model_exists"):
-                            self._log_d1_ui("Model files available; server stopped")
-                        else:
-                            self._log_d1_ui("Model files missing; use Download / Retry / Start")
-                    painter.setPen(QColor(185, 225, 232))
-                    painter.setFont(self._ui_font(7, QFont.DemiBold))
-                    painter.drawText(log_rect.adjusted(9*scale, 4*scale, -9*scale, -4*scale),
-                                     Qt.AlignLeft | Qt.AlignTop, "ENGINE LOG")
-                    painter.setFont(self._ui_font(7, QFont.Normal))
-                    log_lines = self.d1_ui_log[-5:]
-                    log_text = "\n".join(log_lines)
-                    painter.drawText(log_rect.adjusted(9*scale, 21*scale, -9*scale, -5*scale),
-                                     Qt.AlignLeft | Qt.AlignTop | Qt.TextWordWrap, log_text)
             painter.restore()
 
         # Highlight the actual grabbed native window once two-fist drag is armed.
@@ -8962,35 +9172,9 @@ class SpatialDesktop(QWidget):
             if self.settings_page not in ("gesture_map", "speech_commands"):
                 hovered_settings_rects.extend(self._settings_tab_rects(cx, cy, scale).values())
             page = self.settings_page
-            if page == "voice":
-                hovered_settings_rects.extend([QRectF(cx-320*scale, cy-170*scale, 290*scale, 38*scale),
-                    QRectF(cx-320*scale, cy-120*scale, 290*scale, 38*scale),
-                    QRectF(cx-320*scale, cy-60*scale, 290*scale, 38*scale),
-                    QRectF(cx-320*scale, cy-10*scale, 290*scale, 38*scale)])
-            elif page == "update":
-                hovered_settings_rects.append(QRectF(cx-320*scale, cy-170*scale, 290*scale, 46*scale))
-            elif page == "d1":
-                hovered_settings_rects.extend([QRectF(cx-320*scale, cy-170*scale, 290*scale, 44*scale),
-                    QRectF(cx-320*scale, cy-110*scale, 140*scale, 42*scale),
-                    QRectF(cx-170*scale, cy-110*scale, 140*scale, 42*scale),
-                    QRectF(cx-320*scale, cy-50*scale, 290*scale, 42*scale)])
-            elif page == "hands":
-                hovered_settings_rects.extend(self._tli_calibration_button_rects(cx, cy, scale).values())
-                hovered_settings_rects.extend([QRectF(cx-320*scale, cy+135*scale, 290*scale, 28*scale),
-                    QRectF(cx-320*scale, cy-122*scale, 290*scale, 32*scale),
-                    QRectF(cx-320*scale, cy-170*scale, 290*scale, 38*scale)])
-            elif page == "notifications":
-                hovered_settings_rects.extend([QRectF(cx-320*scale, cy+(-165+(yoff+125)*0.58)*scale, 290*scale, 36*scale)
-                    for yoff in (-125, -70, -15, 40, 85, 130)])
-            elif page == "interaction":
-                hovered_settings_rects.extend([QRectF(cx-320*scale, cy+195*scale, 290*scale, 34*scale),
-                    QRectF(cx-320*scale, cy+237*scale, 290*scale, 34*scale)])
-            elif page == "tli":
-                hovered_settings_rects.extend([QRectF(cx-320*scale, cy-170*scale, 290*scale, 34*scale),
-                    QRectF(cx-300*scale, cy-112*scale, 250*scale, 48*scale)])
-            elif page == "gestures":
-                if getattr(self, "custom_gesture_dropdown", None) is not None:
-                    hovered_settings_rects.append(QRectF(cx-338*scale, cy-190*scale, 318*scale, 42*scale))
+            if page not in ("gesture_map", "speech_commands"):
+                # Same rectangles the page paints and hit-tests (see _settings_layout).
+                hovered_settings_rects.extend(self._settings_control_rects(cx, cy, scale).values())
             for rect in hovered_settings_rects:
                 if any(point is not None and rect.contains(point)
                        for point in self.side_cursor_positions.values()):
@@ -9025,39 +9209,13 @@ class SpatialDesktop(QWidget):
                 if self.settings_page not in ("gesture_map", "speech_commands"):
                     press_rects.extend(self._settings_tab_rects(pcx, pcy, pscale).values())
                 page = self.settings_page
-                if page == "interaction":
-                    press_rects.extend([QRectF(pcx-320*pscale, pcy+215*pscale, 290*pscale, 34*pscale),
-                        QRectF(pcx-320*pscale, pcy+258*pscale, 290*pscale, 34*pscale)])
-                elif page == "tli":
-                    press_rects.extend([QRectF(pcx-320*pscale, pcy-170*pscale, 290*pscale, 34*pscale),
-                        QRectF(pcx-300*pscale, pcy-112*pscale, 250*pscale, 48*pscale)])
-                elif page == "hands":
-                    press_rects.extend(self._tli_calibration_button_rects(pcx, pcy, pscale).values())
-                    press_rects.extend([QRectF(pcx-320*pscale, pcy-170*pscale, 290*pscale, 38*pscale),
-                        QRectF(pcx-320*pscale, pcy-122*pscale, 290*pscale, 32*pscale),
-                        QRectF(pcx-320*pscale, pcy+135*pscale, 290*pscale, 28*pscale)])
-                elif page == "notifications":
-                    press_rects.extend([QRectF(pcx-320*pscale, pcy+(-165+(yoff+125)*0.58)*pscale, 290*pscale, 36*pscale)
-                        for yoff in (-125, -70, -15, 40, 85, 130)])
-                elif page == "voice":
-                    press_rects.extend([QRectF(pcx-320*pscale, pcy-170*pscale, 290*pscale, 38*pscale),
-                        QRectF(pcx-320*pscale, pcy-120*pscale, 290*pscale, 38*pscale),
-                        QRectF(pcx-320*pscale, pcy-60*pscale, 290*pscale, 38*pscale),
-                        QRectF(pcx-320*pscale, pcy-10*pscale, 290*pscale, 38*pscale)])
-                elif page == "update":
-                    press_rects.append(QRectF(pcx-320*pscale, pcy-170*pscale, 290*pscale, 46*pscale))
-                elif page == "d1":
-                    press_rects.extend([QRectF(pcx-320*pscale, pcy-170*pscale, 290*pscale, 44*pscale),
-                        QRectF(pcx-320*pscale, pcy-110*pscale, 140*pscale, 42*pscale),
-                        QRectF(pcx-170*pscale, pcy-110*pscale, 140*pscale, 42*pscale),
-                        QRectF(pcx-320*pscale, pcy-50*pscale, 290*pscale, 42*pscale)])
-                elif page == "gestures":
+                if page not in ("gesture_map", "speech_commands"):
+                    press_rects.extend(self._settings_control_rects(pcx, pcy, pscale).values())
+                if page == "gestures":
                     layout = self._custom_gesture_layout(pcx, pcy, pscale)
                     press_rects.extend([layout["record_left"], layout["record_right"]])
                     for row in layout["rows"]:
                         press_rects.extend([row["row"], row["side"], row["timer"], row["label"], row["action"], row["delete"]])
-                    if getattr(self, "custom_gesture_dropdown", None) is not None:
-                        press_rects.append(QRectF(pcx-338*pscale, pcy-190*pscale, 318*pscale, 42*pscale))
             pressed_rect = next((r for r in press_rects if r.contains(pressed_point)), None)
             if pressed_rect is not None:
                 fade_alpha = int(235 * (1.0 - pressed_age/0.30))

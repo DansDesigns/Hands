@@ -1,6 +1,7 @@
 """Local Liquid AI d1 decision layer using the official llama.cpp System One endpoint.
 
-The application starts and owns llama-server.exe; no manually running server is required.
+The application starts and owns llama-server (llama-server.exe on Windows); no manually
+running server is required.
 """
 from __future__ import annotations
 import json
@@ -54,12 +55,25 @@ def model_paths(model_key: str | None = None) -> tuple[Path, Path]:
     return folder / spec["model_file"], folder / spec["projector_file"]
 
 
+SERVER_BINARY = "llama-server.exe" if os.name == "nt" else "llama-server"
+
+
 def server_path() -> Path:
-    names = [ROOT / "tools" / "llama.cpp" / "llama-server.exe", ROOT / "llama-server.exe"]
+    names = [ROOT / "tools" / "llama.cpp" / SERVER_BINARY, ROOT / SERVER_BINARY]
     for path in names:
         if path.is_file():
             return path
-    return Path("llama-server.exe")
+    return Path(SERVER_BINARY)
+
+
+def _server_env(binary: Path) -> dict:
+    """Let a bundled Linux/macOS server find the shared libraries installed beside it."""
+    env = dict(os.environ)
+    if os.name != "nt":
+        for var in ("LD_LIBRARY_PATH", "DYLD_LIBRARY_PATH"):
+            existing = env.get(var, "")
+            env[var] = str(binary.parent) + (os.pathsep + existing if existing else "")
+    return env
 
 
 def _download_worker(model_key: str) -> None:
@@ -228,7 +242,8 @@ def _start_server_worker(model_key: str) -> None:
         log_handle.write("Command: " + " ".join(cmd) + "\n")
         log_handle.flush()
         _server_process = subprocess.Popen(cmd, cwd=str(binary.parent), stdout=log_handle,
-                                           stderr=subprocess.STDOUT, creationflags=creationflags)
+                                           stderr=subprocess.STDOUT, creationflags=creationflags,
+                                           env=_server_env(binary))
         # Store the child PID once launched so a crashed/stopped server leaves a
         # reclaimable lock even if the owning Spatial Desktop UI is still open.
         try:
