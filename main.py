@@ -1462,7 +1462,14 @@ class SpatialDesktop(QWidget):
         self.setWindowTitle("Spatial Desktop")
         # Consistent tactile feedback for native buttons across settings and dialogs.
         self.setStyleSheet(self.styleSheet() + " QPushButton:pressed, QToolButton:pressed { background-color: rgba(75, 205, 235, 210); border: 2px solid #b9f5ff; padding-top: 2px; padding-left: 2px; }")
-        self.setWindowFlags(Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint | Qt.Tool)
+        overlay_flags = Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint | Qt.Tool
+        # On X11/XLibre, bypass the window manager for the fullscreen tracking
+        # surface. Qt maps this to the X11 override-redirect hint, so Qtile will
+        # not tile, decorate, group, or otherwise manage the overlay. Keep this
+        # limited to the main Spatial Desktop overlay; menus/dialogs remain normal.
+        if sys.platform.startswith("linux"):
+            overlay_flags |= Qt.X11BypassWindowManagerHint
+        self.setWindowFlags(overlay_flags)
         self.setAttribute(Qt.WA_TranslucentBackground, True)
         self.setAutoFillBackground(False)
         self.setWindowState(Qt.WindowFullScreen)
