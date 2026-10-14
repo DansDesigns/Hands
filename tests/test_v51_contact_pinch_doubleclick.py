@@ -136,7 +136,8 @@ class V51ContactAndPinchDoubleClickTests(unittest.TestCase):
         self.assertIn('"finger_thickness": 4.24,', self.main)
         self.assertIn('"finger_thickness": (0.8, 10.0)', self.main)
         self.assertIn('value = minimum+ratio*(maximum-minimum)', self.main)
-        self.assertIn("single gradient over the final union", self.main.lower())
+        # Finger widths stay steady when the hand rotates (foreshortening corrected).
+        self.assertIn("palm_width *= self._landmark_foreshortening(points, 5, 17)", self.main)
 
     def test_tli_is_larger_and_the_activation_point_uses_the_same_fingertip_midpoint(self):
         self.assertIn("tx, ty = xy(landmarks[4])", self.main)

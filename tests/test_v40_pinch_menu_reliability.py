@@ -17,8 +17,9 @@ class V40PinchMenuReliabilityTests(unittest.TestCase):
 
     def test_model_fallback_is_skin_like_and_live_landmark_driven(self):
         self.assertIn("def _paint_hand_skeleton(self, painter, points, side=None):", self.main)
-        self.assertIn("gradient = QLinearGradient(bounds.topLeft(), bounds.bottomRight())", self.main)
-        self.assertIn("hand_shape = hand_shape.united(stroker.createStroke(line))", self.main)
+        # v65: depth-ordered, shaded 3D skin (rounded palm body + tapered fingers).
+        self.assertIn("def _paint_hand_skin_3d(", self.main)
+        self.assertIn("parts.sort(key=lambda part: part[2], reverse=True)  # far first", self.main)
         self.assertIn("Qt.RoundCap, Qt.RoundJoin", self.main)
         self.assertIn("unrigged and untextured", self.readme)
         self.assertIn("CGTrader hand model listing", self.readme)

@@ -87,7 +87,7 @@ except Exception as exc:
     raise SystemExit(1)
 
 from PySide6.QtCore import Qt, QTimer, QPoint, QPointF, QRectF, QObject, Signal
-from PySide6.QtGui import QPainter, QColor, QPen, QBrush, QFont, QFontMetricsF, QCursor, QLinearGradient, QImage, QPainterPath, QPainterPathStroker
+from PySide6.QtGui import QPainter, QColor, QPen, QBrush, QFont, QFontMetricsF, QCursor, QLinearGradient, QImage, QPainterPath, QPainterPathStroker, QRadialGradient, QPolygonF
 from PySide6.QtCore import QUrl
 from PySide6.QtWidgets import QApplication, QWidget, QMessageBox, QInputDialog
 
@@ -5977,18 +5977,40 @@ class SpatialDesktop(QWidget):
                 )
         except (TypeError, ValueError, AttributeError):
             pass
+        # Turning the hand foreshortens the on-screen palm, which made every finger
+        # thinner when the hand was side-on or tilted. MediaPipe's z (same scale as x)
+        # lets each palm dimension be corrected back to its unrotated length.
+        palm_length *= self._landmark_foreshortening(points, 0, 9)
+        palm_width *= self._landmark_foreshortening(points, 5, 17)
         # Direct proportional mapping: larger apparent palm (closer camera) means thicker
         # strokes; smaller palm (farther camera) means thinner strokes, for every segment.
         return relative_palm_projection_scale(math.sqrt(max(1.0, palm_length*palm_width)), reference_size)
 
-    def _paint_hand_skeleton(self, painter, points, side=None):
-        """Render a smooth, connected skin-like hand whose thickness tracks camera scale.
+    # Camera frames are 16:9; landmark y is normalised by height and z roughly by width.
+    LANDMARK_Y_TO_X = 9.0/16.0
 
-        Finger shafts, tips and joints are merged into one filled silhouette before the
-        skin gradient is applied. This avoids the obvious separately coloured circles
-        previously painted over the rounded ends of individual lines. Geometry follows
-        tracked landmarks; all brush widths use the same user-size and projected-size
-        factors so apparent finger thickness remains consistent as the hand moves.
+    def _landmark_xyz(self, points, index):
+        point = points[index]
+        z = float(point[2]) if len(point) > 2 else 0.0
+        return float(point[0]), float(point[1])*self.LANDMARK_Y_TO_X, z
+
+    def _landmark_foreshortening(self, points, a, b, limit=3.0):
+        """True 3D length / on-screen length for one landmark pair (1.0 when unknown)."""
+        ax, ay, az = self._landmark_xyz(points, a)
+        bx, by, bz = self._landmark_xyz(points, b)
+        flat = math.hypot(bx-ax, by-ay)
+        full = math.sqrt((bx-ax)**2 + (by-ay)**2 + (bz-az)**2)
+        if not math.isfinite(full) or full <= 1e-6:
+            return 1.0
+        return min(limit, max(1.0, full/max(flat, full/limit)))
+
+    def _paint_hand_skeleton(self, painter, points, side=None):
+        """Render the virtual hand (shaded 3D skin, or the alternate skeleton style).
+
+        Geometry follows tracked landmarks; all widths use the same user-size and
+        projected-size factors (corrected for hand rotation) so apparent finger
+        thickness stays consistent as the hand moves and turns. The skin style is
+        drawn by _paint_hand_skin_3d.
         """
         if not points or len(points) < 21:
             return
@@ -6055,62 +6077,258 @@ class SpatialDesktop(QWidget):
             painter.restore()
             return
 
-        # Build the filled palm and merge each round-capped segment into a single shape.
-        # A single gradient over the final union means no separate colour spots at joints.
-        palm_order = (0, 1, 5, 9, 13, 17)
         palm_width_scale = min(1.8, max(0.65, float(getattr(self, "palm_width_scale", 1.0))))
-        palm_center = QPointF((joints[5].x()+joints[17].x())*0.5,
-                              (joints[5].y()+joints[17].y())*0.5)
-        axis_x = joints[5].x()-joints[17].x()
-        axis_y = joints[5].y()-joints[17].y()
-        axis_length = max(1e-6, math.hypot(axis_x, axis_y))
-        axis_x, axis_y = axis_x/axis_length, axis_y/axis_length
-
-        def palm_joint(index):
-            point = joints[index]
-            dx, dy = point.x()-palm_center.x(), point.y()-palm_center.y()
-            lateral = dx*axis_x + dy*axis_y
-            return QPointF(point.x()+lateral*axis_x*(palm_width_scale-1.0),
-                           point.y()+lateral*axis_y*(palm_width_scale-1.0))
-
-        palm_points = {idx: (palm_joint(idx) if idx in (5, 9, 13, 17) else joints[idx])
-                       for idx in palm_order}
-        palm_path = QPainterPath()
-        palm_path.moveTo(palm_points[palm_order[0]])
-        for idx in palm_order[1:]:
-            palm_path.lineTo(palm_points[idx])
-        palm_path.closeSubpath()
-        hand_shape = QPainterPath(palm_path)
-        for index, radius in ((0, 5.0), (1, 4.5), (5, 5.0), (9, 4.5), (13, 4.3), (17, 4.7)):
-            point = joints[index]
-            r = radius*width_scale
-            joint_shape = QPainterPath()
-            joint_shape.addEllipse(point, r, r)
-            hand_shape = hand_shape.united(joint_shape)
-
-        for a, b, base_width in edges:
-            width = base_width*width_scale*(finger_thickness if (a, b) in finger_edges else 1.0)
-            line = QPainterPath()
-            line.moveTo(joints[a])
-            line.lineTo(joints[b])
-            stroker = QPainterPathStroker()
-            stroker.setWidth(max(0.5, width))
-            stroker.setCapStyle(Qt.RoundCap)
-            stroker.setJoinStyle(Qt.RoundJoin)
-            hand_shape = hand_shape.united(stroker.createStroke(line))
-
-        bounds = hand_shape.boundingRect()
-        gradient = QLinearGradient(bounds.topLeft(), bounds.bottomRight())
-        gradient.setColorAt(0.0, skin_color(246, 207, 179, 225))
-        gradient.setColorAt(0.45, skin_color(225, 174, 143, 232))
-        gradient.setColorAt(1.0, skin_color(185, 128, 101, 222))
-        painter.save()
-        painter.setPen(QPen(skin_color(118, 72, 55, 150), max(0.65, 0.9*width_scale),
-                            Qt.SolidLine, Qt.RoundCap, Qt.RoundJoin))
-        painter.setBrush(QBrush(gradient))
-        painter.drawPath(hand_shape)
+        self._paint_hand_skin_3d(painter, points, joints, width_scale, finger_thickness,
+                                 palm_width_scale, skin_color(225, 174, 143, 255))
         painter.restore()
-        painter.restore()
+
+    # Joint radii (before finger-thickness and size scaling) from knuckle to tip.
+    HAND_FINGER_CHAINS = (
+        ("thumb", (1, 2, 3, 4), (4.6, 4.1, 3.4, 2.8)),
+        ("index", (5, 6, 7, 8), (3.9, 3.3, 2.75, 2.35)),
+        ("middle", (9, 10, 11, 12), (4.0, 3.4, 2.85, 2.4)),
+        ("ring", (13, 14, 15, 16), (3.75, 3.2, 2.7, 2.3)),
+        ("pinky", (17, 18, 19, 20), (3.3, 2.85, 2.4, 2.1)),
+    )
+    # Key light from the upper left of the screen.
+    HAND_LIGHT = (-0.55, -0.835)
+
+    @staticmethod
+    def _shade_colour(color, factor, alpha=None):
+        """factor > 1 mixes toward white, factor < 1 darkens."""
+        r, g, b = color.red(), color.green(), color.blue()
+        if factor >= 1.0:
+            t = min(1.0, factor-1.0)
+            r, g, b = (round(c+(255-c)*t) for c in (r, g, b))
+        else:
+            r, g, b = (round(c*max(0.0, factor)) for c in (r, g, b))
+        return QColor(r, g, b, color.alpha() if alpha is None else alpha)
+
+    @staticmethod
+    def _tapered_capsule(p1, r1, p2, r2):
+        """A rounded, tapered limb segment from p1 (radius r1) to p2 (radius r2).
+
+        Built as one closed outline (two sides joined by two end arcs), so it never
+        has the winding-cancellation holes a polygon-plus-circles path produces.
+        """
+        path = QPainterPath()
+        dx, dy = p2.x()-p1.x(), p2.y()-p1.y()
+        length = math.hypot(dx, dy)
+        if length <= 1e-3 or abs(r1-r2) >= length:
+            r = max(r1, r2)
+            centre = p1 if r1 >= r2 else p2
+            path.addEllipse(centre, r, r)
+            return path
+        ux, uy = dx/length, dy/length
+        nx, ny = -uy, ux
+
+        def qt_angle(vx, vy):  # Qt arc angles: counter-clockwise on screen from 3 o'clock
+            return math.degrees(math.atan2(-vy, vx))
+
+        def sweep(start, through):
+            delta = (through-start+180.0) % 360.0 - 180.0
+            return 180.0 if delta > 0 else -180.0
+
+        path.moveTo(QPointF(p1.x()+nx*r1, p1.y()+ny*r1))
+        path.lineTo(QPointF(p2.x()+nx*r2, p2.y()+ny*r2))
+        start = qt_angle(nx, ny)
+        path.arcTo(QRectF(p2.x()-r2, p2.y()-r2, 2*r2, 2*r2), start, sweep(start, qt_angle(ux, uy)))
+        path.lineTo(QPointF(p1.x()-nx*r1, p1.y()-ny*r1))
+        start = qt_angle(-nx, -ny)
+        path.arcTo(QRectF(p1.x()-r1, p1.y()-r1, 2*r1, 2*r1), start, sweep(start, qt_angle(-ux, -uy)))
+        path.closeSubpath()
+        return path
+
+    @staticmethod
+    def _convex_hull(points):
+        pts = sorted({(round(p.x(), 3), round(p.y(), 3)) for p in points})
+        if len(pts) <= 2:
+            return [QPointF(x, y) for x, y in pts]
+
+        def cross(o, a, b):
+            return (a[0]-o[0])*(b[1]-o[1]) - (a[1]-o[1])*(b[0]-o[0])
+        lower, upper = [], []
+        for pt in pts:
+            while len(lower) >= 2 and cross(lower[-2], lower[-1], pt) <= 0:
+                lower.pop()
+            lower.append(pt)
+        for pt in reversed(pts):
+            while len(upper) >= 2 and cross(upper[-2], upper[-1], pt) <= 0:
+                upper.pop()
+            upper.append(pt)
+        return [QPointF(x, y) for x, y in lower[:-1]+upper[:-1]]
+
+    def _paint_hand_skin_3d(self, painter, points, joints, width_scale, finger_thickness,
+                            palm_width_scale, base):
+        """Depth-ordered, shaded hand: rounded palm body, tapered cylindrical fingers.
+
+        Parts are drawn back-to-front using MediaPipe's per-landmark depth, so curled
+        fingers pass in front of (or behind) the palm as they really do. The convex,
+        rounded palm can never fold over itself when the hand turns side-on. Everything
+        is composed in an offscreen layer, then drawn once with the hand opacity so
+        overlapping parts do not double up in transparency.
+        """
+        # Depth of each landmark relative to the wrist, in palm lengths (+ = farther).
+        wx, wy, wz = self._landmark_xyz(points, 0)
+        mx, my, mz = self._landmark_xyz(points, 9)
+        palm_len = max(1e-4, math.sqrt((mx-wx)**2 + (my-wy)**2 + (mz-wz)**2))
+        depth = [(self._landmark_xyz(points, i)[2]-wz)/palm_len for i in range(21)]
+
+        def depth_size(i):  # nearer the camera looks slightly larger
+            return min(1.3, max(0.75, 1.0-0.35*depth[i]))
+
+        def depth_tone(i):  # farther parts are a touch darker
+            return 1.0-min(0.2, max(-0.1, 0.3*depth[i]))
+
+        size = finger_thickness*width_scale
+        radii = {}
+        for _name, chain, base_radii in self.HAND_FINGER_CHAINS:
+            for index, r in zip(chain, base_radii):
+                radii[index] = max(0.8, r*size*depth_size(index))
+
+        # Palm: convex hull of the (width-scaled) palm landmarks plus thumb webbing,
+        # rounded by roughly a knuckle radius so it keeps a body when seen edge-on.
+        centre = QPointF((joints[5].x()+joints[17].x())*0.5, (joints[5].y()+joints[17].y())*0.5)
+        ax, ay = joints[5].x()-joints[17].x(), joints[5].y()-joints[17].y()
+        al = max(1e-6, math.hypot(ax, ay))
+        ax, ay = ax/al, ay/al
+
+        def widened(i):
+            pt = joints[i]
+            lateral = (pt.x()-centre.x())*ax + (pt.y()-centre.y())*ay
+            return QPointF(pt.x()+lateral*ax*(palm_width_scale-1.0), pt.y()+lateral*ay*(palm_width_scale-1.0))
+
+        # The wrist end is as wide as a real wrist rather than a single point.
+        knuckle_width = math.hypot(widened(5).x()-widened(17).x(), widened(5).y()-widened(17).y())
+        vx, vy = joints[9].x()-joints[0].x(), joints[9].y()-joints[0].y()
+        vl = max(1e-6, math.hypot(vx, vy))
+        px, py = -vy/vl, vx/vl
+        half_wrist = 0.36*knuckle_width
+        base_pt = QPointF(joints[0].x()+vx*0.04, joints[0].y()+vy*0.04)
+        wrist_pts = [QPointF(base_pt.x()+px*half_wrist, base_pt.y()+py*half_wrist),
+                     QPointF(base_pt.x()-px*half_wrist, base_pt.y()-py*half_wrist)]
+        palm_pts = wrist_pts + [joints[0], joints[1]] + [widened(i) for i in (5, 9, 13, 17)]
+        web = QPointF(joints[2].x()*0.45+joints[5].x()*0.4+joints[1].x()*0.15,
+                      joints[2].y()*0.45+joints[5].y()*0.4+joints[1].y()*0.15)
+        palm_pts.append(web)
+        hull = self._convex_hull(palm_pts)
+        palm_round = max(1.0, 1.0*radii[9])
+        palm_core = QPainterPath()
+        if len(hull) >= 3:
+            palm_core.addPolygon(QPolygonF(hull))
+            palm_core.closeSubpath()
+        else:
+            palm_core.addEllipse(joints[0], palm_round, palm_round)
+        stroker = QPainterPathStroker()
+        stroker.setWidth(2.0*palm_round)
+        stroker.setJoinStyle(Qt.RoundJoin)
+        stroker.setCapStyle(Qt.RoundCap)
+        palm_shape = palm_core.united(stroker.createStroke(palm_core)).simplified()
+
+        # Drawable parts: palm, then each finger split at its middle knuckle so a
+        # curling finger can pass in front of / behind the palm part-way along.
+        # The palm is biased slightly "back" so fingers level with it (an open hand)
+        # always draw on top; landmark depth noise then can't make knuckles flicker.
+        # Fingers only go behind the palm when clearly farther away (curled while the
+        # back of the hand faces the camera).
+        parts = [("palm", None, sum(depth[i] for i in (0, 5, 9, 13, 17))/5.0 + 0.08)]
+        for name, chain, _r in self.HAND_FINGER_CHAINS:
+            proximal = [(chain[0], chain[1])]
+            distal = [(chain[1], chain[2]), (chain[2], chain[3])]
+            for segs in (proximal, distal):
+                idx = sorted({i for seg in segs for i in seg})
+                parts.append((name, segs, sum(depth[i] for i in idx)/len(idx)))
+        parts.sort(key=lambda part: part[2], reverse=True)  # far first
+
+        # Offscreen layer covering the hand, its outline and its shadow.
+        reach = max(radii.values()) + palm_round + 12.0*max(0.5, width_scale)
+        xs = [pt.x() for pt in joints.values()]
+        ys = [pt.y() for pt in joints.values()]
+        left, top = math.floor(min(xs)-reach), math.floor(min(ys)-reach)
+        w_px, h_px = math.ceil(max(xs)+reach)-left, math.ceil(max(ys)+reach)-top
+        if w_px <= 0 or h_px <= 0 or w_px*h_px > 16_000_000:
+            return
+        try:
+            dpr = float(painter.device().devicePixelRatioF())
+        except Exception:
+            dpr = 1.0
+        layer = QImage(max(1, int(w_px*dpr)), max(1, int(h_px*dpr)), QImage.Format_ARGB32_Premultiplied)
+        layer.setDevicePixelRatio(dpr)
+        layer.fill(Qt.transparent)
+        lp = QPainter(layer)
+        try:
+            lp.setRenderHint(QPainter.Antialiasing, True)
+            lp.translate(-left, -top)
+            rim_w = max(0.8, 1.15*max(0.5, width_scale))
+            rim = self._shade_colour(base, 0.52, 215)
+            light_x, light_y = self.HAND_LIGHT
+
+            # Soft contact shadow under the whole hand.
+            silhouette = QPainterPath(palm_shape)
+            silhouette.setFillRule(Qt.WindingFill)
+            for _name, chain, _r in self.HAND_FINGER_CHAINS:
+                for a, b in zip(chain, chain[1:]):
+                    silhouette.addPath(self._tapered_capsule(joints[a], radii[a], joints[b], radii[b]))
+            lp.setPen(Qt.NoPen)
+            o = 4.5*max(0.5, width_scale)
+            lp.setBrush(QColor(0, 0, 0, 46))
+            lp.drawPath(silhouette.translated(o*0.55, o))
+
+            for name, segs, _z in parts:
+                if segs is None:
+                    # Palm: rim, then a soft dome-like radial shade lit from the upper left.
+                    bounds = palm_shape.boundingRect()
+                    extent = max(4.0, 0.5*math.hypot(bounds.width(), bounds.height()))
+                    tone = depth_tone(0)*0.5 + depth_tone(9)*0.5
+                    lp.setPen(QPen(rim, 2.0*rim_w, Qt.SolidLine, Qt.RoundCap, Qt.RoundJoin))
+                    lp.setBrush(Qt.NoBrush)
+                    lp.drawPath(palm_shape)
+                    centre_pt = bounds.center()
+                    shade = QRadialGradient(QPointF(centre_pt.x()+light_x*extent*0.35,
+                                                    centre_pt.y()+light_y*extent*0.35), extent*1.15)
+                    shade.setColorAt(0.0, self._shade_colour(base, 1.13*tone))
+                    shade.setColorAt(0.55, self._shade_colour(base, 0.98*tone))
+                    shade.setColorAt(1.0, self._shade_colour(base, 0.74*tone))
+                    lp.setPen(Qt.NoPen)
+                    lp.setBrush(QBrush(shade))
+                    lp.drawPath(palm_shape)
+                    continue
+                # Finger part: one outline then one fill for the whole part, so joints
+                # inside a part stay seamless while overlaps with other parts keep an edge.
+                outline = QPainterPath()
+                outline.setFillRule(Qt.WindingFill)
+                body = QPainterPath()
+                body.setFillRule(Qt.WindingFill)
+                for a, b in segs:
+                    outline.addPath(self._tapered_capsule(joints[a], radii[a]+rim_w, joints[b], radii[b]+rim_w))
+                    body.addPath(self._tapered_capsule(joints[a], radii[a], joints[b], radii[b]))
+                lp.setPen(Qt.NoPen)
+                lp.setBrush(rim)
+                lp.drawPath(outline)
+                first, last = segs[0][0], segs[-1][1]
+                p1, p2 = joints[first], joints[last]
+                dx, dy = p2.x()-p1.x(), p2.y()-p1.y()
+                length = math.hypot(dx, dy)
+                nx, ny = (-dy/length, dx/length) if length > 1e-3 else (light_x, light_y)
+                if nx*light_x + ny*light_y < 0:  # point the normal toward the light
+                    nx, ny = -nx, -ny
+                mid = QPointF((p1.x()+p2.x())*0.5, (p1.y()+p2.y())*0.5)
+                joints_in_part = sorted({i for seg in segs for i in seg})
+                r = sum(radii[i] for i in joints_in_part)/len(joints_in_part)
+                tone = sum(depth_tone(i) for i in joints_in_part)/len(joints_in_part)
+                # Cylinder shading across the finger: lit edge, highlight, core, shadow.
+                shade = QLinearGradient(QPointF(mid.x()+nx*r, mid.y()+ny*r),
+                                        QPointF(mid.x()-nx*r, mid.y()-ny*r))
+                shade.setColorAt(0.0, self._shade_colour(base, 1.03*tone))
+                shade.setColorAt(0.28, self._shade_colour(base, 1.17*tone))
+                shade.setColorAt(0.58, self._shade_colour(base, 0.97*tone))
+                shade.setColorAt(0.86, self._shade_colour(base, 0.80*tone))
+                shade.setColorAt(1.0, self._shade_colour(base, 0.70*tone))
+                lp.setBrush(QBrush(shade))
+                lp.drawPath(body)
+        finally:
+            lp.end()
+        painter.drawImage(QPointF(left, top), layer)
 
     def _paint_tli(self, painter, cursor, side, engaged=False):
         """Paint a bright, large TLI; its centre is exactly the interaction point."""
