@@ -3679,7 +3679,15 @@ class SpatialDesktop(QWidget):
     def _set_os_pointer(self, point):
         if point is None or self._gesture_ui_modal_open():
             return
-        global_pos = self.mapToGlobal(QPoint(round(point.x()), round(point.y())))
+        # interactive_visual_point() is mapped against the full physical screen,
+        # not the Qtile work area. mapToGlobal() adds the overlay's origin, which
+        # can be offset by a reserved top bar and prevents the cursor reaching it.
+        screen = QApplication.primaryScreen()
+        geometry = screen.geometry() if screen is not None else None
+        if geometry is not None:
+            global_pos = geometry.topLeft() + QPoint(round(point.x()), round(point.y()))
+        else:
+            global_pos = self.mapToGlobal(QPoint(round(point.x()), round(point.y())))
         QCursor.setPos(global_pos)
         self.last_os_cursor_pos = global_pos
 
