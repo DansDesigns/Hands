@@ -785,7 +785,34 @@ class SearchHandOverlay(QWidget):
                 pass
         self.update()
 
-    def paintEvent(self, _event):
+    def paintEvent(self, event):
+        """Paint one frame; the painter is always released, even if drawing fails.
+
+        If an exception escaped mid-frame, the QPainter stayed active on the window,
+        and every later repaint then failed ("Painter not active" / "one painter at
+        a time"), leaving stale frames stacked on screen. Re-entrant paints (possible
+        while native windows are being moved) are skipped for the same reason.
+        """
+        if getattr(self, "_in_paint_event", False):
+            return
+        self._in_paint_event = True
+        self._frame_painter = None
+        try:
+            self._paint_frame(event)
+        except Exception:
+            if not getattr(self, "_paint_error_reported", False):
+                self._paint_error_reported = True
+                import traceback
+                print("Spatial Desktop: a frame failed to paint (later failures are not repeated):")
+                traceback.print_exc()
+        finally:
+            painter = self._frame_painter
+            self._frame_painter = None
+            if painter is not None and painter.isActive():
+                painter.end()
+            self._in_paint_event = False
+
+    def _paint_frame(self, _event):
         owner = self.owner
         if not (owner.search_dialog is not None and owner.search_dialog.isVisible()):
             return
@@ -795,6 +822,7 @@ class SearchHandOverlay(QWidget):
         if not self.isVisible() or self.width() <= 0 or self.height() <= 0:
             return
         painter = QPainter()
+        self._frame_painter = painter
         if not painter.begin(self):
             return
         painter.setRenderHint(QPainter.Antialiasing, True)
@@ -923,13 +951,41 @@ class TliCalibrationWindow(QWidget):
         self.live_overlay = {"hands": list(hands or []), "tli": list(tli_points or [])}
         self.update()
 
-    def paintEvent(self, _event):
+    def paintEvent(self, event):
+        """Paint one frame; the painter is always released, even if drawing fails.
+
+        If an exception escaped mid-frame, the QPainter stayed active on the window,
+        and every later repaint then failed ("Painter not active" / "one painter at
+        a time"), leaving stale frames stacked on screen. Re-entrant paints (possible
+        while native windows are being moved) are skipped for the same reason.
+        """
+        if getattr(self, "_in_paint_event", False):
+            return
+        self._in_paint_event = True
+        self._frame_painter = None
+        try:
+            self._paint_frame(event)
+        except Exception:
+            if not getattr(self, "_paint_error_reported", False):
+                self._paint_error_reported = True
+                import traceback
+                print("Spatial Desktop: a frame failed to paint (later failures are not repeated):")
+                traceback.print_exc()
+        finally:
+            painter = self._frame_painter
+            self._frame_painter = None
+            if painter is not None and painter.isActive():
+                painter.end()
+            self._in_paint_event = False
+
+    def _paint_frame(self, _event):
         # Native video windows can temporarily invalidate the transparent overlay surface
         # while Windows is moving/resizing them. Skip that frame instead of issuing
         # follow-on drawing calls against an inactive painter.
         if not self.isVisible() or self.width() <= 0 or self.height() <= 0:
             return
         painter = QPainter()
+        self._frame_painter = painter
         if not painter.begin(self):
             return
         painter.setRenderHint(QPainter.Antialiasing, True)
@@ -1082,13 +1138,41 @@ class HandCalibrationWizard(QWidget):
         self._secondary_rect = QRectF(self.width()/2+64, y, 110, 44)
         return self._primary_rect, self._secondary_rect
 
-    def paintEvent(self, _event):
+    def paintEvent(self, event):
+        """Paint one frame; the painter is always released, even if drawing fails.
+
+        If an exception escaped mid-frame, the QPainter stayed active on the window,
+        and every later repaint then failed ("Painter not active" / "one painter at
+        a time"), leaving stale frames stacked on screen. Re-entrant paints (possible
+        while native windows are being moved) are skipped for the same reason.
+        """
+        if getattr(self, "_in_paint_event", False):
+            return
+        self._in_paint_event = True
+        self._frame_painter = None
+        try:
+            self._paint_frame(event)
+        except Exception:
+            if not getattr(self, "_paint_error_reported", False):
+                self._paint_error_reported = True
+                import traceback
+                print("Spatial Desktop: a frame failed to paint (later failures are not repeated):")
+                traceback.print_exc()
+        finally:
+            painter = self._frame_painter
+            self._frame_painter = None
+            if painter is not None and painter.isActive():
+                painter.end()
+            self._in_paint_event = False
+
+    def _paint_frame(self, _event):
         # Native video windows can temporarily invalidate the transparent overlay surface
         # while Windows is moving/resizing them. Skip that frame instead of issuing
         # follow-on drawing calls against an inactive painter.
         if not self.isVisible() or self.width() <= 0 or self.height() <= 0:
             return
         painter = QPainter()
+        self._frame_painter = painter
         if not painter.begin(self):
             return
         painter.setRenderHint(QPainter.Antialiasing, True)
@@ -8040,12 +8124,40 @@ class SpatialDesktop(QWidget):
             super().keyPressEvent(event)
 
     def paintEvent(self, event):
+        """Paint one frame; the painter is always released, even if drawing fails.
+
+        If an exception escaped mid-frame, the QPainter stayed active on the window,
+        and every later repaint then failed ("Painter not active" / "one painter at
+        a time"), leaving stale frames stacked on screen. Re-entrant paints (possible
+        while native windows are being moved) are skipped for the same reason.
+        """
+        if getattr(self, "_in_paint_event", False):
+            return
+        self._in_paint_event = True
+        self._frame_painter = None
+        try:
+            self._paint_frame(event)
+        except Exception:
+            if not getattr(self, "_paint_error_reported", False):
+                self._paint_error_reported = True
+                import traceback
+                print("Spatial Desktop: a frame failed to paint (later failures are not repeated):")
+                traceback.print_exc()
+        finally:
+            painter = self._frame_painter
+            self._frame_painter = None
+            if painter is not None and painter.isActive():
+                painter.end()
+            self._in_paint_event = False
+
+    def _paint_frame(self, event):
         # Native video windows can temporarily invalidate the transparent overlay surface
         # while Windows is moving/resizing them. Skip that frame instead of issuing
         # follow-on drawing calls against an inactive painter.
         if not self.isVisible() or self.width() <= 0 or self.height() <= 0:
             return
         painter = QPainter()
+        self._frame_painter = painter
         if not painter.begin(self):
             return
         painter.setRenderHint(QPainter.Antialiasing, True)
@@ -8643,37 +8755,10 @@ class SpatialDesktop(QWidget):
                         self._paint_custom_gesture_dropdown(painter, cx, cy, scale)
             painter.restore()
 
-        # Highlight the actual grabbed native window once two-fist drag is armed.
-        # Prefer the live HWND bounds so the outline follows the target window rather
-        # than accidentally retaining a stale/full-screen rect from an earlier frame.
-        for side, active in self.active_action.items():
-            if not active or active.get("mode") != "drag_window":
-                continue
-            live_rect = self._native_window_rect(active.get("hwnd"))
-            rect = live_rect or active.get("rect")
-            if rect is None:
-                continue
-            try:
-                top_left = self.mapFromGlobal(QPoint(int(rect[0]), int(rect[1])))
-                bottom_right = self.mapFromGlobal(QPoint(int(rect[2]), int(rect[3])))
-                target_rect = QRectF(top_left, bottom_right).normalized().adjusted(-3, -3, 3, 3)
-                highlight_color = QColor(85, 235, 255, 230)
-                painter.setBrush(Qt.NoBrush)
-                painter.setPen(QPen(QColor(40, 180, 245, 110), 9, Qt.SolidLine, Qt.RoundCap))
-                painter.drawRoundedRect(target_rect, 8, 8)
-                painter.setPen(QPen(highlight_color, 3, Qt.DashLine, Qt.RoundCap))
-                painter.drawRoundedRect(target_rect, 8, 8)
-                label_rect = QRectF(target_rect.left()+12, target_rect.top()+8, 240, 28)
-                painter.setPen(Qt.NoPen)
-                painter.setBrush(QBrush(QColor(10, 35, 50, 220)))
-                painter.drawRoundedRect(label_rect, 8, 8)
-                painter.setPen(QColor(205, 250, 255))
-                painter.setFont(self._ui_font(9, QFont.DemiBold))
-                painter.drawText(label_rect, Qt.AlignCenter, "WINDOW DRAG ACTIVE")
-            except Exception:
-                pass
-
         # When move mode is engaged, animate waves and sparkles from the TLI/hand anchor.
+        # This is the only window-drag feedback: the old outline around the grabbed
+        # window was removed (it re-queried native window bounds on every frame and
+        # left stacked outlines over video players such as PotPlayer).
         # This visual feedback appears only after the fist shake has been recognised.
         for side, active in self.active_action.items():
             if not active or active.get("mode") != "drag_window":
@@ -9058,7 +9143,9 @@ class SpatialDesktop(QWidget):
                                                    notification_stack_offsets, margin=18)
             now_mono = time.monotonic()
             if self.heard_popup_mode == "unrecognised" and now_mono < self.heard_popup_shake_until:
-                import math
+                # math is imported at module level. A local "import math" here made
+                # math a local name for this whole method, so the window-drag sparkle
+                # animation earlier in the frame raised UnboundLocalError mid-paint.
                 shake = int(math.sin(now_mono * 48.0) * 4.0)
                 pill.translate(shake, 0)
             painter.save()
