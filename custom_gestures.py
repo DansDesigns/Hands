@@ -4,6 +4,10 @@ A recorded pose is a small feature vector describing how bent each finger is, me
 in 3D so it does not depend on where the hand is, how big it looks, or (mostly) which
 way it is turned. Matching compares live features with each recorded template.
 
+It also records how far apart neighbouring fingers are (measured in the palm plane), so
+"split" poses such as the Vulcan salute (index+middle together, ring+pinky together,
+a gap between middle and ring) are told apart from an ordinary open hand.
+
 Overlapping both TLIs is a built-in glass-menu toggle (handled in main.py), so it is
 not a recordable gesture; tli_overlap() below is the shared overlap test.
 
@@ -28,8 +32,21 @@ FINGERS = {
 }
 FINGER_ORDER = ("thumb", "index", "middle", "ring", "pinky")
 FINGER_SHORT = {"thumb": "T", "index": "I", "middle": "M", "ring": "R", "pinky": "P"}
-FEATURE_COUNT = 12
+FEATURE_COUNT = 15
 LEGACY_FEATURE_COUNT = 10
+PRE_SPREAD_FEATURE_COUNT = 12
+# Finger spread: angle between neighbouring fingers in the palm plane, in units of
+# SPREAD_DEGREES. -1 means unknown (poses recorded before spread was measured).
+SPREAD_DEGREES = 20.0
+SPREAD_UNKNOWN = -1.0
+SPREAD_APART = 0.6       # >= 12 degrees: a deliberate gap between two fingers
+SPREAD_TOGETHER = 0.4    # <= 8 degrees: two fingers held together
+SPREAD_MISMATCH = 0.5    # a gap counts as "not apart" for matching below 10 degrees
+SPREAD_GATE = 0.5        # split poses: each inner gap must agree within 10 degrees
+# Spread values 12-14 are I-M, M-R, R-P. Only the two inner gaps define a split: the
+# pinky drifts out on its own in a relaxed hand, so it can't carry a deliberate gap.
+SPREAD_GAPS = (("index", "middle"), ("middle", "ring"), ("ring", "pinky"))
+SPLIT_GAPS = (0, 1)
 MAX_GESTURES = 6
 SIDES = ("left", "right", "either")
 # With the circle timer off a gesture still needs this brief stable hold, so a single
@@ -131,6 +148,9 @@ def hand_features(landmarks):
       11   thumb screen direction: -1 pointing up, +1 pointing down. Only compared when
            both poses have the thumb out, so it separates thumbs up from thumbs down
            without making every other pose depend on hand rotation.
+      12-14 spread between index-middle, middle-ring, ring-pinky: the angle between the
+           knuckle-to-tip directions after projecting them onto the palm plane, in
+           SPREAD_DEGREES. Not part of the distance; see split_gate().
     """
     try:
         if landmarks is None or len(landmarks) < 21:
@@ -161,7 +181,33 @@ def hand_features(landmarks):
     thumb_vertical = ty / max(1e-6, math.hypot(tx, ty))
     values = bends + reaches + [thumb_out, min(2.0, thumb_bend),
                                 min(1.5, max(-1.5, thumb_across)), thumb_vertical]
+    values += _finger_spreads(p)
     return values if all(math.isfinite(v) for v in values) else None
+
+
+def _cross(u, v):
+    return (u[1]*v[2]-u[2]*v[1], u[2]*v[0]-u[0]*v[2], u[0]*v[1]-u[1]*v[0])
+
+
+def _finger_spreads(p):
+    """Angles between neighbouring fingers in the palm plane (SPREAD_DEGREES units).
+
+    Projecting onto the palm plane drops the noisy depth part of each fingertip, so the
+    value follows the sideways gap between fingers even when the hand is turned.
+    """
+    normal = _cross(_sub(p[5], p[0]), _sub(p[17], p[0]))
+    length = _norm(normal)
+    if length < 1e-6:
+        return [SPREAD_UNKNOWN]*len(SPREAD_GAPS)
+    normal = (normal[0]/length, normal[1]/length, normal[2]/length)
+
+    def in_plane(name):
+        mcp, _pip, _dip, tip = FINGERS[name]
+        d = _sub(p[tip], p[mcp])
+        k = d[0]*normal[0] + d[1]*normal[1] + d[2]*normal[2]
+        return (d[0]-k*normal[0], d[1]-k*normal[1], d[2]-k*normal[2])
+
+    return [min(2.0, _angle(in_plane(a), in_plane(b)) / SPREAD_DEGREES) for a, b in SPREAD_GAPS]
 
 
 # Matches gesture_rules.THUMB_OUT_ACROSS_PALM, which decides whether a closed hand is a fist.
@@ -185,10 +231,67 @@ def extended_fingers(features):
     return out
 
 
+def _spread_gaps(features, ext):
+    """{gap index: spread} for inner gaps whose two fingers are both extended."""
+    if not features or len(features) < FEATURE_COUNT:
+        return {}
+    out = {}
+    for i in SPLIT_GAPS:
+        a, b = SPREAD_GAPS[i]
+        value = features[12+i]
+        if a in ext and b in ext and value >= 0.0:
+            out[i] = value
+    return out
+
+
+def is_split(features):
+    """A deliberate split: one inner finger gap held apart while another is held together."""
+    gaps = _spread_gaps(features, extended_fingers(features))
+    return (any(v >= SPREAD_APART for v in gaps.values()) and
+            any(v <= SPREAD_TOGETHER for v in gaps.values()))
+
+
+def is_vulcan(features):
+    """Vulcan salute: all four fingers out, index+middle together, gap before the ring."""
+    ext = extended_fingers(features)
+    gaps = _spread_gaps(features, ext)
+    return ({"index", "middle", "ring", "pinky"} <= ext and len(gaps) == 2 and
+            gaps[1] >= SPREAD_APART and gaps[0] <= SPREAD_TOGETHER)
+
+
+def split_gate(a, b):
+    """False when a split pose is compared with a pose whose finger gaps don't match.
+
+    Only applies when either pose is a split, so ordinary poses match exactly as
+    before however the fingers happen to be spread.
+    """
+    if not (is_split(a) or is_split(b)):
+        return True
+    gaps_a = _spread_gaps(a, extended_fingers(a))
+    gaps_b = _spread_gaps(b, extended_fingers(b))
+    for i in set(gaps_a) & set(gaps_b):
+        x, y = gaps_a[i], gaps_b[i]
+        if abs(x-y) > SPREAD_GATE:
+            return False
+        if max(x, y) >= SPREAD_APART and min(x, y) < SPREAD_MISMATCH:
+            return False
+    return True
+
+
 def describe(features):
     ext = extended_fingers(features)
     if not ext:
         return "FIST"
+    if is_vulcan(features):
+        return "VULCAN"
+    if is_split(features):
+        gaps = _spread_gaps(features, ext)
+        names = [f for f in FINGER_ORDER if f in ext]
+        label = FINGER_SHORT[names[0]]
+        for prev, name in zip(names, names[1:]):
+            gap = next((i for i, pair in enumerate(SPREAD_GAPS) if pair == (prev, name)), None)
+            label += ("|" if gaps.get(gap, 0.0) >= SPREAD_APART else "·") + FINGER_SHORT[name]
+        return label
     if len(ext) == 5:
         return "OPEN HAND"
     if ext == {"thumb"}:
@@ -206,8 +309,8 @@ def builtin_conflict(features, pinch_ratio=None):
         return "That looks like a pinch, which is already a built-in gesture."
     if not ext:
         return "That looks like a fist, which is already a built-in gesture."
-    if len(ext) == 5:
-        return "That looks like an open hand, which is the normal pointing pose."
+    if len(ext) == 5 and not is_split(features):
+        return "That's an open hand, the pointing pose. Split your fingers (like a Vulcan salute) to use it."
     if ext == {"index", "middle"} or ext == {"index", "middle", "thumb"}:
         return "That looks like the peace sign, which already toggles tracking."
     return None
@@ -240,7 +343,9 @@ def pinch_ratio(landmarks):
 
 # The thumb is described by 2 of the 10 values but is often the only difference
 # between poses (4 fingers vs open hand, pointing vs an L-shape), so weight it up.
-FEATURE_WEIGHTS = (1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 4.0, 1.5, 2.0, 3.0)
+# Finger spread (12-14) is not part of the distance: split_gate() handles it, so
+# ordinary poses keep matching the same way however the fingers are spread.
+FEATURE_WEIGHTS = (1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 4.0, 1.5, 2.0, 3.0, 0.0, 0.0, 0.0)
 
 
 def feature_distance(a, b):
@@ -273,6 +378,8 @@ def best_pose_match(features, gestures, side, tolerance):
         if gesture.get("kind") != "pose":
             continue
         if gesture.get("side", "either") not in ("either", side):
+            continue
+        if not split_gate(features, gesture.get("features")):
             continue
         d = feature_distance(features, gesture.get("features"))
         if d < best_d:
@@ -335,6 +442,9 @@ def _valid_gesture(item):
     if len(features) == LEGACY_FEATURE_COUNT:
         # Recorded before the thumb-across/direction values existed: neutral padding.
         features = features + [0.0, 0.0]
+    if len(features) == PRE_SPREAD_FEATURE_COUNT:
+        # Recorded before finger spread was measured: unknown, so never a split.
+        features = features + [SPREAD_UNKNOWN]*len(SPREAD_GAPS)
     if len(features) != FEATURE_COUNT or not all(math.isfinite(v) for v in features):
         return None
     side = item.get("side", "either")

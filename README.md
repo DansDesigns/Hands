@@ -82,6 +82,13 @@ Calibration stores the thumb/index midpoint relative to the wrist-to-middle-MCP 
 
 The camera's central X range `0.20–0.80` and Y range `0.16–0.84` map to the full display. Positions outside that region clamp to screen edges while the camera may continue tracking the hand in the outer overscan area. Settings slider travel is reduced to `0.42x` cursor travel for finer adjustment.
 
+The tracker recovers the camera by itself after the PC sleeps, or if the driver stops sending frames. It releases the camera and opens it again when any of these happen:
+- the tracking loop was paused for more than 3 seconds (sleep/resume)
+- frames have failed for 2 seconds
+- the same picture has been repeated for 2 seconds
+
+Retries back off up to 30 seconds. If the camera doesn't come back under its usual index after repeated tries, the next few indexes are tried as well. Hands reappear within a second or two of the camera returning, with no restart needed.
+
 `gestures.txt` uses one `setting_name=value` per line; blank lines and lines beginning with `#` are ignored. Supported settings:
 
 - `hand_visual_scale`: `0.3–1.0`
@@ -412,6 +419,11 @@ Record your own hand poses and give each one an action.
 
 - **Record Left Hand / Record Right Hand**: after a 2-second countdown, hold the pose still while 15 frames are captured. The pose is stored as how bent each finger is (measured in 3D), so it works wherever your hand is and copes with moderate rotation. The row label shows which fingers are out, e.g. `T·P` for thumb and little finger, or `I·M·R` for three fingers.
 - Poses that clash with built-in gestures (fist, open hand, pinch, peace sign) are refused, as are poses too similar to one you've already recorded.
+- **Split poses (Vulcan salute)**: the gaps between neighbouring fingers are measured too. These are the angles between index–middle, middle–ring and ring–pinky, taken flat across the palm so turning the hand doesn't change them. A pose counts as a *split* when one inner gap (index–middle or middle–ring) is held apart (12° or more) while the other is held together (8° or less).
+  - Split poses can be recorded even with all five fingers out, because they're clearly different from the ordinary open hand. The classic index+middle | ring+pinky salute is labelled **VULCAN**; other splits show the gap with a bar, e.g. `T·I|M·R·P`.
+  - A split gesture only fires when your live hand has the same gaps: each inner gap must agree to within 10°, and a gap held apart in one must not be closed in the other. A normal open hand never triggers a Vulcan gesture, and making a Vulcan salute doesn't trigger your other open-finger gestures.
+  - The pinky gap isn't used to define a split, because the little finger drifts outwards on its own in a relaxed hand.
+  - Gestures recorded before spread was measured behave exactly as before.
 - A **fist** only counts with the thumb tucked in. Fingers closed with the thumb out is free for custom gestures: record **THUMBS UP** and **THUMBS DOWN** as separate gestures (thumb direction is compared only when the thumb is out).
 - **Built-in TLI overlap**: bring both TLIs together (open hands) and hold for the hold time to toggle the glass menu. A ring shows progress. It isn't a recordable gesture.
 - On each row, tap the hand chip to cycle LEFT / RIGHT / ANY, and tap the action (**▾**) to open a list of every action and pick one. **×** deletes the row.

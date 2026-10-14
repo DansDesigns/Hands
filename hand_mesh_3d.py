@@ -243,6 +243,21 @@ class HandModel:
         rest_screen = rest_world @ self.to_screen.T
         distances = np.min(np.linalg.norm(rest_screen[:, None, :]-self.heads[None, :, :], axis=2), axis=1)
         self.reach = float(np.percentile(distances, 99.5))
+        # How far the mesh extends past each fingertip joint, along the last bone.
+        # Rigs differ (WebXR places the "tip" joint mid-pad), but MediaPipe's tip
+        # landmark is the very end of the finger, so posing matches the mesh end to it.
+        dominant = self.joints[np.arange(len(self.joints)), np.argmax(self.weights, axis=1)]
+        self.tip_cap = {}
+        for tip, dip in ((4, 3), (8, 7), (12, 11), (16, 15), (20, 19)):
+            if tip not in self.landmark_head or dip not in self.landmark_head:
+                continue
+            axis = self.landmark_head[tip]-self.landmark_head[dip]
+            length = float(np.linalg.norm(axis))
+            own = [k for k, c in enumerate(self.canonical) if c and CANONICAL_LANDMARK.get(c) in (tip, dip)]
+            verts = rest_screen[np.isin(dominant, own)]
+            if length > 1e-9 and len(verts):
+                beyond = float(((verts-self.landmark_head[tip]) @ (axis/length)).max())
+                self.tip_cap[tip] = max(0.0, beyond)
         # Fade the forearm out just past the wrist so the mesh never ends in a hard,
         # open "sleeve" edge (1 = fully visible, 0 = transparent).
         up = self.landmark_head[9]-self.landmark_head[0]
@@ -320,7 +335,7 @@ def pose_joint_matrices(model: HandModel, target: np.ndarray) -> np.ndarray:
     scale = float(np.linalg.norm(target[9]-target[0])) / max(1e-9, model.palm_length)
     r_root = (_palm_frame(target[0], target[5], target[9], target[17]) @
               _palm_frame(rest[0], rest[5], rest[9], rest[17]).T)
-    rotations, heads = {}, {}
+    rotations, heads, stretch = {}, {}, {}
     for k, canonical in enumerate(model.canonical):
         landmark = CANONICAL_LANDMARK.get(canonical) if canonical else None
         if landmark is not None and landmark in NEXT_LANDMARK and NEXT_LANDMARK[landmark] in rest:
@@ -328,8 +343,17 @@ def pose_joint_matrices(model: HandModel, target: np.ndarray) -> np.ndarray:
             rest_dir = rest[child] - rest[landmark]
             rotations[k] = _align(r_root @ rest_dir, target[child]-target[landmark]) @ r_root
             heads[k] = target[landmark]
+            # Stretch the bone along its own axis to the user's segment length, so the
+            # mesh joints - and above all the fingertips - land on the tracked landmarks
+            # instead of wherever the model's own finger lengths would put them.
+            rest_len = float(np.linalg.norm(rest_dir))
+            if rest_len > 1e-9:
+                # For the last bone, the tracked tip is the end of the mesh fingertip.
+                reach_len = rest_len + model.tip_cap.get(child, 0.0)
+                factor = float(np.linalg.norm(target[child]-target[landmark])) / (scale*reach_len)
+                stretch[k] = (min(1.8, max(0.55, factor)), rest_dir/rest_len)
         elif landmark is not None and landmark != 0:
-            heads[k] = target[landmark]          # fingertip: follows its parent bone below
+            heads[k] = None                      # fingertip: placed along its parent bone below
         else:
             rotations[k] = r_root                # wrist, metacarpals, unmapped bones
             heads[k] = target[0] + scale*(r_root @ (model.heads[k]-rest[0]))
@@ -342,11 +366,37 @@ def pose_joint_matrices(model: HandModel, target: np.ndarray) -> np.ndarray:
         parent_joint = next((j for j, c in enumerate(model.canonical)
                              if c and CANONICAL_LANDMARK.get(c) == parent_landmark), None)
         rotations[k] = rotations.get(parent_joint, r_root)
+    # Fingertip joints carry their distal bone's stretch, so the very tip stays on it.
+    for k, canonical in enumerate(model.canonical):
+        landmark = CANONICAL_LANDMARK.get(canonical)
+        if k not in stretch and landmark in PREVIOUS_LANDMARK:
+            parent_joint = next((j for j, c in enumerate(model.canonical)
+                                 if c and CANONICAL_LANDMARK.get(c) == PREVIOUS_LANDMARK[landmark]), None)
+            if parent_joint in stretch:
+                stretch[k] = stretch[parent_joint]
+            if heads.get(k) is None and parent_joint is not None:
+                # Carry the tip joint along the (stretched) distal bone from its parent.
+                linear = scale*rotations[parent_joint]
+                if parent_joint in stretch:
+                    factor, axis = stretch[parent_joint]
+                    linear = linear @ (np.eye(3) + (factor-1.0)*np.outer(axis, axis))
+                heads[k] = heads[parent_joint] + linear @ (model.heads[k]-model.heads[parent_joint])
+            elif heads.get(k) is None:
+                heads[k] = target[landmark]
+    # Rigs without fingertip bones: any joint still unplaced sits on its own landmark.
+    for k, canonical in enumerate(model.canonical):
+        if heads.get(k) is None:
+            landmark = CANONICAL_LANDMARK.get(canonical)
+            heads[k] = target[landmark] if landmark is not None else target[0]
     mats = np.empty((model.joint_count, 4, 4), dtype=np.float64)
     for k in range(model.joint_count):
+        linear = scale*rotations[k]
+        if k in stretch:
+            factor, axis = stretch[k]
+            linear = linear @ (np.eye(3) + (factor-1.0)*np.outer(axis, axis))
         delta = np.eye(4)
-        delta[:3, :3] = scale*rotations[k] @ model.to_screen
-        delta[:3, 3] = heads[k] - scale*rotations[k] @ model.heads[k]
+        delta[:3, :3] = linear @ model.to_screen
+        delta[:3, 3] = heads[k] - linear @ model.heads[k]
         mats[k] = delta @ model.rest_joint_mats[k]
     return mats
 

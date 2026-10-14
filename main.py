@@ -549,16 +549,12 @@ class Tracker:
             min_tracking_confidence=0.55,
         )
         self.hands = vision.HandLandmarker.create_from_options(options)
-        self.cap = cv2.VideoCapture(0, cv2.CAP_DSHOW) if sys.platform.startswith("win") else cv2.VideoCapture(0)
-        self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
-        self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 360)
-        try:
-            self.cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
-        except Exception:
-            pass
-        if not self.cap.isOpened():
+        self.camera_index = 0
+        self.cap = self._open_camera(self.camera_index)
+        if self.cap is None:
             self.hands.close()
             raise RuntimeError("Could not open camera. Check camera permissions and the camera index.")
+        self._reopen_failures = 0
         self.running = True
         self.hand_tracking_enabled = True
         self.hands_data = []
@@ -575,6 +571,71 @@ class Tracker:
         self.thread = threading.Thread(target=self._loop, daemon=True)
         self.thread.start()
 
+    # A camera that went through a system sleep often never delivers again on the old
+    # handle: grab() fails forever, blocks for its driver timeout, or keeps returning the
+    # last (frozen) frame. These limits decide when the handle is released and reopened.
+    CAMERA_STALL_SECONDS = 2.0        # failed or frozen frames for this long -> reopen
+    CAMERA_RESUME_GAP_SECONDS = 3.0   # one loop pass this long (sleep/resume) -> reopen
+    CAMERA_REOPEN_MAX_DELAY = 30.0
+
+    @staticmethod
+    def _open_camera(index):
+        cap = cv2.VideoCapture(index, cv2.CAP_DSHOW) if sys.platform.startswith("win") else cv2.VideoCapture(index)
+        if not cap.isOpened():
+            cap.release()
+            return None
+        cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
+        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 360)
+        try:
+            cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+        except Exception:
+            pass
+        return cap
+
+    def _clear_hand_state(self):
+        with self.lock:
+            self.hands_data = []
+        self._candidate_streak = {"left": 0, "right": 0}
+        self._candidate_center = {"left": None, "right": None}
+        self._candidate_misses = {"left": 0, "right": 0}
+
+    def _reopen_camera(self, reason):
+        """Release the camera and open it again; True once it delivers a frame."""
+        print(f"Camera {reason}; reopening it.", flush=True)
+        self._clear_hand_state()
+        old, self.cap = self.cap, None
+        if old is not None:
+            try:
+                old.release()
+            except Exception:
+                pass
+        time.sleep(0.5)  # give the driver a moment to settle / re-enumerate after resume
+        # The original camera first. Only after repeated failures try the next few
+        # indexes too, because a device that re-enumerated can come back under another.
+        indexes = [self.camera_index]
+        if self._reopen_failures >= 2:
+            indexes += [i for i in range(4) if i != self.camera_index]
+        for index in indexes:
+            if not self.running:
+                return False
+            cap = self._open_camera(index)
+            if cap is None:
+                continue
+            delivered = False
+            for _ in range(15):  # the first frames after a resume can still fail briefly
+                if cap.grab():
+                    delivered = True
+                    break
+                time.sleep(0.1)
+            if delivered and self.running:
+                self.cap = cap
+                self._reopen_failures = 0
+                print(f"Camera {index} is delivering frames again.", flush=True)
+                return True
+            cap.release()
+        self._reopen_failures += 1
+        return False
+
     def _loop(self):
         last_frame_time = 0.0
         frame_interval = 1.0 / 30.0
@@ -586,7 +647,45 @@ class Tracker:
         paused_frame_interval = 1.0 / 5.0
         idle_after_seconds = 1.0
         last_hand_seen = 0.0
+        last_wall, last_mono = time.time(), time.monotonic()
+        failing_since = None        # first failed grab/retrieve of the current run
+        frozen_since = None         # first repeat of an identical frame
+        last_sample = None
+        reopen_delay, next_reopen_at = 1.0, 0.0
+        gap_check_armed = False
+
+        def reopen(reason, force=False):
+            nonlocal failing_since, frozen_since, last_sample, reopen_delay, next_reopen_at
+            nonlocal last_wall, last_mono, last_frame_time
+            if not force and time.monotonic() < next_reopen_at:
+                return
+            if self._reopen_camera(reason):
+                reopen_delay = 1.0
+            else:
+                reopen_delay = min(self.CAMERA_REOPEN_MAX_DELAY, reopen_delay*2.0)
+            next_reopen_at = time.monotonic() + reopen_delay
+            failing_since = frozen_since = last_sample = None
+            last_frame_time = 0.0
+            last_wall, last_mono = time.time(), time.monotonic()
+
         while self.running:
+            # A pass of this loop normally takes one frame (~33 ms). A much longer one means
+            # the PC slept (the wall clock jumps across a suspend; the monotonic clock may
+            # or may not, depending on the OS) or the driver stalled in grab(): either way
+            # the old camera handle is not trustworthy any more.
+            wall, mono = time.time(), time.monotonic()
+            # Not armed until a frame has been processed: the very first pass includes
+            # model start-up, which can be slow on a modest machine.
+            if gap_check_armed and (wall - last_wall > self.CAMERA_RESUME_GAP_SECONDS or
+                                    mono - last_mono > self.CAMERA_RESUME_GAP_SECONDS):
+                reopen("paused for %.0f s (sleep/resume?)" % max(wall - last_wall, mono - last_mono), force=True)
+                continue
+            last_wall, last_mono = wall, mono
+            if self.cap is None:
+                # Still waiting for the camera to come back after a failed reopen.
+                reopen("is unavailable")
+                time.sleep(0.2)
+                continue
             # grab() waits for the next camera frame without decoding it; frames that
             # are skipped below are never decoded/converted, which saves CPU.
             ok = self.cap.grab()
@@ -611,13 +710,29 @@ class Tracker:
                 ok, frame = self.cap.retrieve()
             if not ok or frame is None:
                 # A camera read failure must not leave the previous frame's hands on screen.
-                with self.lock:
-                    self.hands_data = []
-                self._candidate_streak = {"left": 0, "right": 0}
-                self._candidate_center = {"left": None, "right": None}
-                self._candidate_misses = {"left": 0, "right": 0}
+                self._clear_hand_state()
+                if failing_since is None:
+                    failing_since = now
+                elif now - failing_since > self.CAMERA_STALL_SECONDS:
+                    reopen("stopped delivering frames")
+                    continue
                 time.sleep(0.02)
                 continue
+            failing_since = None
+            # Real camera frames always carry sensor noise; the exact same picture for
+            # seconds means the driver is replaying its last buffer (common after resume).
+            sample = frame[::24, ::24]
+            if last_sample is not None and np.array_equal(sample, last_sample):
+                if frozen_since is None:
+                    frozen_since = now
+                elif now - frozen_since > self.CAMERA_STALL_SECONDS:
+                    reopen("is returning a frozen picture")
+                    continue
+            else:
+                frozen_since = None
+                if reopen_delay > 1.0 and now >= next_reopen_at:
+                    reopen_delay = 1.0
+            last_sample = sample.copy()
             last_frame_time = now
             frame = cv2.flip(frame, 1)
             frame = cv2.resize(frame, (480, 270), interpolation=cv2.INTER_AREA)
@@ -676,6 +791,9 @@ class Tracker:
                     self.hands_data = found
                     self.latest_frame = frame.copy()
                     self.frame_id += 1
+                if not gap_check_armed:
+                    gap_check_armed = True
+                    last_wall, last_mono = time.time(), time.monotonic()
             except Exception as exc:
                 # Keep the camera thread alive, but never preserve visible hands from a
                 # failed inference frame. Clear candidate history so recovery is fresh.
@@ -710,7 +828,8 @@ class Tracker:
     def close(self):
         self.running = False
         self.thread.join(timeout=1.2)
-        self.cap.release()
+        if self.cap is not None:
+            self.cap.release()
         self.hands.close()
 
 
@@ -1543,6 +1662,8 @@ class SpatialDesktop(QWidget):
         self.active_release_cooldown_seconds = 0.20
         self.right_click_context_active = {"left": False, "right": False}
         self.side_cursor_positions = {"left": None, "right": None}
+        # Screen offset applied when drawing each hand so it moves with the smoothed TLI.
+        self.hand_draw_offset = {"left": (0.0, 0.0), "right": (0.0, 0.0)}
         # Keep raw, smoothed camera-mapped anchors separate from scaled interaction points.
         # This avoids feeding transformed coordinates back into the smoothing filter.
         self.smoothed_side_cursor_positions = {"left": None, "right": None}
@@ -6054,10 +6175,17 @@ class SpatialDesktop(QWidget):
         projection_scale = self._hand_projection_scale(points, side)
         width_scale = user_scale*projection_scale
 
+        # Follow the smoothed TLI (see update_scene) so the TLI never drifts off the
+        # thumb/index gap while the hand moves; no offset when the hand has no TLI.
+        if side in ("left", "right") and self.side_cursor_positions.get(side) is not None:
+            off_x, off_y = getattr(self, "hand_draw_offset", {}).get(side, (0.0, 0.0))
+        else:
+            off_x = off_y = 0.0
+
         def sp(index):
             q = self.interactive_visual_point(points[index][0], points[index][1])
             x, y = scale_hand_point((q.x(), q.y()), (scale_origin.x(), scale_origin.y()), user_scale)
-            return QPointF(x, y)
+            return QPointF(x+off_x, y+off_y)
 
         joints = {i: sp(i) for i in range(21)}
         painter.save()
@@ -7243,6 +7371,13 @@ class SpatialDesktop(QWidget):
             mapped_anchor = self._scale_hand_tli_point(
                 self.interactive_hand_anchor(landmarks, side), self.hand_positions[side], side)
             cursor = self._smooth_cursor(side, mapped_anchor, now)
+            # The TLI is smoothed; draw the hand with the same offset so it moves with
+            # the TLI and the TLI stays on the same spot between thumb and index finger.
+            dx, dy = cursor.x()-mapped_anchor.x(), cursor.y()-mapped_anchor.y()
+            lag = math.hypot(dx, dy)
+            if lag > 90.0:  # a jump (re-acquired hand): don't drag the hand far behind
+                dx, dy = dx*90.0/lag, dy*90.0/lag
+            self.hand_draw_offset[side] = (dx, dy)
             cursor_points[side] = QPointF(cursor)
             # All interaction code and rendering now consume the same scaled TLI.
             self.side_cursor_positions[side] = QPointF(cursor)

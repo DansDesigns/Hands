@@ -43,33 +43,47 @@ class BundledModelTests(unittest.TestCase):
             self.assertTrue(0.0 <= float(model.fade.min()) < 0.05 and float(model.fade.max()) == 1.0)
         self.assertTrue((hm.BUNDLED_HANDS_DIR / "LICENSE-webxr-input-profiles.md").is_file())
 
+    @staticmethod
+    def _rest_targets(model):
+        """Rest-pose landmarks as MediaPipe reports them: tips at the end of each finger."""
+        target = np.array([model.landmark_head[i] for i in range(21)])
+        for tip, dip in ((4, 3), (8, 7), (12, 11), (16, 15), (20, 19)):
+            axis = target[tip]-target[dip]
+            target[tip] = target[tip] + axis/np.linalg.norm(axis)*model.tip_cap[tip]
+        return target
+
     def test_rest_pose_targets_reproduce_the_rest_mesh(self):
         model = hm.HandModel(hm.BUNDLED_HANDS_DIR / "generic-hand-left.glb")
-        target = np.array([model.landmark_head[i] for i in range(21)])
-        mats = hm.pose_joint_matrices(model, target)
+        mats = hm.pose_joint_matrices(model, self._rest_targets(model))
         posed = model._skin(mats)
         rest = model._skin(model.rest_joint_mats) @ model.to_screen.T
         self.assertLess(float(np.abs(posed-rest).max()), 1e-4)
 
-    def test_posed_joints_land_on_their_landmarks(self):
+    def test_knuckles_land_on_landmarks_and_fingertips_end_on_tip_landmarks(self):
         model = hm.HandModel(hm.BUNDLED_HANDS_DIR / "generic-hand-right.glb")
-        rest = np.array([model.landmark_head[i] for i in range(21)])
-        # Scale, rotate and move the whole hand, then bend the index finger.
+        rest = self._rest_targets(model)
+        # Scale, rotate and move the whole hand, then bend and lengthen the index tip.
         angle = 0.7
         rot = np.array([[np.cos(angle), -np.sin(angle), 0], [np.sin(angle), np.cos(angle), 0], [0, 0, 1]])
         target = (rest-rest[0]) @ rot.T * 900.0 + np.array([800.0, 500.0, 0.0])
-        target[7] = target[6] + (target[7]-target[6]) @ np.array([[1, 0, 0], [0, 0, -1], [0, 1, 0]]).T
+        target[8] = target[7] + 1.3*(target[8]-target[7]) @ np.array([[1, 0, 0], [0, 0, -1], [0, 1, 0]]).T
         mats = hm.pose_joint_matrices(model, target)
         for k, canonical in enumerate(model.canonical):
             landmark = hm.CANONICAL_LANDMARK.get(canonical)
-            if landmark is None:
+            if landmark is None or landmark in (4, 8, 12, 16, 20):
                 continue
             head_world = np.linalg.inv(model.to_screen) @ model.heads[k]
-            # Joint heads are not skinned vertices; map them through the joint's own
-            # delta (rest joint matrix maps vertices, so undo it for the head point).
             delta = mats[k] @ np.linalg.inv(model.rest_joint_mats[k])
             moved = (delta @ np.r_[head_world, 1.0])[:3]
             self.assertLess(float(np.linalg.norm(moved-target[landmark])), 1e-6, canonical)
+        # The far end of each finger's mesh sits on its tip landmark (TLI alignment).
+        posed = model._skin(mats)
+        dominant = model.joints[np.arange(len(model.joints)), np.argmax(model.weights, axis=1)]
+        for tip, dip in ((4, 3), (8, 7)):
+            own = [k for k, c in enumerate(model.canonical) if c and hm.CANONICAL_LANDMARK.get(c) in (tip, dip)]
+            axis = (target[tip]-target[dip])/np.linalg.norm(target[tip]-target[dip])
+            end = float(((posed[np.isin(dominant, own)]-target[tip]) @ axis).max())
+            self.assertLess(abs(end), 0.5, f"tip {tip}")
 
 
 class RenderStyleSettingsTests(unittest.TestCase):
