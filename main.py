@@ -2608,16 +2608,25 @@ class SpatialDesktop(QWidget):
             "stt_toggle": "STT  ·  " + ("ON" if self.speech.running else "OFF"),
         }
 
+    def _announce_voice_input_state(self, enabled):
+        """Use the same spoken state confirmation for all voice-input toggles."""
+        self.tts.speak("Voice input is " + ("on." if enabled else "off."))
+
     def _toggle_focused_dictation_from_menu(self):
         dialog = self.search_dialog
         if dialog is not None and dialog.isVisible():
             enabled = not dialog.dictation_enabled
             dialog.set_dictation_enabled(enabled, notify=True)
-            self.status = "Search dictation " + ("enabled" if enabled else "disabled")
+            self.status = "Search dictation " + ("enabled" if dialog.dictation_enabled else "disabled")
         elif self.focus_dictation_enabled:
             self.end_focused_dictation("")
         else:
             self.begin_focused_dictation()
+        dialog = self.search_dialog
+        dictation_active = bool(self.speech.running and (
+            self.focus_dictation_enabled or
+            (dialog is not None and dialog.isVisible() and dialog.dictation_enabled)))
+        self._announce_voice_input_state(dictation_active)
 
     def _toggle_stt_from_menu(self):
         dialog = self.search_dialog
@@ -2625,13 +2634,16 @@ class SpatialDesktop(QWidget):
             if dialog is not None and dialog.isVisible() and dialog.dictation_enabled:
                 dialog.set_dictation_enabled(False, notify=True)
             self.focus_dictation_enabled = False
+            self.focus_dictation_paused = False
             self.focus_dictation_committed_words = []
+            self.focus_dictation_last_partial = ""
             self.speech.stop()
             self.stt_enabled = False
             self.status = "Vosk speech recognition stopped"
         else:
-            self.stt_enabled = self.speech.start()
+            self.stt_enabled = bool(self.speech.start())
             self.status = "Vosk speech recognition " + ("enabled" if self.stt_enabled else "could not start")
+        self._announce_voice_input_state(self.stt_enabled)
 
     def _action_menu_geometry(self, side):
         """Return panel and option rectangles for the thumb/index Pinch Menu."""
@@ -3293,10 +3305,12 @@ class SpatialDesktop(QWidget):
                         self.stt_enabled = False
                         self.status = "Voice input off"
                     else:
-                        self.stt_enabled = self.speech.start()
+                        self.stt_enabled = bool(self.speech.start())
                         if self.stt_enabled:
                             self.status = "Voice input on — listening locally with Vosk"
-                            self.tts.speak("Voice input is on.")
+                        else:
+                            self.status = "Voice input could not start"
+                    self._announce_voice_input_state(self.stt_enabled)
                 elif action == "settings":
                     self.settings_open = True
                     self.settings_page = "interaction"
@@ -4761,6 +4775,28 @@ class SpatialDesktop(QWidget):
         low = text.lower().strip()
         low = re.sub(r"\s+", " ", low)
         dialog = self.search_dialog
+
+        # Handle global stop-listening commands before any dictation path can type
+        # the phrase into a field. Keep confirmation identical to the Glass Menu.
+        stop_listening_phrases = {
+            "stop listening", "voice off", "stop voice control", "disable voice input",
+            "turn off voice input", "stop voice input", "turn voice input off",
+            "turn the voice input off", "disable listening", "stop listening now",
+            "turn off listening", "stop voice recognition", "disable voice recognition",
+        }
+        if low in stop_listening_phrases:
+            if dialog is not None and dialog.isVisible() and dialog.dictation_enabled:
+                dialog.set_dictation_enabled(False, notify=True)
+            if self.focus_dictation_enabled:
+                self.end_focused_dictation("")
+            self.focus_dictation_paused = False
+            self.focus_dictation_committed_words = []
+            self.focus_dictation_last_partial = ""
+            self.speech.stop()
+            self.stt_enabled = False
+            self.status = "Voice input off"
+            self._announce_voice_input_state(False)
+            return
 
         # Live local facts must be answered from the OS, never guessed by a model.
         if not self.focus_dictation_enabled and not (dialog is not None and dialog.isVisible()):
