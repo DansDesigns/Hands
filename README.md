@@ -108,7 +108,7 @@ Retries back off up to 30 seconds. If the camera doesn't come back under its usu
 
 `gestures.txt` uses one `setting_name=value` per line; blank lines and lines beginning with `#` are ignored. Supported settings:
 
-- `hand_visual_scale`: `0.3–1.0`
+- `hand_visual_scale`: `0.1–1.0`
 - `finger_thickness`: `0.8–10.0` (default `8.0`)
 - `hand_tracking_sensitivity`: `0.5–1.5`
 - `cursor_smoothing`: `0.0–0.95`
@@ -356,7 +356,7 @@ The tracker now uses more conservative MediaPipe confidence thresholds and requi
 
 ## v47 hand scaling and pinch timer fixes
 
-- **Hand scale:** the slider is limited to 0.3×–1.0×. The hand and TLI share one transform, so interaction stays attached to the shrunken hand. The later v49 fix changes the transform origin to the wrist to stop grip-induced jumps.
+- **Hand scale:** the slider is limited to 0.1×–1.0×. The hand and TLI share one transform, so interaction stays attached to the shrunken hand. The later v49 fix changes the transform origin to the wrist to stop grip-induced jumps.
 - **Finger thickness:** the saved Interaction Settings slider now spans 0.8×–8.0×.
 - **Pinch timer:** the circle remains empty for a continuous 0.8-second confirmation hold. Any confirmed release before the buffer expires cancels that sequence; a quick second pinch starts a new 0.8-second buffer and cannot inherit the first pinch's elapsed time. Once confirmed, the circle accumulates only actual pinch-down time; release gaps and duplicate frames contribute nothing.
 

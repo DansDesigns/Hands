@@ -32,18 +32,23 @@ def test_linux_overlay_reasserts_native_topmost_even_without_dragging():
     assert "ctypes.c_ulong(int(target.winId()))" in method
 
 
-def test_linux_desktop_launcher_uses_freehand_icon():
+def test_linux_desktop_launcher_uses_local_freehand_icon_without_fetching():
     installer = (ROOT / "install_linux.sh").read_text(encoding="utf-8")
-    assert "https://raw.githubusercontent.com/DansDesigns/Hands/main/Freehand_logo_small.png" in installer
+    assert 'ICON_PATH="$APP_DIR/Freehand_logo_small.png"' in installer
     assert "Icon=$ICON_PATH" in installer
-    assert "curl -fL" in installer
+    assert "curl " not in installer
+    assert "wget " not in installer
+    assert "raw.githubusercontent.com" not in installer
 
 
-def test_windows_start_menu_shortcut_uses_freehand_icon():
+def test_windows_start_menu_shortcut_uses_local_freehand_icon_without_fetching():
     installer = (ROOT / "install_windows.bat").read_text(encoding="utf-8")
-    assert "https://raw.githubusercontent.com/DansDesigns/Hands/main/Freehand_logo_small.png" in installer
+    assert 'set "ICON_PNG=%CD%\\Freehand_logo_small.png"' in installer
     assert "Freehand_logo_small.ico" in installer
     assert "$s.IconLocation=$env:ICON_ICO + ',0'" in installer
+    icon_setup = installer[installer.index("[9/9] Assigning the local Freehand launcher icon"):installer.index('set "STARTMENU=')]
+    assert "Invoke-WebRequest" not in icon_setup
+    assert "raw.githubusercontent.com" not in icon_setup
 
 
 def test_linux_installer_creates_launcher_without_a_second_installer():

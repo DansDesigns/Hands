@@ -49,7 +49,7 @@
 # Camera X 0.20–0.80 and Y 0.16–0.84 map to the full display. Positions outside clamp to the edges.
 #
 # SETTING SYNTAX AND RANGES
-# hand_visual_scale: 0.3–1.0; hand skeleton / TLI visual size and position are scaled together.
+# hand_visual_scale: 0.1–1.0; hand skeleton / TLI visual size and position are scaled together.
 # skin_tone_darkness: 0–100; higher values darken the skin-like palm/finger mesh.
 # finger_thickness: 0.8–10.0; default 4.24; every rounded mesh width uses the same direct palm-size factor (closer = thicker; farther = thinner).
 # hand_tracking_sensitivity: 0.5–1.5; drag and scroll movement gain.

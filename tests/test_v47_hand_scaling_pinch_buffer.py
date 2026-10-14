@@ -24,7 +24,7 @@ class V47HandScalingPinchBufferTests(unittest.TestCase):
         self.assertIn('def _visual_tli_position(self, side, cursor, points=None):', self.main)
         self.assertIn('scale_origin, user_scale = self._hand_visual_transform(points, side)', self.main)
         self.assertIn('cursor = self._visual_tli_position(side, cursor, points)', self.main)
-        self.assertIn('"hand_visual_scale": (0.3, 1.0)', self.main)
+        self.assertIn('"hand_visual_scale": (0.1, 1.0)', self.main)
         self.assertIn('value = minimum+ratio*(maximum-minimum)', self.main)
 
     def test_finger_thickness_reaches_10x_in_settings_and_renderer(self):
@@ -55,7 +55,7 @@ class V47HandScalingPinchBufferTests(unittest.TestCase):
         self.assertAlmostEqual(pinch_timer_elapsed_seconds(10.0, 0.3, 11.2, 11.5, 11.9), 0.6)
 
     def test_documentation_calls_out_buffer_and_new_ranges(self):
-        self.assertIn('hand_visual_scale: 0.3–1.0', self.guide)
+        self.assertIn('hand_visual_scale: 0.1–1.0', self.guide)
         self.assertIn('finger_thickness: 0.8–10.0', self.guide)
         self.assertIn('v47 hand scaling and pinch timer fixes', self.readme)
         self.assertIn('release gaps and duplicate frames contribute nothing', self.readme)

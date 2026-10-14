@@ -45,7 +45,7 @@ class V48TLIInteractionScalingTests(unittest.TestCase):
 
     def test_hand_size_defaults_to_minimum(self):
         self.assertIn('"hand_visual_scale": 0.3,', self.main)
-        self.assertIn("clamped('hand_visual_scale', 0.3, 1.0, 0.3)", self.main)
+        self.assertIn("clamped('hand_visual_scale', 0.1, 1.0, 0.3)", self.main)
         self.assertRegex(self.gestures, r"(?m)^hand_visual_scale=0\.30$")
 
     def test_startup_mode_is_os_desktop(self):

@@ -15,14 +15,14 @@ class V46HandScaleAndScrollTests(unittest.TestCase):
         cls.settings = (ROOT / "gestures.txt").read_text(encoding="utf-8")
         cls.readme = (ROOT / "README.md").read_text(encoding="utf-8")
 
-    def test_hand_scale_slider_spans_0_3_to_1_and_rendering_honours_it(self):
-        self.assertIn('"hand_visual_scale": (0.3, 1.0)', self.main)
-        self.assertIn('"hand_visual_scale={clamped(\'hand_visual_scale\', 0.3, 1.0, 0.3):.2f}"', self.main)
-        self.assertIn('("hand_scale", -119, self.hand_visual_scale, 0.3, 1.0, "HAND SCALE")', self.main)
+    def test_hand_scale_slider_spans_0_1_to_1_and_rendering_honours_it(self):
+        self.assertIn('"hand_visual_scale": (0.1, 1.0)', self.main)
+        self.assertIn('"hand_visual_scale={clamped(\'hand_visual_scale\', 0.1, 1.0, 0.3):.2f}"', self.main)
+        self.assertIn('("hand_scale", -119, self.hand_visual_scale, 0.1, 1.0, "HAND SCALE")', self.main)
         self.assertIn('value = minimum+ratio*(maximum-minimum)', self.main)
-        self.assertIn('visual_scale = min(1.0, max(0.3, float(getattr(self, "hand_visual_scale", 0.3))))', self.main)
+        self.assertIn('visual_scale = min(1.0, max(0.1, float(getattr(self, "hand_visual_scale", 0.3))))', self.main)
         self.assertIn('scale_origin, user_scale = self._hand_visual_transform(points, side)', self.main)
-        self.assertIn('hand_visual_scale: 0.3–1.0', self.settings)
+        self.assertIn('hand_visual_scale: 0.1–1.0', self.settings)
 
     def test_finger_thickness_slider_spans_0_8_to_10_and_renderer_honours_it(self):
         self.assertIn('"finger_thickness": (0.8, 10.0)', self.main)

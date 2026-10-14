@@ -292,7 +292,7 @@ def save_gesture_settings(values: dict) -> None:
         "# All gesture recognition uses hand shape and time. Relative camera depth is not used for activation.",
         "#",
         "# SETTINGS",
-        "# hand_visual_scale: skeleton/TLI scale, 0.3 to 1.0.",
+        "# hand_visual_scale: skeleton/TLI scale, 0.1 to 1.0.",
         "# hand_contact_band_ratio: palm attraction distance beyond touch, in palm widths; 0.0 to 0.9; default 0.02.",
         "# palm_attract_acceleration: speed multiplier for the virtual hands blending toward shared contact alignment; 0.2 to 5.0x; default 0.33x.",
         "# skin_tone_darkness: 0 to 100 percent extra warm darkening of the skin-like hand mesh.",
@@ -322,11 +322,12 @@ def save_gesture_settings(values: dict) -> None:
         "# click_debounce_seconds: minimum fist duration accepted as a click, 0.04 to 0.25 seconds.",
         "# default_gesture_hold_seconds: shared activation duration for peace sign, thumbs up, and Pinch Menu, 0.5 to 5.0 seconds; default 0.5.",
         "# invert_scroll: true reverses vertical scroll direction; false is normal.",
+        "# swap_drag_scroll_notches: true swaps the drag-scroll Back/Forward navigation notch directions.",
         "# cursor_lock_priority: right or left; selected physical hand gets first refusal for new gestures when both are visible.",
         "# Quick pinch clicks require a discrete short pulse before the 0.8s timer buffer; two quick pinches at one point form a native double-click.",
         "# Settings slider drag uses a reduced gain (0.42x) for finer control; initial pickup preserves the value.",
         "# Default TLI colours: LEFT red, RIGHT blue. Swatches can still cycle independently.",
-        f"hand_visual_scale={clamped('hand_visual_scale', 0.3, 1.0, 0.3):.2f}",
+        f"hand_visual_scale={clamped('hand_visual_scale', 0.1, 1.0, 0.3):.2f}",
         f"hand_recognition_threshold={clamped('hand_recognition_threshold', 0.30, 0.90, 0.60):.2f}",
         f"hand_contact_band_ratio={clamped('hand_contact_band_ratio', 0.0, 0.9, 0.02):.2f}",
         f"palm_attract_acceleration={clamped('palm_attract_acceleration', 0.2, 5.0, 0.33):.2f}",
@@ -358,6 +359,7 @@ def save_gesture_settings(values: dict) -> None:
         f"default_gesture_hold_seconds={clamped('default_gesture_hold_seconds', 0.5, 5.0, 0.5):.2f}",
         f"pinch_buffer_seconds={clamped('pinch_buffer_seconds', 0.3, 2.0, 0.8):.2f}",
         f"invert_scroll={str(bool(values.get('invert_scroll', True))).lower()}",
+        f"swap_drag_scroll_notches={str(bool(values.get('swap_drag_scroll_notches', False))).lower()}",
         f"cursor_lock_priority={values.get('cursor_lock_priority', 'right') if values.get('cursor_lock_priority', 'right') in ('right', 'left') else 'right'}",
         f"left_click_color={colors['left_click_color']}",
         f"right_click_color={colors['right_click_color']}",
@@ -405,12 +407,13 @@ def load_gesture_settings() -> dict:
         "default_gesture_hold_seconds": 0.5,
         "pinch_buffer_seconds": 0.8,
         "invert_scroll": True,
+        "swap_drag_scroll_notches": False,
         "cursor_lock_priority": "right",
         "left_click_color": "#ff5555",
         "right_click_color": "#5091ff",
     }
     ranges = {
-        "hand_visual_scale": (0.3, 1.0),
+        "hand_visual_scale": (0.1, 1.0),
         "hand_recognition_threshold": (0.30, 0.90),
         "hand_contact_band_ratio": (0.0, 0.9),
         "palm_attract_acceleration": (0.2, 5.0),
@@ -458,7 +461,7 @@ def load_gesture_settings() -> dict:
                 values[key] = min(hi, max(lo, number))
         # Old floating_device_mode entries are intentionally ignored; gesture
         # activation no longer depends on estimated depth or device distance.
-        elif key == "invert_scroll":
+        elif key in ("invert_scroll", "swap_drag_scroll_notches"):
             values[key] = value.lower() in ("true", "1", "yes", "on")
         elif key == "hand_skin_effect":
             values[key] = value.lower() in ("true", "1", "yes", "on")
@@ -673,13 +676,13 @@ class Tracker:
 
     def _loop(self):
         last_frame_time = 0.0
-        frame_interval = 1.0 / 30.0
-        # While no hand has been seen for a moment, run inference at a lower rate; the
-        # first detection immediately restores 30 FPS (the 3-frame confirmation below
-        # then completes at full rate). While hand tracking is paused, frames are only
-        # needed for the optional ~1 Hz face welcome check.
-        idle_frame_interval = 1.0 / 15.0
-        paused_frame_interval = 1.0 / 5.0
+        frame_interval = 1.0 / 18.0
+        # Run inference at a modest active cadence and downshift further when no hands
+        # are present. This substantially reduces sustained CPU use on software-rendered
+        # Linux desktops while staying responsive enough for gesture interaction.
+        idle_frame_interval = 1.0 / 8.0
+        # Paused hand tracking only needs occasional frames for the optional face welcome.
+        paused_frame_interval = 1.0 / 2.0
         idle_after_seconds = 1.0
         last_hand_seen = 0.0
         last_wall, last_mono = time.time(), time.monotonic()
@@ -704,7 +707,8 @@ class Tracker:
             last_wall, last_mono = time.time(), time.monotonic()
 
         while self.running:
-            # A pass of this loop normally takes one frame (~33 ms). A much longer one means
+            # Active inference is capped at 18 FPS to reduce sustained CPU load. A much
+            # longer pass means
             # the PC slept (the wall clock jumps across a suspend; the monotonic clock may
             # or may not, depending on the OS) or the driver stalled in grab(): either way
             # the old camera handle is not trustworthy any more.
@@ -738,9 +742,10 @@ class Tracker:
                     # Do not busy-spin while waiting for the next inference slot.
                     # Camera reads can return much faster than the inference cadence;
                     # without yielding here this loop can consume a full CPU core even
-                    # when gesture handling is disabled. Sleep only for the remaining
-                    # interval (capped) so shutdown and camera responsiveness stay quick.
-                    time.sleep(min(interval - elapsed, 0.005))
+                    # when gesture handling is disabled. Use a longer bounded sleep to
+                    # avoid a high-frequency grab/sleep spin on cameras whose grab() does
+                    # not block for a fresh frame; shutdown remains responsive.
+                    time.sleep(min(interval - elapsed, 0.02))
                     continue
                 ok, frame = self.cap.retrieve()
             if not ok or frame is None:
@@ -779,7 +784,10 @@ class Tracker:
                 if self.hand_tracking_enabled:
                     rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
                     image = mp.Image(image_format=mp.ImageFormat.SRGB, data=np.ascontiguousarray(rgb))
-                    self.timestamp_ms += 33
+                    # MediaPipe VIDEO timestamps must be monotonic and should reflect
+                    # the actual frame cadence; a fixed 33 ms step becomes inaccurate
+                    # now that inference deliberately runs below 30 FPS.
+                    self.timestamp_ms = max(self.timestamp_ms + 1, int(now * 1000.0))
                     result = self.hands.detect_for_video(image, self.timestamp_ms)
                     raw_seen = set()
                     for index, landmarks in enumerate(result.hand_landmarks):
@@ -1473,13 +1481,12 @@ class SpatialDesktop(QWidget):
         self.setWindowTitle("Spatial Desktop")
         # Consistent tactile feedback for native buttons across settings and dialogs.
         self.setStyleSheet(self.styleSheet() + " QPushButton:pressed, QToolButton:pressed { background-color: rgba(75, 205, 235, 210); border: 2px solid #b9f5ff; padding-top: 2px; padding-left: 2px; }")
+        # Let X11/XLibre's window manager own the fullscreen overlay's stacking
+        # level. With override-redirect, an app opened later (notably osm-launcher,
+        # which is also WindowStaysOnTopHint) can stay above the hands indefinitely.
+        # A WM-managed, mouse-transparent, always-on-top Tool remains click-through
+        # while sharing the same topmost layer as native launchers.
         overlay_flags = Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint | Qt.Tool
-        # On X11/XLibre, bypass the window manager for the fullscreen tracking
-        # surface. Qt maps this to the X11 override-redirect hint, so Qtile will
-        # not tile, decorate, group, or otherwise manage the overlay. Keep this
-        # limited to the main Spatial Desktop overlay; menus/dialogs remain normal.
-        if sys.platform.startswith("linux"):
-            overlay_flags |= Qt.X11BypassWindowManagerHint
         self.setWindowFlags(overlay_flags)
         self.setAttribute(Qt.WA_TranslucentBackground, True)
         self.setAutoFillBackground(False)
@@ -1502,6 +1509,7 @@ class SpatialDesktop(QWidget):
         self.hand_render_style = (style if style in HAND_RENDER_STYLES else
                                   ("flat" if self.hand_skin_effect_enabled else "skeleton"))
         self._hand_mesh_renderer = None
+        self._hand_mesh_frame_cache = {}
         self._hand_mesh_notice_shown = False
         self.skin_use_skeleton_color = bool(settings.get("skin_use_skeleton_color", False))
         self.hand_transparency = float(settings.get("hand_transparency", 75.0))
@@ -1543,6 +1551,7 @@ class SpatialDesktop(QWidget):
         self.default_gesture_hold_seconds = settings.get("default_gesture_hold_seconds", settings["menu_pinch_hold_seconds"])
         self.menu_pinch_hold_seconds = self.default_gesture_hold_seconds
         self.invert_scroll = settings.get("invert_scroll", True)
+        self.swap_drag_scroll_notches = settings.get("swap_drag_scroll_notches", False)
         self.cursor_lock_priority = settings.get("cursor_lock_priority", "right")
         self.ui_preferences = load_ui_preferences()
         self.ui_font_scale = float(self.ui_preferences.get("ui_font_scale", 1.2))
@@ -1844,7 +1853,7 @@ class SpatialDesktop(QWidget):
         self.search_hand_overlay = SearchHandOverlay(self)
         self.timer = QTimer(self)
         self.timer.timeout.connect(self.update_scene)
-        self.timer.start(33)
+        self.timer.start(50)
         QTimer.singleShot(1200, self._maybe_start_hand_onboarding)
         QTimer.singleShot(2400, self.speak_startup_greeting)
 
@@ -1885,6 +1894,7 @@ class SpatialDesktop(QWidget):
             "default_gesture_hold_seconds": self.default_gesture_hold_seconds,
             "pinch_buffer_seconds": self.pinch_buffer_seconds,
             "invert_scroll": self.invert_scroll,
+            "swap_drag_scroll_notches": self.swap_drag_scroll_notches,
             "cursor_lock_priority": self.cursor_lock_priority,
             "left_click_color": self.left_click_color.name(),
             "right_click_color": self.right_click_color.name(),
@@ -2085,6 +2095,7 @@ class SpatialDesktop(QWidget):
         right_h = 0.0
         if page == "interaction":
             stack("scroll_toggle")
+            stack("swap_drag_scroll_toggle")
             stack("priority_toggle")
         elif page == "hands":
             stack("render_style")
@@ -2546,7 +2557,7 @@ class SpatialDesktop(QWidget):
             ]
         if page == "hands":
             return [
-                ("hand_scale", self.hand_visual_scale, 0.3, 1.0, "HAND SCALE"),
+                ("hand_scale", self.hand_visual_scale, 0.1, 1.0, "HAND SCALE"),
                 ("hand_recognition_threshold", self.hand_recognition_threshold, 0.30, 0.90, "HAND RECOGNITION THRESHOLD"),
                 ("finger_thickness", self.finger_thickness, 0.8, 10.0, "FINGER THICKNESS"),
                 ("palm_width_scale", self.palm_width_scale, 0.65, 1.8, "PALM WIDTH"),
@@ -3489,6 +3500,11 @@ class SpatialDesktop(QWidget):
                     self.invert_scroll = not self.invert_scroll
                     self.schedule_gesture_settings_save()
                     self.status = "Scroll direction inverted" if self.invert_scroll else "Scroll direction normal"
+                elif pressed("swap_drag_scroll_toggle"):
+                    self.swap_drag_scroll_notches = not self.swap_drag_scroll_notches
+                    self.schedule_gesture_settings_save()
+                    self.status = ("Drag-scroll Back/Forward notches swapped" if self.swap_drag_scroll_notches
+                                   else "Drag-scroll Back/Forward notches normal")
                 elif pressed("priority_toggle"):
                     self.cursor_lock_priority = "left" if self.cursor_lock_priority == "right" else "right"
                     self.schedule_gesture_settings_save()
@@ -4000,10 +4016,10 @@ class SpatialDesktop(QWidget):
         elif sys.platform.startswith("linux"):
             # Optional xdotool support lets us close the external active window by ID
             # rather than sending Alt+F4 blindly to the fullscreen overlay.
-            # This runs from the 30 Hz scene timer, and each check launches two
-            # processes, so look up xdotool once and poll at most twice a second.
+            # This runs from the scene timer, and each check launches two processes,
+            # so poll only once per second rather than on every UI frame.
             now = time.monotonic()
-            if not force and now - getattr(self, "_last_foreground_poll", 0.0) < 0.5:
+            if not force and now - getattr(self, "_last_foreground_poll", 0.0) < 1.0:
                 return
             self._last_foreground_poll = now
             if not hasattr(self, "_xdotool_available"):
@@ -6184,7 +6200,7 @@ class SpatialDesktop(QWidget):
             self.hand_contact_last_update = None
             self.hand_contact_weight = 0.0
             self.hand_scale_origins = {side: QPointF(x, y) for side, (x, y) in wrists.items()}
-            base_scale = min(1.0, max(0.3, float(getattr(self, "hand_visual_scale", 0.3))))
+            base_scale = min(1.0, max(0.1, float(getattr(self, "hand_visual_scale", 0.3))))
             self.hand_contact_scales = {side: base_scale for side in wrists}
             return
         elif "left" in screen_points and "right" in screen_points:
@@ -6207,7 +6223,7 @@ class SpatialDesktop(QWidget):
 
         origins = shared_contact_origins(wrists, weight)
         self.hand_scale_origins = {side: QPointF(x, y) for side, (x, y) in origins.items()}
-        base_scale = min(1.0, max(0.3, float(getattr(self, "hand_visual_scale", 0.3))))
+        base_scale = min(1.0, max(0.1, float(getattr(self, "hand_visual_scale", 0.3))))
         self.hand_contact_scales = {side: base_scale for side in wrists}
 
     def _draw_fitted_button_label(self, painter, rect, text, base_size=10, min_size=7,
@@ -6394,7 +6410,7 @@ class SpatialDesktop(QWidget):
         The user-selected scale never changes with hand proximity. When the two hands
         are touching, both share one pivot (see _update_hand_scale_origins).
         """
-        visual_scale = min(1.0, max(0.3, float(
+        visual_scale = min(1.0, max(0.1, float(
             getattr(self, "hand_contact_scales", {}).get(
                 side, getattr(self, "hand_visual_scale", 0.3)))))
         if not points or len(points) < 21:
@@ -6584,7 +6600,14 @@ class SpatialDesktop(QWidget):
         painter.restore()
 
     def _paint_hand_mesh_3d(self, painter, points, joints, side, user_scale, base):
-        """Draw the rigged 3D hand mesh; False means fall back to the flat style."""
+        """Draw a lower-cost, cached frame of the rigged 3D hand mesh.
+
+        The GL render/readback path is CPU-expensive on software OpenGL (common on
+        Linux desktops). Render at 72% resolution and cap expensive pose renders to
+        15 FPS, reusing/repositioning the latest image between renders. Large pose
+        changes can still trigger an immediate render so fingers don't lag behind a
+        quick open/close gesture.
+        """
         if self._hand_mesh_renderer is None:
             try:
                 from hand_mesh_3d import HandMeshRenderer
@@ -6596,34 +6619,64 @@ class SpatialDesktop(QWidget):
         if renderer.failed:
             self._report_hand_mesh_problem(renderer.error)
             return False
-        # Overlay pixels; depth uses the same pixels-per-unit as x (MediaPipe z ~ x scale).
-        # First-person view: the hands are seen from the user's side, not the camera's,
-        # so depth is reversed (nearest the camera = farthest from the user). With the
-        # palm toward the camera the user sees the back of the virtual hand, as with
-        # their real hand.
         px_per_x = max(1.0, self.width()-1)/0.60*user_scale
         z0 = float(points[0][2]) if len(points[0]) > 2 else 0.0
         target = np.array([[joints[i].x(), joints[i].y(),
                             -((float(points[i][2]) if len(points[i]) > 2 else 0.0)-z0)*px_per_x]
                            for i in range(21)], dtype=np.float64)
-        # The mirrored camera image plus the reversed depth restores true handedness:
-        # each physical hand uses its own model.
         model_side = side if side in ("left", "right") else "right"
-        result = renderer.render(model_side, target, (base.red(), base.green(), base.blue()))
-        if result is None:
-            self._report_hand_mesh_problem(renderer.error or "3D hand rendering failed")
-            return False
-        data, w, h, left, top = result
-        image = QImage(data, w, h, w*4, QImage.Format_RGBA8888_Premultiplied).copy()
-        # Soft contact shadow from the hand's own silhouette, matching the flat style.
-        shadow = QImage(image)
-        sp_ = QPainter(shadow)
-        sp_.setCompositionMode(QPainter.CompositionMode_SourceIn)
-        sp_.fillRect(shadow.rect(), QColor(0, 0, 0, 46))
-        sp_.end()
-        offset = 4.5*max(0.5, user_scale/0.6)
-        painter.drawImage(QPointF(left+offset*0.55, top+offset), shadow)
-        painter.drawImage(QPointF(left, top), image)
+        now = time.monotonic()
+        colour = (base.red(), base.green(), base.blue())
+        render_scale = 0.72
+        render_interval = 1.0 / 15.0
+        cache = self._hand_mesh_frame_cache.get(model_side)
+        render_now = cache is None or (now - cache["rendered_at"]) >= render_interval
+
+        if cache is not None and not render_now:
+            # Compare pose relative to the wrist so ordinary hand translation can use
+            # a cheap image offset. Big articulation/depth changes bypass the throttle.
+            translation = target[0, :2] - cache["target"][0, :2]
+            shape_delta = target[:, :2] - cache["target"][:, :2] - translation
+            max_shape_delta = float(np.max(np.linalg.norm(shape_delta, axis=1)))
+            max_depth_delta = float(np.max(np.abs(target[:, 2] - cache["target"][:, 2])))
+            if colour != cache["colour"] or max_shape_delta > 18.0 or max_depth_delta > 22.0:
+                render_now = True
+
+        if render_now:
+            # Lower pixel workload matters much more than multisampling on CPU-backed
+            # GL. Qt smooth-scales this cached image to screen size when it is drawn.
+            render_target = target * render_scale
+            result = renderer.render(model_side, render_target, colour)
+            if result is None:
+                self._report_hand_mesh_problem(renderer.error or "3D hand rendering failed")
+                return False
+            data, w, h, left, top = result
+            image = QImage(data, w, h, w*4, QImage.Format_RGBA8888_Premultiplied).copy()
+            cache = {
+                "image": image,
+                "rendered_at": now,
+                "target": target.copy(),
+                "colour": colour,
+                "left": float(left) / render_scale,
+                "top": float(top) / render_scale,
+                "width": float(w) / render_scale,
+                "height": float(h) / render_scale,
+            }
+            self._hand_mesh_frame_cache[model_side] = cache
+
+        # Translate the cached image by the current wrist movement without rebuilding
+        # its vertex pose. Relative finger/palm movement is refreshed at least every
+        # 1/15 sec, or immediately when it exceeds the limits above.
+        translation = target[0, :2] - cache["target"][0, :2]
+        dest = QRectF(cache["left"] + float(translation[0]),
+                      cache["top"] + float(translation[1]),
+                      cache["width"], cache["height"])
+        # The mesh shading already supplies depth and volume; drawing a second, fully
+        # copied black silhouette costs another image-sized allocation each frame.
+        painter.save()
+        painter.setRenderHint(QPainter.SmoothPixmapTransform, True)
+        painter.drawImage(dest, cache["image"])
+        painter.restore()
         return True
 
     def _report_hand_mesh_problem(self, message):
@@ -7539,7 +7592,7 @@ class SpatialDesktop(QWidget):
         if getattr(self, "_capturing_glass_backdrop", False):
             return
         now = time.monotonic() if now is None else float(now)
-        if now-self._last_native_topmost_reassert <= 0.12:
+        if now-self._last_native_topmost_reassert <= 0.06:
             return
 
         if sys.platform.startswith("linux"):
@@ -7636,8 +7689,8 @@ class SpatialDesktop(QWidget):
     def _sync_linux_fullscreen_geometry(self):
         """Keep the XLibre/X11 overlay aligned to the full physical screen rectangle.
 
-        Some X11 window managers report the work area for a fullscreen Qt widget even
-        with override-redirect enabled. Force the widget's local (0, 0) to correspond
+        Some X11 window managers initially report the work area for a fullscreen Qt
+        widget rather than the full physical screen. Force the widget's local (0, 0) to correspond
         to screen.geometry().topLeft() and make its drawing area match that screen's
         actual dimensions, so screen-local hand coordinates and mapToGlobal agree.
         """
@@ -7652,7 +7705,7 @@ class SpatialDesktop(QWidget):
             self.update()
 
     # Repaint interval used while nothing on screen is moving (see _scene_is_idle).
-    IDLE_REPAINT_INTERVAL = 0.1
+    IDLE_REPAINT_INTERVAL = 0.33
 
     def _scene_is_idle(self, now):
         """True when no hand is in view and nothing is animating.
@@ -7702,6 +7755,13 @@ class SpatialDesktop(QWidget):
         self._last_scene_repaint = now
         self.update()
 
+    def _adjust_scene_timer_cadence(self, hand_present, now):
+        """Run gesture/UI work at 20 Hz while active and 10 Hz while idle."""
+        desired_ms = 50 if hand_present or not self._scene_is_idle(now) else 100
+        timer = getattr(self, "timer", None)
+        if timer is not None and timer.interval() != desired_ms:
+            timer.setInterval(desired_ms)
+
     def update_scene(self):
         """Mutually-exclusive quick clicks, direct fist manipulation, and Pinch Menu gestures."""
         # Track which hand toggled this frame so only that hand's gesture processing pauses.
@@ -7725,6 +7785,7 @@ class SpatialDesktop(QWidget):
             if self._applied_desktop_mode != self.desktop_mode or getattr(self, "_applied_menu_state", None) != menu_state:
                 self.apply_desktop_mode()
             self.depth += (self.target_depth-self.depth)*0.16
+            self._adjust_scene_timer_cadence(False, now)
             self._request_scene_repaint(now)
             return
         detected_hands, _frame_id = self.tracker.snapshot()
@@ -7737,6 +7798,7 @@ class SpatialDesktop(QWidget):
                 continue
             if side not in hands_by_side or score > hands_by_side[side][1]:
                 hands_by_side[side] = (landmarks, score)
+        self._adjust_scene_timer_cadence(bool(hands_by_side), now)
 
         # Full-screen-modal onboarding keeps live inference/rendering available but stops
         # all normal pointer, click, drag, scroll, peace-toggle and menu gesture paths.
@@ -8320,6 +8382,8 @@ class SpatialDesktop(QWidget):
                             horizontal_notches_per_second = 0.0
                             if scroll_stage == 3 and previous_stage != 3 and abs(smoothed_dx) > deadzone and not active.get("scroll_nav_fired", False):
                                 direction = -1 if smoothed_dx < 0 else 1
+                                if self.swap_drag_scroll_notches:
+                                    direction = -direction
                                 if self._send_browser_navigation(direction):
                                     self.status = "Back button sent" if direction < 0 else "Forward button sent"
                                 active["scroll_nav_fired"] = True
@@ -9434,15 +9498,19 @@ class SpatialDesktop(QWidget):
 
                     if self.settings_page == "interaction":
                         scroll = controls["scroll_toggle"]
+                        swap_nav = controls["swap_drag_scroll_toggle"]
                         priority = controls["priority_toggle"]
-                        painter.setBrush(QBrush(QColor(55, 145, 82, 225) if self.invert_scroll else QColor(75, 80, 89, 205)))
-                        painter.setPen(QPen(QColor(155, 245, 180, 220) if self.invert_scroll else QColor(155, 162, 172, 200), 1.5*scale))
-                        painter.drawRoundedRect(scroll, 10*scale, 10*scale)
+                        for rect, enabled in ((scroll, self.invert_scroll),
+                                              (swap_nav, self.swap_drag_scroll_notches)):
+                            painter.setBrush(QBrush(QColor(55, 145, 82, 225) if enabled else QColor(75, 80, 89, 205)))
+                            painter.setPen(QPen(QColor(155, 245, 180, 220) if enabled else QColor(155, 162, 172, 200), 1.5*scale))
+                            painter.drawRoundedRect(rect, 10*scale, 10*scale)
                         painter.setBrush(QBrush(QColor(10, 37, 55, 215)))
                         painter.setPen(QPen(QColor(125, 235, 245, 200), 1.5*scale))
                         painter.drawRoundedRect(priority, 10*scale, 10*scale)
                         painter.setPen(QColor(225, 250, 250))
                         self._draw_fitted_button_label(painter, scroll, "SCROLL  ·  "+("INVERTED" if self.invert_scroll else "NORMAL"), base_size=label_size, min_size=6, inset=12*scale)
+                        self._draw_fitted_button_label(painter, swap_nav, "DRAG NAV  ·  "+("BACK/FORWARD SWAPPED" if self.swap_drag_scroll_notches else "NORMAL"), base_size=label_size, min_size=6, inset=12*scale)
                         self._draw_fitted_button_label(painter, priority, "CURSOR PRIORITY  ·  "+self.cursor_lock_priority.upper(), base_size=label_size, min_size=6, inset=12*scale)
 
                     elif self.settings_page == "tli":
@@ -10029,7 +10097,7 @@ class SpatialDesktop(QWidget):
                     for sign in (-1.0, 1.0):
                         notch_x = point.x() + sign*offset
                         if horizontal_fallback and notch_index == 2:
-                            direction = sign
+                            direction = sign * (-1.0 if self.swap_drag_scroll_notches else 1.0)
                             painter.drawLine(QPointF(notch_x-direction*7, point.y()-8), QPointF(notch_x+direction*7, point.y()))
                             painter.drawLine(QPointF(notch_x+direction*7, point.y()), QPointF(notch_x-direction*7, point.y()+8))
                         else:
@@ -10038,7 +10106,7 @@ class SpatialDesktop(QWidget):
                 for sign in (-1.0, 1.0):
                     notch_x = point.x() + sign*offset
                     if horizontal_fallback and notch_index == 2:
-                        direction = sign
+                        direction = sign * (-1.0 if self.swap_drag_scroll_notches else 1.0)
                         painter.drawLine(QPointF(notch_x-direction*7, point.y()-8),
                                          QPointF(notch_x+direction*7, point.y()))
                         painter.drawLine(QPointF(notch_x+direction*7, point.y()),

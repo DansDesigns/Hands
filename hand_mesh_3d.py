@@ -22,6 +22,7 @@ import json
 import math
 import re
 import struct
+import time
 from pathlib import Path
 
 import numpy as np
@@ -299,49 +300,128 @@ def _normalize(v):
     return v/n if n > 1e-9 else v
 
 
-def _palm_frame(wrist, index_mcp, middle_mcp, pinky_mcp):
-    up = _normalize(middle_mcp - wrist)
-    across = index_mcp - pinky_mcp
-    across = _normalize(across - up*float(np.dot(across, up)))
-    return np.column_stack([up, across, np.cross(up, across)])
+def _palm_frame(wrist, index_mcp, middle_mcp, pinky_mcp, previous=None):
+    """Build an orthonormal palm basis without flips when the hand turns edge-on.
+
+    The projected index-to-pinky axis becomes almost zero when the palm is edge-on
+    to the camera. Normalizing that near-zero vector used to collapse the basis and
+    make the thumb twist abruptly. Reuse the previous across-axis in that singular
+    region, project it onto the new palm plane, and choose the closest sign.
+    """
+    up = _normalize(np.asarray(middle_mcp, dtype=np.float64) - wrist)
+    if float(np.linalg.norm(up)) < 1e-8:
+        up = np.asarray(previous[:, 0], dtype=np.float64) if previous is not None else np.array([0.0, 1.0, 0.0])
+        up = _normalize(up)
+
+    across_raw = np.asarray(index_mcp, dtype=np.float64) - pinky_mcp
+    across = across_raw - up*float(np.dot(across_raw, up))
+    across_len = float(np.linalg.norm(across))
+    raw_len = float(np.linalg.norm(across_raw))
+    if across_len < max(1e-6, raw_len*0.12):
+        if previous is not None:
+            previous_across = np.asarray(previous[:, 1], dtype=np.float64)
+            across = previous_across - up*float(np.dot(previous_across, up))
+        if float(np.linalg.norm(across)) < 1e-6:
+            # Pick whichever cardinal axis is least parallel to the palm's long axis.
+            basis = min((np.array([1.0, 0.0, 0.0]), np.array([0.0, 1.0, 0.0]),
+                         np.array([0.0, 0.0, 1.0])), key=lambda axis: abs(float(np.dot(axis, up))))
+            across = basis - up*float(np.dot(basis, up))
+    across = _normalize(across)
+    if previous is not None:
+        # Blend in the previous across axis near the edge-on singularity. This avoids
+        # the sudden twist when tracked across-width changes from noisy to well-defined.
+        previous_across = np.asarray(previous[:, 1], dtype=np.float64)
+        previous_across = previous_across - up*float(np.dot(previous_across, up))
+        previous_len = float(np.linalg.norm(previous_across))
+        raw_len = max(1e-9, float(np.linalg.norm(across_raw)))
+        confidence = min(1.0, max(0.0, (across_len/raw_len - 0.08)/0.34))
+        if previous_len > 1e-7:
+            previous_across = previous_across/previous_len
+            if float(np.dot(across, previous_across)) < 0.0:
+                across = -across
+            across = _normalize(confidence*across + (1.0-confidence)*previous_across)
+        if float(np.dot(across, previous[:, 1])) < 0.0:
+            across = -across
+    normal = _normalize(np.cross(up, across))
+    if float(np.linalg.norm(normal)) < 1e-7:
+        # Last-resort guard against malformed or momentarily collapsed landmarks.
+        fallback = np.asarray(previous[:, 2], dtype=np.float64) if previous is not None else np.array([0.0, 0.0, 1.0])
+        normal = _normalize(fallback - up*float(np.dot(fallback, up)))
+    across = _normalize(np.cross(normal, up))
+    return np.column_stack([up, across, normal])
 
 
-def _align(u, v):
-    """Smallest rotation taking unit vector u onto unit vector v."""
-    u, v = _normalize(u), _normalize(v)
-    c = float(np.dot(u, v))
+def _align(u, v, preferred_axes=()):
+    """Smallest rotation taking u onto v, robust to collapsed/noisy landmarks.
+
+    A zero-length target direction is not evidence for a 180-degree turn. MediaPipe
+    can briefly collapse adjacent finger joints when a digit is occluded; treating that
+    as an antiparallel direction caused arbitrary thumb/finger flips. For true 180-degree
+    turns, use palm-relative axes first so the roll remains anatomically stable.
+    """
+    u = np.asarray(u, dtype=np.float64)
+    v = np.asarray(v, dtype=np.float64)
+    u_len, v_len = float(np.linalg.norm(u)), float(np.linalg.norm(v))
+    if (not np.isfinite(u_len) or not np.isfinite(v_len) or
+            u_len < 1e-8 or v_len < 1e-8):
+        return np.eye(3)
+    u, v = u/u_len, v/v_len
+    c = min(1.0, max(-1.0, float(np.dot(u, v))))
     axis = np.cross(u, v)
-    s = float(np.linalg.norm(axis))
-    if s < 1e-8:
-        if c > 0:
+    sine = float(np.linalg.norm(axis))
+    if sine < 1e-8:
+        if c >= 0.0:
             return np.eye(3)
-        ortho = np.cross(u, [1.0, 0.0, 0.0])
-        if np.linalg.norm(ortho) < 1e-6:
-            ortho = np.cross(u, [0.0, 1.0, 0.0])
-        axis = _normalize(ortho)
+        axis = None
+        candidates = list(preferred_axes or ())
+        candidates.extend(([0.0, 0.0, 1.0], [0.0, 1.0, 0.0], [1.0, 0.0, 0.0]))
+        for candidate in candidates:
+            candidate = np.asarray(candidate, dtype=np.float64)
+            projected = candidate - u*float(np.dot(candidate, u))
+            length = float(np.linalg.norm(projected))
+            if length > 1e-7:
+                axis = projected/length
+                break
+        if axis is None:
+            return np.eye(3)
         k = np.array([[0, -axis[2], axis[1]], [axis[2], 0, -axis[0]], [-axis[1], axis[0], 0]])
         return np.eye(3) + 2*k@k
-    axis /= s
+    axis /= sine
     k = np.array([[0, -axis[2], axis[1]], [axis[2], 0, -axis[0]], [-axis[1], axis[0], 0]])
-    return np.eye(3) + s*k + (1-c)*(k@k)
+    return np.eye(3) + sine*k + (1-c)*(k@k)
 
 
-def pose_joint_matrices(model: HandModel, target: np.ndarray) -> np.ndarray:
+def pose_joint_matrices(model: HandModel, target: np.ndarray, target_palm_frame=None) -> np.ndarray:
     """4x4 skinning matrix per joint mapping rest-mesh vertices onto the target pose.
 
     target: (21, 3) landmark positions in overlay pixels (x right, y down, z away).
     """
     rest = model.landmark_head
     scale = float(np.linalg.norm(target[9]-target[0])) / max(1e-9, model.palm_length)
-    r_root = (_palm_frame(target[0], target[5], target[9], target[17]) @
-              _palm_frame(rest[0], rest[5], rest[9], rest[17]).T)
+    target_frame = (target_palm_frame if target_palm_frame is not None else
+                    _palm_frame(target[0], target[5], target[9], target[17]))
+    r_root = target_frame @ _palm_frame(rest[0], rest[5], rest[9], rest[17]).T
+    target_palm_length = float(np.linalg.norm(target[9]-target[0]))
+    # Below this fraction of the palm, a segment direction is mostly landmark noise.
+    # Keep that bone aligned with the palm instead of turning it toward a random noisy
+    # vector. The threshold scales with the hand, so it remains useful at 0.1x display.
+    min_direction_length = max(1e-6, target_palm_length*0.025)
     rotations, heads, stretch = {}, {}, {}
     for k, canonical in enumerate(model.canonical):
         landmark = CANONICAL_LANDMARK.get(canonical) if canonical else None
         if landmark is not None and landmark in NEXT_LANDMARK and NEXT_LANDMARK[landmark] in rest:
             child = NEXT_LANDMARK[landmark]
             rest_dir = rest[child] - rest[landmark]
-            rotations[k] = _align(r_root @ rest_dir, target[child]-target[landmark]) @ r_root
+            target_dir = target[child]-target[landmark]
+            if float(np.linalg.norm(target_dir)) < min_direction_length:
+                # The joint direction has collapsed (common when MediaPipe guesses an
+                # occluded fingertip). Preserve the anatomical palm-relative direction.
+                rotations[k] = r_root
+            else:
+                rotations[k] = _align(
+                    r_root @ rest_dir, target_dir,
+                    preferred_axes=(target_frame[:, 2], target_frame[:, 1], target_frame[:, 0]),
+                ) @ r_root
             heads[k] = target[landmark]
             # Stretch the bone along its own axis to the user's segment length, so the
             # mesh joints - and above all the fingertips - land on the tracked landmarks
@@ -351,7 +431,12 @@ def pose_joint_matrices(model: HandModel, target: np.ndarray) -> np.ndarray:
                 # For the last bone, the tracked tip is the end of the mesh fingertip.
                 reach_len = rest_len + model.tip_cap.get(child, 0.0)
                 factor = float(np.linalg.norm(target[child]-target[landmark])) / (scale*reach_len)
-                stretch[k] = (min(1.8, max(0.55, factor)), rest_dir/rest_len)
+                # Finger segment lengths vary substantially when curled or extended. The
+                # old 0.55–1.8 clamp caused tips to miss the tracked joints and made the
+                # hand look as though the wrong finger was bending, especially at small
+                # display scales. Keep the guardrails, but let the rig match more of the
+                # observed range without flattening a curled joint.
+                stretch[k] = (min(2.5, max(0.15, factor)), rest_dir/rest_len)
         elif landmark is not None and landmark != 0:
             heads[k] = None                      # fingertip: placed along its parent bone below
         else:
@@ -467,6 +552,7 @@ class HandMeshRenderer:
         self._models = {}
         self._vaos = {}
         self._targets = {}
+        self._palm_frames = {}
         self._failed = False
 
     @property
@@ -547,7 +633,10 @@ class HandMeshRenderer:
                     pass
             size = (max(need_w, current[0] if current else 0), max(need_h, current[1] if current else 0))
             ctx = self._ctx
-            samples = min(4, int(getattr(ctx, "max_samples", 0) or 0))
+            # 2x MSAA is sufficient for a small translucent hand overlay and is
+            # much cheaper on software OpenGL drivers (common on desktop Linux).
+            max_samples = int(getattr(ctx, "max_samples", 0) or 0)
+            samples = 2 if max_samples >= 2 else 0
             colour = ctx.renderbuffer(size, 4, samples=samples)
             depth = ctx.depth_renderbuffer(size, samples=samples)
             msaa = ctx.framebuffer(colour, depth)
@@ -571,7 +660,11 @@ class HandMeshRenderer:
         if model is None:
             return None
         try:
-            mats = pose_joint_matrices(model, target)
+            previous = self._palm_frames.get(side)
+            previous_frame = previous[0] if previous and (time.monotonic()-previous[1]) < 0.35 else None
+            target_frame = _palm_frame(target[0], target[5], target[9], target[17], previous=previous_frame)
+            self._palm_frames[side] = (target_frame, time.monotonic())
+            mats = pose_joint_matrices(model, target, target_palm_frame=target_frame)
             palm_pixels = float(np.linalg.norm(target[9]-target[0]))
             margin = self.model_reach(side, palm_pixels)*1.15 + 4.0
             left = math.floor(float(target[:, 0].min()) - margin)
