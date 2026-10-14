@@ -1612,6 +1612,8 @@ class SpatialDesktop(QWidget):
         self._applied_desktop_mode = None
         self._applied_menu_state = None
         self._last_native_topmost_reassert = 0.0
+        self._linux_x11_lib = None
+        self._linux_x11_display = None
         self.menu_open = True
         self.hub_visible = True
         self.settings_open = False
@@ -3679,15 +3681,7 @@ class SpatialDesktop(QWidget):
     def _set_os_pointer(self, point):
         if point is None or self._gesture_ui_modal_open():
             return
-        # interactive_visual_point() is mapped against the full physical screen,
-        # not the Qtile work area. mapToGlobal() adds the overlay's origin, which
-        # can be offset by a reserved top bar and prevents the cursor reaching it.
-        screen = QApplication.primaryScreen()
-        geometry = screen.geometry() if screen is not None else None
-        if geometry is not None:
-            global_pos = geometry.topLeft() + QPoint(round(point.x()), round(point.y()))
-        else:
-            global_pos = self.mapToGlobal(QPoint(round(point.x()), round(point.y())))
+        global_pos = self.mapToGlobal(QPoint(round(point.x()), round(point.y())))
         QCursor.setPos(global_pos)
         self.last_os_cursor_pos = global_pos
 
@@ -7523,18 +7517,61 @@ class SpatialDesktop(QWidget):
         return True
 
     def _maintain_native_topmost(self, now=None):
-        """Reassert the active hand-visual overlay above ordinary/topmost app windows on Windows.
+        """Keep the active visual overlay above other windows without taking focus.
 
-        This does not activate the window or steal keyboard focus. Search and calibration
-        surfaces own the hands while they are visible, so promote those instead of the
-        full-screen parent in those modes.
+        Windows reasserts HWND_TOPMOST as before. On Linux/X11, Qtile can raise a
+        dragged client above an override-redirect overlay, so briefly restack the
+        fullscreen overlay natively while a native window drag is underway.
         """
-        if not sys.platform.startswith("win") or getattr(self, "_capturing_glass_backdrop", False):
+        if getattr(self, "_capturing_glass_backdrop", False):
             return
         now = time.monotonic() if now is None else float(now)
         if now-self._last_native_topmost_reassert <= 0.12:
             return
 
+        if sys.platform.startswith("linux"):
+            # XRaiseWindow must only receive native X11 window IDs. On a Wayland Qt
+            # backend, winId() is not an X11 window and should be left to Qt/the WM.
+            try:
+                if QApplication.platformName().lower() not in ("xcb", "x11"):
+                    return
+            except Exception:
+                return
+            dragging = any(isinstance(active, dict) and active.get("mode") == "drag_window"
+                           for active in getattr(self, "active_action", {}).values())
+            if not dragging or not self.isVisible():
+                return
+            try:
+                # XRaiseWindow works with the override-redirect fullscreen window and
+                # avoids activating it or stealing focus from the window being dragged.
+                if getattr(self, "_linux_x11_display", None) is None:
+                    x11 = ctypes.CDLL("libX11.so.6")
+                    x11.XOpenDisplay.argtypes = [ctypes.c_char_p]
+                    x11.XOpenDisplay.restype = ctypes.c_void_p
+                    x11.XRaiseWindow.argtypes = [ctypes.c_void_p, ctypes.c_ulong]
+                    x11.XRaiseWindow.restype = ctypes.c_int
+                    x11.XFlush.argtypes = [ctypes.c_void_p]
+                    x11.XFlush.restype = ctypes.c_int
+                    display = x11.XOpenDisplay(None)
+                    if not display:
+                        return
+                    self._linux_x11_lib = x11
+                    self._linux_x11_display = display
+                self._linux_x11_lib.XRaiseWindow(self._linux_x11_display,
+                                                  ctypes.c_ulong(int(self.winId())))
+                self._linux_x11_lib.XFlush(self._linux_x11_display)
+                self._last_native_topmost_reassert = now
+            except Exception:
+                # Qt's topmost hint remains the safe fallback if libX11 is unavailable.
+                try:
+                    self.raise_()
+                    self._last_native_topmost_reassert = now
+                except Exception:
+                    pass
+            return
+
+        if not sys.platform.startswith("win"):
+            return
         search_dialog = getattr(self, "search_dialog", None)
         search_overlay = getattr(self, "search_hand_overlay", None)
         if search_dialog is not None and search_dialog.isVisible():
@@ -7564,6 +7601,24 @@ class SpatialDesktop(QWidget):
             self._last_native_topmost_reassert = now
         except Exception:
             pass
+
+    def _sync_linux_fullscreen_geometry(self):
+        """Keep the XLibre/X11 overlay aligned to the full physical screen rectangle.
+
+        Some X11 window managers report the work area for a fullscreen Qt widget even
+        with override-redirect enabled. Force the widget's local (0, 0) to correspond
+        to screen.geometry().topLeft() and make its drawing area match that screen's
+        actual dimensions, so screen-local hand coordinates and mapToGlobal agree.
+        """
+        if not sys.platform.startswith("linux"):
+            return
+        screen = QApplication.primaryScreen()
+        if screen is None:
+            return
+        screen_rect = screen.geometry()
+        if self.geometry() != screen_rect:
+            self.setGeometry(screen_rect)
+            self.update()
 
     # Repaint interval used while nothing on screen is moving (see _scene_is_idle).
     IDLE_REPAINT_INTERVAL = 0.1
@@ -10205,6 +10260,11 @@ def main():
     app.setQuitOnLastWindowClosed(False)
     window = SpatialDesktop()
     window.showFullScreen()
+    window._sync_linux_fullscreen_geometry()
+    # Some XLibre/Qtile configurations finalize the native geometry just after the
+    # first show; repeat once the first event-loop pass has applied the fullscreen state.
+    QTimer.singleShot(0, window._sync_linux_fullscreen_geometry)
+    QTimer.singleShot(250, window._sync_linux_fullscreen_geometry)
     window.apply_desktop_mode()
     sys.exit(app.exec())
 

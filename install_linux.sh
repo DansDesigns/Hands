@@ -82,6 +82,11 @@ if ! "$VPY" -u "$APP_DIR/install_d1_model.py" 600m; then
 fi
 
 echo '[9/9] Creating desktop application launcher...'
+# Install and repair the launcher as part of this installer; users should not
+# have to run a second setup script. ZIP extraction can lose Unix executable
+# bits, so restore them before creating a desktop entry which invokes the files.
+chmod +x "$APP_DIR/run_linux.sh" "$APP_DIR/spatial_desktop_launcher.sh"
+
 APPS_DIR="${XDG_DATA_HOME:-$HOME/.local/share}/applications"
 mkdir -p "$APPS_DIR"
 cat > "$APPS_DIR/spatial-desktop-prototype.desktop" <<DESKTOP
@@ -89,15 +94,16 @@ cat > "$APPS_DIR/spatial-desktop-prototype.desktop" <<DESKTOP
 Type=Application
 Name=Spatial Desktop Prototype
 Comment=Camera-controlled spatial desktop and local search
-Exec="$APP_DIR/run_linux.sh"
-Path=$APP_DIR
+Exec="$APP_DIR/spatial_desktop_launcher.sh"
+TryExec="$APP_DIR/spatial_desktop_launcher.sh"
 Terminal=true
 Categories=Utility;
 DESKTOP
 chmod +x "$APPS_DIR/spatial-desktop-prototype.desktop"
 if command -v update-desktop-database >/dev/null 2>&1; then
-    update-desktop-database "$APPS_DIR" || true
+    update-desktop-database "$APPS_DIR" >/dev/null 2>&1 || true
 fi
+printf 'Spatial Desktop launcher installed: %s\n' "$APPS_DIR/spatial-desktop-prototype.desktop"
 
 echo '============================================================'
 echo 'INSTALLATION COMPLETE'
