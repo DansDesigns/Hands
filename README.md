@@ -19,6 +19,11 @@ Settings → Hands → **RENDER** is a three-way switch:
 
 The bundled 3D hands are `assets/hands/generic-hand-left.glb` and `generic-hand-right.glb` from the [WebXR Input Profiles](https://github.com/immersive-web/webxr-input-profiles) project, MIT licensed (see `assets/hands/LICENSE-webxr-input-profiles.md`). Hands are shown from your own viewpoint, not the camera's: with your palms toward the camera you see the backs of the virtual hands, just as you see your real ones.
 
+**Hidden fingertips are drawn tucked in.** The tracker always reports every fingertip, even ones the camera can't see; for those it guesses, often a half-open finger. A fingertip or thumb tip counts as hidden when it's farther from the camera than the palm or another finger in front of it.
+- With the flat and 3D styles, hidden digits are drawn folded into a fist, and a hidden thumb rests over the curled fingers. This is the common case of a fist or pointing hand seen from the back. A fingertip outside the camera view is cut off rather than tucked, so it keeps its tracked position. Touching fingertips (a pinch) are never tucked.
+- Digits fade in and out of the tucked pose over about 80 ms.
+- This only changes the drawing. Gestures, the TLI and the cursor still use the tracked landmarks, and the skeleton style still shows the raw tracking.
+
 **Using your own hand model:** save a rigged glTF/GLB hand as `models/hands/custom-right.glb` and/or `custom-left.glb` (`models/` is git-ignored, so licensed downloads stay out of the repository). If only one side is provided, it is mirrored for the other hand. Bone names from WebXR, Blender/Rigify (`f_index.01.R`) and Mixamo (`RightHandIndex1`) rigs are recognised automatically; for other rigs add `custom-right.joints.json` mapping each bone name to `wrist`, `<finger>-meta` or `<finger>-1`…`<finger>-4` (finger = thumb/index/middle/ring/pinky, 1 = knuckle bone, 4 = tip). FBX/OBJ/BLEND models need exporting to glTF from Blender first. Check each model's licence before sharing it: many marketplace "royalty free" licences allow use in a product but not redistributing the model file.
 
 ## v61 overlay and menu layout updates

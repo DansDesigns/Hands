@@ -53,6 +53,7 @@ from gesture_rules import (
     thumb_sticking_out,
 )
 from voice_services import Speech, KokoroTTS
+from hand_occlusion import TuckSmoother
 from custom_gestures import (
     ACTION_IDS as CUSTOM_GESTURE_ACTION_IDS, ACTION_LABELS as CUSTOM_GESTURE_ACTION_LABELS,
     ACTION_GROUPS as CUSTOM_GESTURE_ACTION_GROUPS,
@@ -1664,6 +1665,10 @@ class SpatialDesktop(QWidget):
         self.side_cursor_positions = {"left": None, "right": None}
         # Screen offset applied when drawing each hand so it moves with the smoothed TLI.
         self.hand_draw_offset = {"left": (0.0, 0.0), "right": (0.0, 0.0)}
+        # Drawn-hand landmarks with fingertips the camera can't see folded in (see
+        # hand_occlusion). Gestures and the TLI keep using hand_positions.
+        self.hand_display_positions = {"left": None, "right": None}
+        self._hand_tucker = TuckSmoother()
         # Keep raw, smoothed camera-mapped anchors separate from scaled interaction points.
         # This avoids feeding transformed coordinates back into the smoothing filter.
         self.smoothed_side_cursor_positions = {"left": None, "right": None}
@@ -6187,6 +6192,13 @@ class SpatialDesktop(QWidget):
             x, y = scale_hand_point((q.x(), q.y()), (scale_origin.x(), scale_origin.y()), user_scale)
             return QPointF(x+off_x, y+off_y)
 
+        # The flat and 3D hands show fingertips the camera can't see as tucked in, instead
+        # of MediaPipe's guess; the skeleton style keeps showing the raw tracking.
+        style = getattr(self, "hand_render_style", "flat")
+        display = getattr(self, "hand_display_positions", {}).get(side) if side in ("left", "right") else None
+        if style != "skeleton" and display is not None and display[0] is points:
+            points = display[1]
+
         joints = {i: sp(i) for i in range(21)}
         painter.save()
         painter.setOpacity(painter.opacity() * min(1.0, max(0.10, float(getattr(self, "hand_transparency", 50.0)) / 100.0)))
@@ -6221,7 +6233,6 @@ class SpatialDesktop(QWidget):
 
         # Skeleton mode is a genuine alternate rendering style, not a hide/show switch.
         # It reuses the identical transformed landmarks and camera-distance scaling.
-        style = getattr(self, "hand_render_style", "flat")
         if style == "skeleton":
             skeleton_color = QColor(self.left_click_color if side == "left" else self.right_click_color)
             skeleton_width_scale = min(4.0, max(0.5, float(getattr(self, "skeleton_line_thickness", 1.5))))
@@ -7378,6 +7389,8 @@ class SpatialDesktop(QWidget):
             if lag > 90.0:  # a jump (re-acquired hand): don't drag the hand far behind
                 dx, dy = dx*90.0/lag, dy*90.0/lag
             self.hand_draw_offset[side] = (dx, dy)
+            self.hand_display_positions[side] = (self.hand_positions[side],
+                                                 self._hand_tucker.update(side, self.hand_positions[side], now))
             cursor_points[side] = QPointF(cursor)
             # All interaction code and rendering now consume the same scaled TLI.
             self.side_cursor_positions[side] = QPointF(cursor)
