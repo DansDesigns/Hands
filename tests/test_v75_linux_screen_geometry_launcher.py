@@ -3,13 +3,39 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 
 
-def test_os_pointer_uses_overlay_local_to_global_mapping():
+def test_os_pointer_maps_virtual_hand_points_to_physical_screen_coordinates():
     source = (ROOT / "main.py").read_text(encoding="utf-8")
-    start = source.index("    def _set_os_pointer(self, point):")
-    end = source.index("    def ", start + 8)
+    start = source.index("    def _virtual_point_to_global(self, point):")
+    end = source.index("    def _release_fist_mouse(self, side):", start)
     method = source[start:end]
-    assert "self.mapToGlobal(QPoint(round(point.x()), round(point.y())))" in method
-    assert "screen.geometry().topLeft() + QPoint" not in method
+    assert "QApplication.primaryScreen()" in method
+    assert "geometry.topLeft() + pixel" in method
+    assert "self.mapToGlobal(pixel)" in method
+    assert "self._virtual_point_to_global(point)" in method
+    assert "QCursor.setPos(global_pos)" in method
+
+
+def test_virtual_tli_clamps_to_physical_screen_not_qtile_work_area():
+    source = (ROOT / "main.py").read_text(encoding="utf-8")
+    start = source.index("    def _scale_hand_tli_point(self, cursor, points=None, side=None):")
+    end = source.index("    def _visual_tli_position", start)
+    method = source[start:end]
+    assert "screen.geometry()" in method
+    assert "geometry.width()" in method
+    assert "geometry.height()" in method
+    assert "self.width()-1.0" not in method
+    assert "self.height()-1.0" not in method
+
+
+def test_fullscreen_geometry_is_rechecked_during_live_linux_tracking():
+    source = (ROOT / "main.py").read_text(encoding="utf-8")
+    topmost_start = source.index("    def _maintain_native_topmost(self, now=None):")
+    geometry_start = source.index("    def _sync_linux_fullscreen_geometry(self):", topmost_start)
+    topmost = source[topmost_start:geometry_start]
+    geometry = source[geometry_start:source.index("    # Repaint interval", geometry_start)]
+    assert "_last_linux_geometry_sync_check" in topmost
+    assert "self._sync_linux_fullscreen_geometry()" in topmost
+    assert "reported_origin == screen_rect.topLeft()" in geometry
 
 
 def test_linux_overlay_is_synchronized_to_full_screen_geometry():

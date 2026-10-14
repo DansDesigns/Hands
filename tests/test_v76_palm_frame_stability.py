@@ -31,6 +31,6 @@ def test_palm_frame_stays_orthonormal_as_across_axis_turns_edge_on():
 def test_rendering_is_capped_for_lower_cpu_use():
     main_source = (ROOT / "main.py").read_text(encoding="utf-8")
     mesh_source = (ROOT / "hand_mesh_3d.py").read_text(encoding="utf-8")
-    assert "frame_interval = 1.0 / 24.0" in main_source
-    assert "self.timer.start(40)" in main_source
+    assert "frame_interval = 1.0 / 18.0" in main_source
+    assert "self.timer.start(50)" in main_source
     assert "samples = 2 if max_samples >= 2 else 0" in mesh_source

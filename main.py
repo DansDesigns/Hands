@@ -2730,7 +2730,7 @@ class SpatialDesktop(QWidget):
             return None
         if sys.platform.startswith("linux"):
             try:
-                global_point = self.mapToGlobal(QPoint(round(point.x()), round(point.y())))
+                global_point = self._virtual_point_to_global(point)
                 px, py = int(global_point.x()), int(global_point.y())
                 own_pid = os.getpid()
                 try:
@@ -2775,7 +2775,7 @@ class SpatialDesktop(QWidget):
             return None
         try:
             user32 = ctypes.windll.user32
-            global_point = self.mapToGlobal(QPoint(round(point.x()), round(point.y())))
+            global_point = self._virtual_point_to_global(point)
             px, py = int(global_point.x()), int(global_point.y())
             overlay_hwnd = int(self.winId())
             rect = wintypes.RECT()
@@ -2901,7 +2901,7 @@ class SpatialDesktop(QWidget):
             return False
         try:
             user32 = ctypes.windll.user32
-            global_point = self.mapToGlobal(QPoint(round(point.x()), round(point.y())))
+            global_point = self._virtual_point_to_global(point)
             px, py = int(global_point.x()), int(global_point.y())
             found = {"inside": False}
             enum_type = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
@@ -2930,7 +2930,7 @@ class SpatialDesktop(QWidget):
             return None
         try:
             user32 = ctypes.windll.user32
-            global_point = self.mapToGlobal(QPoint(round(point.x()), round(point.y())))
+            global_point = self._virtual_point_to_global(point)
             sx, sy = int(global_point.x()), int(global_point.y())
             lparam = ((sy & 0xFFFF) << 16) | (sx & 0xFFFF)
             # A hung target application must not stall the camera/gesture loop.
@@ -3086,7 +3086,7 @@ class SpatialDesktop(QWidget):
         if point is None:
             return False
         try:
-            screen_point = self.mapToGlobal(QPoint(round(point.x()), round(point.y())))
+            screen_point = self._virtual_point_to_global(point)
             user32 = ctypes.windll.user32
             native_point = wintypes.POINT(int(screen_point.x()), int(screen_point.y()))
             window_from_point = user32.WindowFromPoint
@@ -3175,7 +3175,7 @@ class SpatialDesktop(QWidget):
         point = cursor or active.get("last_cursor") or active.get("origin")
         screen_point = None
         if point is not None:
-            screen_point = self.mapToGlobal(QPoint(round(point.x()), round(point.y())))
+            screen_point = self._virtual_point_to_global(point)
         wheel_steps = int(steps) if self.invert_scroll else -int(steps)
         side = active.get("side")
         message_id = 0x020E if horizontal else 0x020A  # WM_MOUSEHWHEEL / WM_MOUSEWHEEL
@@ -3638,7 +3638,7 @@ class SpatialDesktop(QWidget):
             return
         if self.desktop_mode == "os" and pyautogui is not None:
             try:
-                global_pos = self.mapToGlobal(QPoint(round(point.x()), round(point.y())))
+                global_pos = self._virtual_point_to_global(point)
                 QCursor.setPos(global_pos)
                 self.last_os_cursor_pos = global_pos
                 pyautogui.click(button="left", _pause=False)
@@ -3697,7 +3697,7 @@ class SpatialDesktop(QWidget):
         if (self.desktop_mode == "os" and pyautogui is not None
                 and not self.mouse_detached_by_side.get(side, False)):
             try:
-                global_pos = self.mapToGlobal(QPoint(round(point.x()), round(point.y())))
+                global_pos = self._virtual_point_to_global(point)
                 QCursor.setPos(global_pos)
                 self.last_os_cursor_pos = global_pos
                 pyautogui.click(button="right", _pause=False)
@@ -3705,10 +3705,31 @@ class SpatialDesktop(QWidget):
             except Exception as exc:
                 self.status = f"OS right-click failed: {exc}"
 
+    def _virtual_point_to_global(self, point):
+        """Convert a virtual-hand point to physical desktop coordinates.
+
+        interactive_visual_point() maps landmarks in primary-screen-local pixels.
+        Qtile can position a Qt.Tool fullscreen overlay at the work-area origin (below
+        its top bar), so mapToGlobal() would incorrectly add that bar offset and make
+        the cursor unable to reach the top bar. Convert from the actual QScreen origin
+        on Linux; use the native Qt mapping on other platforms.
+        """
+        if point is None:
+            return None
+        pixel = QPoint(round(point.x()), round(point.y()))
+        if sys.platform.startswith("linux"):
+            screen = QApplication.primaryScreen()
+            geometry = screen.geometry() if screen is not None else None
+            if geometry is not None:
+                return geometry.topLeft() + pixel
+        return self.mapToGlobal(pixel)
+
     def _set_os_pointer(self, point):
         if point is None or self._gesture_ui_modal_open():
             return
-        global_pos = self.mapToGlobal(QPoint(round(point.x()), round(point.y())))
+        global_pos = self._virtual_point_to_global(point)
+        if global_pos is None:
+            return
         QCursor.setPos(global_pos)
         self.last_os_cursor_pos = global_pos
 
@@ -4378,7 +4399,7 @@ class SpatialDesktop(QWidget):
             side = "right" if self.side_cursor_positions.get("right") is not None else "left"
         point = self.side_cursor_positions.get(side)
         if point is not None:
-            return self.mapToGlobal(QPoint(round(point.x()), round(point.y())))
+            return self._virtual_point_to_global(point)
         if pyautogui is not None:
             try:
                 x, y = pyautogui.position()
@@ -5399,14 +5420,14 @@ class SpatialDesktop(QWidget):
             base_points = []
             for landmark in landmarks:
                 mapped = self.interactive_visual_point(float(landmark.x), float(landmark.y))
-                global_point = self.mapToGlobal(QPoint(round(mapped.x()), round(mapped.y())))
+                global_point = self._virtual_point_to_global(mapped)
                 base_points.append(window.mapFromGlobal(global_point) if window is not None else QPoint())
             color = QColor(self.left_click_color if side == "left" else self.right_click_color)
             overlays.append((base_points, color))
             tx = (float(landmarks[4].x)+float(landmarks[8].x))*0.5
             ty = (float(landmarks[4].y)+float(landmarks[8].y))*0.5
             mapped_tli = self.interactive_visual_point(tx, ty)
-            global_tli = self.mapToGlobal(QPoint(round(mapped_tli.x()), round(mapped_tli.y())))
+            global_tli = self._virtual_point_to_global(mapped_tli)
             local_tli = window.mapFromGlobal(global_tli) if window is not None else QPoint()
             tli_overlays.append((QPointF(local_tli), color))
         if window is not None:
@@ -5484,7 +5505,7 @@ class SpatialDesktop(QWidget):
         points = [(float(lm.x), float(lm.y), float(getattr(lm, "z", 0.0))) for lm in landmarks]
         raw_anchor = self.interactive_hand_anchor(landmarks, side)
         mapped = self._scale_hand_tli_point(raw_anchor, points, side)
-        global_point = self.mapToGlobal(QPoint(round(mapped.x()), round(mapped.y())))
+        global_point = self._virtual_point_to_global(mapped)
         return window.pinch_area_global_rect().contains(QPointF(float(global_point.x()), float(global_point.y())))
 
     def _update_tli_calibration_live_overlay(self, side, landmarks, cursor):
@@ -5498,13 +5519,13 @@ class SpatialDesktop(QWidget):
         for x, y, _z in points:
             q = self.interactive_visual_point(x, y)
             sx, sy = scale_hand_point((q.x(), q.y()), (origin.x(), origin.y()), user_scale)
-            global_point = self.mapToGlobal(QPoint(round(sx), round(sy)))
+            global_point = self._virtual_point_to_global(QPointF(sx, sy))
             local = window.mapFromGlobal(global_point)
             mapped_points.append(QPointF(float(local.x()), float(local.y())))
         color = QColor(self.left_click_color if side == "left" else self.right_click_color)
         local_tli = None
         if cursor is not None:
-            global_tli = self.mapToGlobal(QPoint(round(cursor.x()), round(cursor.y())))
+            global_tli = self._virtual_point_to_global(cursor)
             local = window.mapFromGlobal(global_tli)
             local_tli = QPointF(float(local.x()), float(local.y()))
         window.set_hand_overlay([(mapped_points, color)], [(local_tli, color)] if local_tli is not None else [])
@@ -5599,10 +5620,14 @@ class SpatialDesktop(QWidget):
         return (tx+ix)*0.5, (ty+iy)*0.5
 
     def interactive_point(self, x, y):
-        """Map the calibrated camera area to the screen and clamp the actual pointer."""
+        """Map the calibrated camera area to the physical screen and clamp it there."""
         point = self.interactive_visual_point(x, y)
-        return QPointF(min(max(0.0, point.x()), max(1, self.width()-1)),
-                       min(max(0.0, point.y()), max(1, self.height()-1)))
+        screen = QApplication.primaryScreen()
+        geometry = screen.geometry() if screen is not None else None
+        width = geometry.width() if geometry is not None else self.width()
+        height = geometry.height() if geometry is not None else self.height()
+        return QPointF(min(max(0.0, point.x()), max(1, width-1)),
+                       min(max(0.0, point.y()), max(1, height-1)))
 
     def interactive_visual_point(self, x, y):
         """Map camera landmarks across the full physical screen, including Qtile bars.
@@ -6430,10 +6455,14 @@ class SpatialDesktop(QWidget):
             return QPointF(cursor)
         origin, visual_scale = self._hand_visual_transform(points, side)
         x, y = scale_hand_point((cursor.x(), cursor.y()), (origin.x(), origin.y()), visual_scale)
-        # Clamp only after the shared wrist/contact transform. Drawing, hit-testing and
-        # activation all consume this same transformed point, so the TLI cannot drift.
-        return QPointF(min(max(0.0, x), max(1.0, self.width()-1.0)),
-                       min(max(0.0, y), max(1.0, self.height()-1.0)))
+        # Clamp to the physical screen, not the Qtile work area. On Linux the reserved
+        # top/bottom bars are outside availableGeometry(), but are still valid targets.
+        screen = QApplication.primaryScreen()
+        geometry = screen.geometry() if screen is not None else None
+        width = geometry.width() if geometry is not None else self.width()
+        height = geometry.height() if geometry is not None else self.height()
+        return QPointF(min(max(0.0, x), max(1.0, width-1.0)),
+                       min(max(0.0, y), max(1.0, height-1.0)))
 
     def _visual_tli_position(self, side, cursor, points=None):
         """Return the already-transformed TLI; only slider reticles override its position."""
@@ -7592,6 +7621,10 @@ class SpatialDesktop(QWidget):
         if getattr(self, "_capturing_glass_backdrop", False):
             return
         now = time.monotonic() if now is None else float(now)
+        if sys.platform.startswith("linux") and now-float(
+                getattr(self, "_last_linux_geometry_sync_check", 0.0)) >= 0.5:
+            self._last_linux_geometry_sync_check = now
+            self._sync_linux_fullscreen_geometry()
         if now-self._last_native_topmost_reassert <= 0.06:
             return
 
@@ -7700,7 +7733,17 @@ class SpatialDesktop(QWidget):
         if screen is None:
             return
         screen_rect = screen.geometry()
-        if self.geometry() != screen_rect:
+        try:
+            reported_origin = self.mapToGlobal(QPoint(0, 0))
+        except Exception:
+            reported_origin = screen_rect.topLeft()
+        origin_matches = reported_origin == screen_rect.topLeft()
+        size_matches = self.size() == screen_rect.size()
+        geometry_matches = self.geometry() == screen_rect
+        if not (origin_matches and size_matches and geometry_matches):
+            # Qtile/XLibre can reapply the work-area offset after startup. Reassert
+            # the physical screen bounds so local drawing and full-screen map coords
+            # remain aligned; cursor injection itself uses _virtual_point_to_global().
             self.setGeometry(screen_rect)
             self.update()
 
@@ -8394,7 +8437,7 @@ class SpatialDesktop(QWidget):
                         rect = self._native_window_rect(hwnd) if hwnd else None
                         if rect is not None:
                             left, top, right, bottom = rect
-                            screen_cursor = self.mapToGlobal(QPoint(round(cursor.x()), round(cursor.y())))
+                            screen_cursor = self._virtual_point_to_global(cursor)
                             edge_band = 58.0
                             edge_rate = 0.0
                             if left <= screen_cursor.x() <= right:
