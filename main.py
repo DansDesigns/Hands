@@ -116,6 +116,9 @@ TLI_CALIBRATION_FILE = ROOT / "tli_calibration.json"
 HAND_CALIBRATION_FILE = ROOT / "hand_calibration.json"
 CUSTOM_GESTURES_FILE = ROOT / "custom_gestures.json"
 NOTIFICATION_POSITIONS = ("top-left", "top-center", "top-right", "bottom-left", "bottom-center", "bottom-right")
+# Hand render styles, in the order shown by the Settings -> Hands switch.
+HAND_RENDER_STYLES = ("skeleton", "flat", "3d")
+HAND_RENDER_STYLE_LABELS = {"skeleton": "SKELETON", "flat": "FLAT", "3d": "3D"}
 # Settings -> Notify rows: (ui preference key, label, default position).
 NOTIFICATION_SETTING_ROWS = (
     ("paused_notice_position", "GESTURE LEGEND LOCATION", "bottom-center"),
@@ -283,7 +286,8 @@ def save_gesture_settings(values: dict) -> None:
         "# skin_tone_darkness: 0 to 100 percent extra warm darkening of the skin-like hand mesh.",
         "# finger_thickness: rounded finger segment thickness multiplier, 0.8 to 10.0; default 4.24.",
         "# palm_width_scale: palm contour width multiplier, 0.65 to 1.80; default 1.26.",
-        "# hand_skin_effect: true uses the merged skin-like surface; false uses a line skeleton.",
+        "# hand_render_style: skeleton (lines), flat (painted 2D hand) or 3d (rigged 3D hand mesh).",
+        "# hand_skin_effect: kept for older versions; true unless hand_render_style is skeleton.",
         "# TLI calibration: Hand Settings -> Calibrate Left/Right TLI; the live hand and transformed TLI are redrawn above the target and hit-tested at the same point.",
         "# Each TLI calibration stores the pinch midpoint in normalized palm-local 3D coordinates in tli_calibration.json.",
         "# HAND ONBOARDING: on first run, extend an arm and touch below the camera, then capture a palm-facing pose and a two-hand contact pose.",
@@ -318,6 +322,7 @@ def save_gesture_settings(values: dict) -> None:
         f"finger_thickness={clamped('finger_thickness', 0.8, 10.0, 4.24):.2f}",
         f"palm_width_scale={clamped('palm_width_scale', 0.65, 1.8, 1.26):.2f}",
         f"hand_skin_effect={str(bool(values.get('hand_skin_effect', True))).lower()}",
+        f"hand_render_style={values.get('hand_render_style') if values.get('hand_render_style') in HAND_RENDER_STYLES else ('flat' if values.get('hand_skin_effect', True) else 'skeleton')}",
         f"skin_use_skeleton_color={str(bool(values.get('skin_use_skeleton_color', False))).lower()}",
         f"hand_transparency={clamped('hand_transparency', 10.0, 100.0, 75.0):.1f}",
         f"tli_glow_enabled={str(bool(values.get('tli_glow_enabled', False))).lower()}",
@@ -440,6 +445,8 @@ def load_gesture_settings() -> dict:
             values[key] = value.lower() in ("true", "1", "yes", "on")
         elif key == "hand_skin_effect":
             values[key] = value.lower() in ("true", "1", "yes", "on")
+        elif key == "hand_render_style" and value.lower() in HAND_RENDER_STYLES:
+            values[key] = value.lower()
         elif key == "cursor_lock_priority" and value.lower() in ("left", "right"):
             values[key] = value.lower()
         elif key in ("left_click_color", "right_click_color") and re.fullmatch(r"#[0-9a-fA-F]{6}", value):
@@ -1322,6 +1329,13 @@ class SpatialDesktop(QWidget):
         self.finger_thickness = settings.get("finger_thickness", 4.24)
         self.palm_width_scale = settings.get("palm_width_scale", 1.26)
         self.hand_skin_effect_enabled = bool(settings.get("hand_skin_effect", True))
+        # Skeleton, flat (painted 2D) or 3d (rigged mesh). Older settings files only
+        # have hand_skin_effect, which maps to flat/skeleton.
+        style = settings.get("hand_render_style")
+        self.hand_render_style = (style if style in HAND_RENDER_STYLES else
+                                  ("flat" if self.hand_skin_effect_enabled else "skeleton"))
+        self._hand_mesh_renderer = None
+        self._hand_mesh_notice_shown = False
         self.skin_use_skeleton_color = bool(settings.get("skin_use_skeleton_color", False))
         self.hand_transparency = float(settings.get("hand_transparency", 75.0))
         self.tli_glow_enabled = bool(settings.get("tli_glow_enabled", False))
@@ -1671,7 +1685,8 @@ class SpatialDesktop(QWidget):
             "skin_tone_darkness": self.skin_tone_darkness,
             "finger_thickness": self.finger_thickness,
             "palm_width_scale": self.palm_width_scale,
-            "hand_skin_effect": self.hand_skin_effect_enabled,
+            "hand_skin_effect": self.hand_render_style != "skeleton",
+            "hand_render_style": self.hand_render_style,
             "skin_use_skeleton_color": self.skin_use_skeleton_color,
             "hand_transparency": self.hand_transparency,
             "tli_glow_enabled": self.tli_glow_enabled,
@@ -1897,7 +1912,7 @@ class SpatialDesktop(QWidget):
             stack("scroll_toggle")
             stack("priority_toggle")
         elif page == "hands":
-            stack("skin_effect")
+            stack("render_style")
             stack("skin_tint")
             y += group
             stack("calibrate_left")
@@ -1979,6 +1994,16 @@ class SpatialDesktop(QWidget):
         top = layout["top"]
         return {name: QRectF(cx+x*scale, cy+(top+y)*scale, w*scale, h*scale)
                 for name, (x, y, w, h) in layout[kind].items()}
+
+    # Share of the Hands-page render switch taken by its "RENDER" caption.
+    RENDER_SWITCH_CAPTION = 0.30
+
+    def _render_style_segments(self, rect, scale):
+        """(style, rect) for each segment of the SKELETON | FLAT | 3D switch (draw + click)."""
+        area = rect.adjusted(rect.width()*self.RENDER_SWITCH_CAPTION, 3*scale, -3*scale, -3*scale)
+        width = area.width()/len(HAND_RENDER_STYLES)
+        return [(style, QRectF(area.left()+i*width, area.top(), width, area.height()))
+                for i, style in enumerate(HAND_RENDER_STYLES)]
 
     def _settings_text_rects(self, cx=None, cy=None, scale=None, page=None):
         return self._settings_control_rects(cx, cy, scale, page=page, kind="texts")
@@ -3204,10 +3229,21 @@ class SpatialDesktop(QWidget):
                 return
 
             if self.settings_page == "hands":
-                if pressed("skin_effect"):
-                    self.hand_skin_effect_enabled = not self.hand_skin_effect_enabled
-                    self.schedule_gesture_settings_save()
-                    self.status = "Hand rendering: skin effect" if self.hand_skin_effect_enabled else "Hand rendering: skeleton"
+                if pressed("render_style"):
+                    # Three-way switch: the third of the control that was pressed.
+                    style = next((name for name, seg in self._render_style_segments(controls["render_style"], scale)
+                                  if seg.contains(point)), None)
+                    if style is None:  # the "RENDER" caption: step to the next style
+                        index = HAND_RENDER_STYLES.index(self.hand_render_style)
+                        style = HAND_RENDER_STYLES[(index+1) % len(HAND_RENDER_STYLES)]
+                    if style != self.hand_render_style:
+                        self.hand_render_style = style
+                        self.hand_skin_effect_enabled = style != "skeleton"
+                        self._hand_mesh_notice_shown = False
+                        if self._hand_mesh_renderer is not None and self._hand_mesh_renderer.failed:
+                            self._hand_mesh_renderer = None  # retry 3D after a previous failure
+                        self.schedule_gesture_settings_save()
+                    self.status = "Hand rendering: " + HAND_RENDER_STYLE_LABELS[style].lower()
                     return
                 if pressed("skin_tint"):
                     self.skin_use_skeleton_color = not self.skin_use_skeleton_color
@@ -6057,7 +6093,8 @@ class SpatialDesktop(QWidget):
 
         # Skeleton mode is a genuine alternate rendering style, not a hide/show switch.
         # It reuses the identical transformed landmarks and camera-distance scaling.
-        if not self.hand_skin_effect_enabled:
+        style = getattr(self, "hand_render_style", "flat")
+        if style == "skeleton":
             skeleton_color = QColor(self.left_click_color if side == "left" else self.right_click_color)
             skeleton_width_scale = min(4.0, max(0.5, float(getattr(self, "skeleton_line_thickness", 1.5))))
             painter.save()
@@ -6077,10 +6114,58 @@ class SpatialDesktop(QWidget):
             painter.restore()
             return
 
+        base_skin = skin_color(225, 174, 143, 255)
+        if style == "3d" and self._paint_hand_mesh_3d(painter, points, joints, side, user_scale, base_skin):
+            painter.restore()
+            return
         palm_width_scale = min(1.8, max(0.65, float(getattr(self, "palm_width_scale", 1.0))))
         self._paint_hand_skin_3d(painter, points, joints, width_scale, finger_thickness,
-                                 palm_width_scale, skin_color(225, 174, 143, 255))
+                                 palm_width_scale, base_skin)
         painter.restore()
+
+    def _paint_hand_mesh_3d(self, painter, points, joints, side, user_scale, base):
+        """Draw the rigged 3D hand mesh; False means fall back to the flat style."""
+        if self._hand_mesh_renderer is None:
+            try:
+                from hand_mesh_3d import HandMeshRenderer
+                self._hand_mesh_renderer = HandMeshRenderer()
+            except Exception as exc:
+                self._report_hand_mesh_problem(f"3D hands unavailable: {exc}")
+                return False
+        renderer = self._hand_mesh_renderer
+        if renderer.failed:
+            self._report_hand_mesh_problem(renderer.error)
+            return False
+        # Overlay pixels; depth uses the same pixels-per-unit as x (MediaPipe z ~ x scale).
+        px_per_x = max(1.0, self.width()-1)/0.60*user_scale
+        z0 = float(points[0][2]) if len(points[0]) > 2 else 0.0
+        target = np.array([[joints[i].x(), joints[i].y(),
+                            ((float(points[i][2]) if len(points[i]) > 2 else 0.0)-z0)*px_per_x]
+                           for i in range(21)], dtype=np.float64)
+        # The camera image is mirrored, so a physical right hand has left-hand geometry.
+        model_side = "right" if side == "left" else "left"
+        result = renderer.render(model_side, target, (base.red(), base.green(), base.blue()))
+        if result is None:
+            self._report_hand_mesh_problem(renderer.error or "3D hand rendering failed")
+            return False
+        data, w, h, left, top = result
+        image = QImage(data, w, h, w*4, QImage.Format_RGBA8888_Premultiplied).copy()
+        # Soft contact shadow from the hand's own silhouette, matching the flat style.
+        shadow = QImage(image)
+        sp_ = QPainter(shadow)
+        sp_.setCompositionMode(QPainter.CompositionMode_SourceIn)
+        sp_.fillRect(shadow.rect(), QColor(0, 0, 0, 46))
+        sp_.end()
+        offset = 4.5*max(0.5, user_scale/0.6)
+        painter.drawImage(QPointF(left+offset*0.55, top+offset), shadow)
+        painter.drawImage(QPointF(left, top), image)
+        return True
+
+    def _report_hand_mesh_problem(self, message):
+        if not self._hand_mesh_notice_shown:
+            self._hand_mesh_notice_shown = True
+            print("Spatial Desktop:", message, "Showing the flat hand style instead.")
+            self.status = "3D hands unavailable — using flat style. " + str(message)[:120]
 
     # Joint radii (before finger-thickness and size scaling) from knuckle to tip.
     # Cartoon proportions: chunky fingers with little taper and rounded, full tips.
@@ -8766,13 +8851,27 @@ class SpatialDesktop(QWidget):
                                 label, base_size=label_size, min_size=6, inset=2)
 
                     elif self.settings_page == "hands":
-                        skin_effect = controls["skin_effect"]
-                        painter.setBrush(QBrush(QColor(55, 145, 82, 225) if self.hand_skin_effect_enabled
-                                                else QColor(75, 80, 89, 205)))
+                        # Three-way RENDER STYLE switch: SKELETON | FLAT | 3D.
+                        switch = controls["render_style"]
+                        painter.setBrush(QBrush(QColor(10, 37, 55, 225)))
                         painter.setPen(QPen(QColor(125, 235, 245, 210), 1.5*scale))
-                        painter.drawRoundedRect(skin_effect, 10*scale, 10*scale)
-                        painter.setPen(QColor(235, 255, 255))
-                        self._draw_fitted_button_label(painter, skin_effect, "RENDER STYLE  ·  "+("SKIN EFFECT" if self.hand_skin_effect_enabled else "SKELETON"), base_size=label_size, min_size=6, inset=12*scale)
+                        painter.drawRoundedRect(switch, 10*scale, 10*scale)
+                        caption_w = switch.width()*self.RENDER_SWITCH_CAPTION
+                        painter.setPen(QColor(200, 240, 248))
+                        self._draw_fitted_button_label(painter, QRectF(switch.left(), switch.top(), caption_w, switch.height()),
+                                                       "RENDER", base_size=label_size, min_size=6, inset=8*scale)
+                        for seg_index, (seg_style, seg) in enumerate(self._render_style_segments(switch, scale)):
+                            selected = seg_style == self.hand_render_style
+                            if selected:
+                                painter.setBrush(QBrush(QColor(55, 145, 82, 235)))
+                                painter.setPen(QPen(QColor(155, 245, 180, 230), 1.2*scale))
+                                painter.drawRoundedRect(seg.adjusted(1*scale, 0, -1*scale, 0), 8*scale, 8*scale)
+                            elif seg_index > 0 and HAND_RENDER_STYLES[seg_index-1] != self.hand_render_style:
+                                painter.setPen(QPen(QColor(125, 235, 245, 90), 1.0*scale))
+                                painter.drawLine(QPointF(seg.left(), seg.top()+6*scale), QPointF(seg.left(), seg.bottom()-6*scale))
+                            painter.setPen(QColor(245, 255, 250) if selected else QColor(175, 210, 220))
+                            self._draw_fitted_button_label(painter, seg, HAND_RENDER_STYLE_LABELS[seg_style],
+                                                           base_size=label_size, min_size=6, inset=4*scale)
 
                         tint_toggle = controls["skin_tint"]
                         painter.setBrush(QBrush(QColor(55, 145, 82, 225) if self.skin_use_skeleton_color else QColor(75, 80, 89, 205)))

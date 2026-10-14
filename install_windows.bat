@@ -54,6 +54,14 @@ if errorlevel 1 (
 if errorlevel 1 goto :error
 
 echo.
+echo [4b] Installing the optional 3D hand renderer (moderngl / OpenGL)...
+"%VPY%" -u -m pip install -r requirements-3d.txt
+if errorlevel 1 (
+  echo WARNING: 3D hand rendering could not be installed. The Skeleton and Flat hand styles still work.
+  echo Retry later with: .venv\Scripts\python.exe -m pip install -r requirements-3d.txt
+)
+
+echo.
 echo [5/8] Installing optional offline Kokoro TTS runtime...
 "%VPY%" -u -m pip install --verbose -r requirements-voice.txt
 if errorlevel 1 (

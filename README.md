@@ -9,6 +9,18 @@ The installed app version is recorded in the root `version.txt` file. Open **Set
 When publishing a release, update `version.txt` in the repository to the new dotted numeric version (for example `0.8.1`). Keep the version file at the repository root on the `main` branch so the in-app checker can find it.
 
 
+## Hand render styles: Skeleton, Flat and 3D
+
+Settings → Hands → **RENDER** is a three-way switch:
+
+- **Skeleton** draws the tracked joints as lines.
+- **Flat** is the painted hand: depth-ordered palm and tapered, shaded fingers that stay readable at any angle.
+- **3D** poses a rigged 3D hand mesh from the 21 MediaPipe landmarks and renders it with OpenGL (`moderngl`, installed by the optional `requirements-3d.txt` step). If OpenGL or `moderngl` is unavailable, 3D falls back to Flat and the reason is shown once in the status/console.
+
+The bundled 3D hands are `assets/hands/generic-hand-left.glb` and `generic-hand-right.glb` from the [WebXR Input Profiles](https://github.com/immersive-web/webxr-input-profiles) project, MIT licensed (see `assets/hands/LICENSE-webxr-input-profiles.md`). Because the camera image is mirrored, your physical right hand is drawn with the left-hand model and vice versa.
+
+**Using your own hand model:** save a rigged glTF/GLB hand as `models/hands/custom-right.glb` and/or `custom-left.glb` (`models/` is git-ignored, so licensed downloads stay out of the repository). If only one side is provided, it is mirrored for the other hand. Bone names from WebXR, Blender/Rigify (`f_index.01.R`) and Mixamo (`RightHandIndex1`) rigs are recognised automatically; for other rigs add `custom-right.joints.json` mapping each bone name to `wrist`, `<finger>-meta` or `<finger>-1`…`<finger>-4` (finger = thumb/index/middle/ring/pinky, 1 = knuckle bone, 4 = tip). FBX/OBJ/BLEND models need exporting to glTF from Blender first. Check each model's licence before sharing it: many marketplace "royalty free" licences allow use in a product but not redistributing the model file.
+
 ## v61 overlay and menu layout updates
 
 - On Windows, the active hand-visual overlay periodically reasserts topmost z-order without activating or stealing keyboard focus. This helps keep hands/TLI visible above ordinary apps, Task Manager, and windowed/borderless video players. Exclusive-fullscreen applications can still suppress ordinary desktop overlays.

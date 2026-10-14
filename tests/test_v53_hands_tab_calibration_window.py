@@ -73,8 +73,9 @@ class V53HandsTabCalibrationWindowTests(unittest.TestCase):
         self.assertIn('mean_relative_tli(samples)', self.main)
 
     def test_render_style_switches_between_connected_skin_and_skeleton(self):
-        self.assertIn('if not self.hand_skin_effect_enabled:', self.main)
-        self.assertIn('"RENDER STYLE  ·  "+("SKIN EFFECT" if self.hand_skin_effect_enabled else "SKELETON")', self.main)
+        # v65: three-way SKELETON | FLAT | 3D switch replaces the two-way toggle.
+        self.assertIn('if style == "skeleton":', self.main)
+        self.assertIn('HAND_RENDER_STYLES = ("skeleton", "flat", "3d")', self.main)
         self.assertIn('palm_width_scale-1.0', self.main)
 
 

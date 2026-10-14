@@ -47,6 +47,11 @@ if ! "$VPY" -c 'import pip; print("Using pip", pip.__version__)'; then
     "$VPY" -m ensurepip
 fi
 "$VPY" -u -m pip install --verbose -r "$APP_DIR/requirements.txt"
+echo '[4b] Installing the optional 3D hand renderer (moderngl / OpenGL)...'
+if ! "$VPY" -u -m pip install -r "$APP_DIR/requirements-3d.txt"; then
+    echo 'WARNING: 3D hand rendering could not be installed. The Skeleton and Flat hand styles still work.' >&2
+    echo "Retry later with: $VPY -m pip install -r $APP_DIR/requirements-3d.txt" >&2
+fi
 
 echo '[5/9] Installing optional offline Kokoro TTS runtime...'
 if "$VPY" -u -m pip install --verbose -r "$APP_DIR/requirements-voice.txt"; then
