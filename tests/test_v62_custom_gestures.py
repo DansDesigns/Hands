@@ -140,7 +140,7 @@ class ThumbAndFistTests(unittest.TestCase):
 
     def test_fist_detector_requires_tucked_thumb(self):
         main = (Path(__file__).resolve().parents[1] / "main.py").read_text(encoding="utf-8")
-        self.assertIn("return fingers_closed and not thumb_sticking_out(landmarks)", main)
+        self.assertIn("return fingers_closed and not thumb_sticking_out(landmarks, threshold=-0.55)", main)
 
     def test_thumbs_up_and_down_are_labelled_and_distinguished(self):
         up = hand_features(make_thumb_pose("up"))

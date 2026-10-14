@@ -27,6 +27,22 @@ except Exception:
     vosk = None
 
 
+def _complete_tts_utterance(text: str) -> str:
+    """Give one-shot speech a clear sentence ending without duplicating punctuation."""
+    text = " ".join(str(text).split())
+    if not text:
+        return text
+    # Keep closing quotes/brackets after the terminal punctuation, e.g. He said “hello.”
+    closers = '"\'’”)]}»』】）'
+    split = len(text)
+    while split > 0 and text[split - 1] in closers:
+        split -= 1
+    body, ending = text[:split], text[split:]
+    if body and body[-1] not in ".!?…":
+        body += "."
+    return body + ending
+
+
 DEFAULT_STREAMTTS_VOICE = "vits-piper-en_GB-alan-medium"
 STREAMTTS_VOICES = (
     "vits-piper-en_GB-alan-medium",
@@ -488,7 +504,7 @@ class KokoroTTS:
                 engine = self._ensure_engine(voice)
                 self.activity_callback(True)
                 self._set_status("Speaking with StreamTTS…")
-                engine.push_text(text)
+                engine.push_text(_complete_tts_utterance(text))
                 engine.flush()
                 engine.wait_until_idle(timeout=120)
                 self._set_status("StreamTTS ready")

@@ -14,6 +14,9 @@ import time
 from typing import Deque, List, Optional
 
 
+_UTTERANCE_END = object()
+
+
 def _is_space(ch: str) -> bool:
     return ch.isspace()
 
@@ -154,7 +157,7 @@ class StreamingTTS:
         self._pitch_semitones = float(pitch_semitones)
         self._segmenter = TextSegmenter(mode, max_words_per_chunk)
         self._segmenter_lock = threading.Lock()
-        self._text_queue: queue.Queue[Optional[str]] = queue.Queue()
+        self._text_queue: queue.Queue[object] = queue.Queue()
         self._worker_busy = threading.Event()
         self._errors: Deque[str] = deque(maxlen=16)
         self._error_lock = threading.Lock()
@@ -249,6 +252,9 @@ class StreamingTTS:
             chunks = self._segmenter.flush()
         for chunk in chunks:
             self._text_queue.put(chunk)
+        # The marker is ordered after every chunk from this utterance. It lets the
+        # synthesis worker add a short quiet tail only after the final audio chunk.
+        self._text_queue.put(_UTTERANCE_END)
 
     def _synthesis_loop(self) -> None:
         while True:
@@ -256,6 +262,14 @@ class StreamingTTS:
             if text is None:
                 self._text_queue.task_done()
                 break
+            if text is _UTTERANCE_END:
+                try:
+                    self._enqueue_utterance_tail()
+                except Exception as exc:
+                    self._report_error(f"could not append utterance tail: {exc}")
+                finally:
+                    self._text_queue.task_done()
+                continue
             self._worker_busy.set()
             try:
                 with self._settings_lock:
@@ -271,9 +285,20 @@ class StreamingTTS:
                         raise RuntimeError(
                             "Pitch shifting needs librosa. Run setup_windows.bat or install librosa in this Python environment."
                         ) from exc
-                    samples = librosa.effects.pitch_shift(
-                        y=samples, sr=sample_rate, n_steps=pitch_semitones
+                    original_size = int(samples.size)
+                    edge_pad = min(max(1, int(round(sample_rate * 0.08))), max(1, original_size - 1))
+                    pad_mode = "reflect" if original_size > 1 else "edge"
+                    padded = self._np.pad(samples, (edge_pad, edge_pad), mode=pad_mode)
+                    shifted = librosa.effects.pitch_shift(
+                        y=padded, sr=sample_rate, n_steps=pitch_semitones
                     ).astype(self._np.float32, copy=False)
+                    # Keep the original duration while moving phase-vocoder edge effects
+                    # away from the actual first and last speech samples.
+                    samples = shifted[edge_pad:edge_pad + original_size]
+                    if samples.size < original_size:
+                        samples = self._np.pad(samples, (0, original_size - samples.size))
+                    elif samples.size > original_size:
+                        samples = samples[:original_size]
                 if samples.size:
                     self._enqueue_audio(samples, sample_rate)
             except Exception as exc:
@@ -281,6 +306,16 @@ class StreamingTTS:
             finally:
                 self._worker_busy.clear()
                 self._text_queue.task_done()
+
+    def _enqueue_utterance_tail(self) -> None:
+        """Queue a small silent tail after the current utterance, never between chunks."""
+        with self._audio_lock:
+            sample_rate = self._sample_rate
+        if sample_rate is None:
+            return
+        tail_samples = max(1, int(round(sample_rate * 0.12)))
+        silence = self._np.zeros(tail_samples, dtype=self._np.float32)
+        self._enqueue_audio(silence, sample_rate)
 
     def _enqueue_audio(self, samples, sample_rate: int) -> None:
         need_start = False
@@ -344,6 +379,16 @@ class StreamingTTS:
             with self._audio_lock:
                 remaining = self._audio_queued_samples
             if remaining <= 0 and not self._worker_busy.is_set() and self._text_queue.unfinished_tasks == 0:
+                with self._audio_lock:
+                    stream = self._output_stream
+                try:
+                    latency = getattr(stream, "latency", 0.0) if stream is not None else 0.0
+                    if isinstance(latency, (tuple, list)):
+                        latency = latency[-1] if latency else 0.0
+                    drain_seconds = max(0.0, float(latency)) + 0.025
+                except (TypeError, ValueError):
+                    drain_seconds = 0.05
+                time.sleep(min(0.5, drain_seconds))
                 return
             if time.monotonic() >= deadline:
                 raise TimeoutError("Timed out waiting for synthesized audio to finish playing")
