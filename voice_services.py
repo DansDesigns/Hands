@@ -46,16 +46,26 @@ def load_tts_settings() -> dict:
         return defaults
     if isinstance(supplied, dict):
         defaults["enabled"] = bool(supplied.get("enabled", defaults["enabled"]))
-        voice = supplied.get("voice")
-        # Migrate the former Kokoro voice setting to the new British English default.
+        voice = supplied.get("voice", supplied.get("voice_id"))
+        # Accept every voice ID advertised by the bundled StreamTTS catalogue, not
+        # just the small Piper subset. This is important for voices selected in
+        # the external StreamTTS Config window.
+        catalog_ids = set()
+        try:
+            import sys
+            python_dir = str(STREAMTTS_DIR / "python")
+            if python_dir not in sys.path:
+                sys.path.insert(0, python_dir)
+            from voice_catalog import VOICE_CATALOG
+            catalog_ids = set(VOICE_CATALOG)
+        except Exception:
+            pass
         if isinstance(voice, str) and voice:
-            if voice in STREAMTTS_VOICES or voice.startswith("vits-piper-") or voice.startswith("system:"):
+            candidate = TTS_MODELS_DIR / voice
+            if (voice in catalog_ids or voice in STREAMTTS_VOICES or
+                    voice.startswith("vits-piper-") or voice.startswith("system:") or
+                    (candidate.is_dir() and (candidate / "tokens.txt").is_file() and list(candidate.glob("*.onnx")))):
                 defaults["voice"] = voice
-            else:
-                # Permit locally imported model folders created by StreamTTS Config.
-                candidate = TTS_MODELS_DIR / voice
-                if candidate.is_dir() and (candidate / "tokens.txt").is_file() and list(candidate.glob("*.onnx")):
-                    defaults["voice"] = voice
         try:
             speed = float(supplied.get("speed", defaults["speed"]))
             if speed == speed and 0.5 <= speed <= 2.0:
@@ -249,6 +259,10 @@ class KokoroTTS:
         self.activity_callback = activity_callback or (lambda _active: None)
         self.settings = load_tts_settings()
         self.enabled = bool(self.settings["enabled"])
+        try:
+            self._settings_mtime_ns = TTS_SETTINGS.stat().st_mtime_ns
+        except OSError:
+            self._settings_mtime_ns = 0
         self.status = "StreamTTS starting"
         self._lock = threading.RLock()
         self._engine = None
@@ -434,6 +448,29 @@ class KokoroTTS:
                 return False
         return True
 
+    def _reload_external_settings(self):
+        """Apply changes saved by the standalone StreamTTS Config GUI live."""
+        try:
+            mtime = TTS_SETTINGS.stat().st_mtime_ns
+        except OSError:
+            return
+        if mtime == self._settings_mtime_ns:
+            return
+        # Record the observed version before applying, so a bad file does not
+        # cause a tight reload loop. load_tts_settings safely falls back on errors.
+        self._settings_mtime_ns = mtime
+        supplied = load_tts_settings()
+        self.update_settings(
+            enabled=supplied.get("enabled"),
+            voice=supplied.get("voice"),
+            speed=supplied.get("speed"),
+            pitch=supplied.get("pitch"),
+            mode=supplied.get("mode"),
+            language=supplied.get("language"),
+            persist=False,
+        )
+        self._set_status("StreamTTS settings updated from StreamTTS Config")
+
     def _run(self):
         while not self._stop.is_set():
             try:
@@ -444,6 +481,7 @@ class KokoroTTS:
                 self._pending.task_done()
                 break
             try:
+                self._reload_external_settings()
                 if not self.enabled:
                     continue
                 voice = self.settings["voice"]

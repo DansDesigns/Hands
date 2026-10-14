@@ -4,3 +4,4 @@ sherpa-onnx-bin
 numpy
 sounddevice
 pyttsx3
+librosa

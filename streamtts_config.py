@@ -78,7 +78,10 @@ def read_settings():
     if data["mode"] not in ("immediate", "balanced", "natural"):
         data["mode"] = "balanced"
     voice = str(data.get("voice", DEFAULTS["voice"]))
-    if not (voice.startswith("vits-piper-") or voice.startswith(SYSTEM_PREFIX) or find_model_dir(voice)):
+    # Preserve any voice ID shipped in the original StreamTTS catalogue, even
+    # when its model has not been downloaded yet.
+    if not (voice in VOICE_CATALOG or voice.startswith("vits-piper-") or
+            voice.startswith(SYSTEM_PREFIX) or find_model_dir(voice)):
         data["voice"] = DEFAULTS["voice"]
     return data
 
@@ -335,7 +338,7 @@ class StreamTTSConfig(tk.Tk):
             messagebox.showerror("Save settings", str(exc), parent=self)
             return
         self.settings = settings
-        self.status_var.set(f"Saved {SETTINGS.name}. Restart Spatial Desktop to apply voice, pitch and streaming-mode changes.")
+        self.status_var.set(f"Saved {SETTINGS.name}. Spatial Desktop will apply these settings before its next spoken response. If speech is already playing, the current utterance finishes with the previous settings.")
 
     def test_voice(self):
         voice_id = self._selected_id()
@@ -364,7 +367,10 @@ class StreamTTSConfig(tk.Tk):
                     engine.close()
                 self.after(0, lambda: self.status_var.set("Voice test completed."))
             except Exception as exc:
-                self.after(0, lambda msg=str(exc): self.status_var.set(f"Voice test failed: {msg}"))
+                msg = str(exc)
+                if "needs librosa" in msg.lower() or "no module named 'librosa'" in msg.lower():
+                    msg += " Install it with: python -m pip install librosa"
+                self.after(0, lambda msg=msg: self.status_var.set(f"Voice test failed: {msg}"))
         self.status_var.set("Testing voice…")
         threading.Thread(target=worker, daemon=True).start()
 

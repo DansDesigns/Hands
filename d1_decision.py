@@ -405,8 +405,34 @@ def status() -> dict[str, Any]:
                 "server": str(server_path())}
 
 
+def _wait_until_ready(timeout: float = 30.0) -> bool:
+    """Start D1 if needed and wait briefly for its HTTP API to become ready.
+
+    Engine-tab status can show that the process is alive while the model/server is
+    still warming up. Voice requests should wait for readiness rather than fail on
+    the first start_loading() call.
+    """
+    deadline = time.monotonic() + max(0.0, timeout)
+    start_loading()
+    while time.monotonic() < deadline:
+        state = status()
+        if state.get("ready") and _server_ready():
+            return True
+        if state.get("error") and not state.get("loading") and not state.get("downloading"):
+            return False
+        # Recheck/restart if the server wasn't ready yet; this is a no-op while
+        # the background startup worker is already running.
+        start_loading()
+        time.sleep(0.2)
+    return _server_ready()
+
+
 def _decide(state: str, questions: dict) -> dict | None:
-    if not start_loading():
+    global _error
+    if not _wait_until_ready(timeout=30.0):
+        with _lock:
+            if not _error:
+                _error = "D1 is not ready to accept voice requests. Check Engine status and logs/llama-server.log."
         return None
     try:
         payload = json.dumps({"state": state, "questions": questions}).encode("utf-8")
@@ -417,7 +443,6 @@ def _decide(state: str, questions: dict) -> dict | None:
         answers = result.get("answers", {}) if isinstance(result, dict) else {}
         return answers if isinstance(answers, dict) else None
     except Exception as exc:
-        global _error
         with _lock:
             _error = f"Decision request failed: {type(exc).__name__}: {exc}"
         return None
@@ -464,6 +489,7 @@ def rerank_search_results(query: str, results: list) -> list | None:
 
 
 def answer_general_question(question: str, timeout: float = 20.0) -> str | None:
+    global _error
     """Generate a concise local answer through the running llama.cpp OpenAI-compatible API.
 
     This is deliberately separate from classify_voice_command(): command routing remains
@@ -472,7 +498,10 @@ def answer_general_question(question: str, timeout: float = 20.0) -> str | None:
     clean = " ".join((question or "").split())
     if len(clean) < 2:
         return None
-    if not start_loading():
+    if not _wait_until_ready(timeout=max(30.0, timeout)):
+        with _lock:
+            if not _error:
+                _error = "D1 is not ready to answer questions. Check Engine status and logs/llama-server.log."
         return None
     payload = {
         "model": "local-d1",
@@ -507,7 +536,6 @@ def answer_general_question(question: str, timeout: float = 20.0) -> str | None:
                 content = " ".join(content.strip().split())
                 return content[:1600] or None
     except Exception as exc:
-        global _error
         with _lock:
             _error = f"General answer request failed: {type(exc).__name__}: {exc}"
     return None
