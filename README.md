@@ -1,6 +1,6 @@
 # Spatial Desktop v0.8
 
-**Release version: 0.8.** Spatial Desktop provides camera-based hand tracking, gesture-controlled desktop interaction, per-hand TLI calibration, local Vosk speech recognition, optional offline Kokoro speech output, local file search, face welcome, and an optional local d1 decision runtime. The sections below document the interaction and calibration milestones carried forward into this release; the root `version.txt` is the single version source used by the Settings → Update checker.
+**Release version: 0.8.** Spatial Desktop provides camera-based hand tracking, gesture-controlled desktop interaction, per-hand TLI calibration, local Vosk speech recognition, optional offline StreamTTS speech output, local file search, face welcome, and an optional local d1 decision runtime. The sections below document the interaction and calibration milestones carried forward into this release; the root `version.txt` is the single version source used by the Settings → Update checker.
 
 ## Version checks and updates
 
@@ -19,8 +19,17 @@ Settings → Hands → **RENDER** is a three-way switch:
 
 The bundled 3D hands are `assets/hands/generic-hand-left.glb` and `generic-hand-right.glb` from the [WebXR Input Profiles](https://github.com/immersive-web/webxr-input-profiles) project, MIT licensed (see `assets/hands/LICENSE-webxr-input-profiles.md`). Hands are shown from your own viewpoint, not the camera's: with your palms toward the camera you see the backs of the virtual hands, just as you see your real ones.
 
+**Touching hands are drawn touching.** Each hand is tracked on its own, and the drawn fingers are never exactly as thick as yours. So when your thumbs or fingertips touch, the drawn ones can stop a few pixels apart.
+- When a fingertip of one hand comes within about 0.15 palm lengths (surface to surface) of a fingertip of the other, the ends of those two fingers are pulled together until they meet.
+- The pull fades out smoothly by 0.35 palm lengths, so hands further apart aren't affected.
+- This applies to the flat and 3D styles at any hand scale. Like tucking, it only changes the drawing: the TLI and gestures are untouched.
+
 **Hidden fingertips are drawn tucked in.** The tracker always reports every fingertip, even ones the camera can't see; for those it guesses, often a half-open finger. A fingertip or thumb tip counts as hidden when it's farther from the camera than the palm or another finger in front of it.
 - With the flat and 3D styles, hidden digits are drawn folded into a fist, and a hidden thumb rests over the curled fingers. This is the common case of a fist or pointing hand seen from the back. A fingertip outside the camera view is cut off rather than tucked, so it keeps its tracked position. Touching fingertips (a pinch) are never tucked.
+- With the palm turned away from the camera, any finger that's folded is treated as hidden behind the hand. Once one finger is hidden, the other folded fingers are tucked with it, so a fist is drawn as a fist instead of each finger following the tracker's guess.
+- The thumb only counts as folded when its tip lies across the palm, over the fingers, not just near it. A thumb out to the side after a pinch is never tucked.
+- Which side of the palm the fingers fold to comes from the hand's own handedness, not from the guessed tips, so tucked fingers can't flip to the back of the hand. As a safety net, if two or more clearly folded fingers all bend the other way (a hand whose left/right label is briefly wrong), the fingers win.
+- A tucked digit stays tucked until it's clearly out again: it has to be seen out for 4 camera frames in a row (about 130 ms), and it gets a looser reach limit while tucked. Without this, the tracker's wandering guesses made the drawn fingers flap.
 - Digits fade in and out of the tucked pose over about 80 ms.
 - This only changes the drawing. Gestures, the TLI and the cursor still use the tracked landmarks, and the skeleton style still shows the raw tracking.
 
@@ -76,6 +85,9 @@ Calibration stores the thumb/index midpoint relative to the wrist-to-middle-MCP 
 
 - **Quick fist/grip → open:** left-click at the TLI location captured when the fist began. In Right-click Mode, this becomes a right-click.
 - **Quick thumb/index pinch → release:** left-click at the TLI location captured when the pinch began.
+  - A pinch that releases into folded fingers is not a click. Closing your hand into a thumbs up, thumbs down or fist sweeps the index finger past the thumb, which briefly reads as a pinch.
+  - When the released hand is neither clearly open nor closed, the click waits up to 0.3 s to see which way it goes. A release into an open hand still clicks straight away.
+  - A pinch must also last 0.15 s before moving it can start a drag, so that brief pinch can't press the mouse button either.
 - **Timed thumb/index pinch:** after a 0.8-second confirmation delay, the ring fills for `menu_pinch_hold_seconds` (0.5–5.0 seconds; default 0.6). This opens the Pinch Menu in normal mode, or exits Right-click/Scroll Window mode. If the Pinch Menu is already open and selection-ready, a fresh pinch/grip outside the popup closes it.
 - **Right fist scrolling:** a RIGHT-only fist begins smooth vertical scrolling when deliberate movement is detected over page content. No fist countdown or hold timer is needed; the existing smoothing and spike clamp keep movement gentle. The LEFT fist remains the modifier, and the separate two-fist window drag is unchanged.
 - **Left-fist modifier:** hold the LEFT hand in a fist. A quick RIGHT-hand pinch and release sends a right-click at the pinch start point. A held RIGHT-hand grip starts dragging the native window in OS mode or the virtual canvas/application surface in 3D mode; open the right hand to release. Modifier gestures do not accumulate the Pinch Menu timer.
@@ -120,10 +132,10 @@ A project licence has not yet been selected. Check the repository for the licenc
 ## Offline voice and fast local search (v29)
 
 - **Vosk STT retained:** audio runs in short bounded blocks. Partial transcripts feed the search box word-by-word as they become available; final recognition still handles voice commands.
-- **Ulauncher-style local search:** say `search bar` or `search files` while voice input is enabled, press `Ctrl+Space`, or click the Search tile. Results update as you type. Press **Dictate** or launch it by voice to stream Vosk partial transcripts into the query field. Use **Add Folder** to include locations; use Up/Down and Enter to select/open. The **Speak** button uses Kokoro to read the selected filename and excerpt.
+- **Ulauncher-style local search:** say `search bar` or `search files` while voice input is enabled, press `Ctrl+Space`, or click the Search tile. Results update as you type. Press **Dictate** or launch it by voice to stream Vosk partial transcripts into the query field. Use **Add Folder** to include locations; use Up/Down and Enter to select/open. The **Speak** button uses StreamTTS to read the selected filename and excerpt.
 - **No model needed for search:** Python plus SQLite FTS5 indexes file names, paths and bounded text excerpts. Ranking combines BM25, file-name/path weighting, exact phrase boosts, fuzzy filename matching and a small transparent synonym table. It runs locally and does not download embeddings or use cloud services. The initial index is built in a background thread and later updates changed files incrementally.
 - **Indexed file types:** file names for all types; contents for common text/source files, PDF and DOCX. The installer includes the small PDF/Word parsing dependencies. Common personal folders are indexed by default; use Add Folder to choose others. The index is stored under `~/.spatial_desktop`.
-- **Optional local TTS (Kokoro):** the Windows/Linux installer installs `requirements-voice.txt` and attempts to download Kokoro ONNX voice files via `install_voice_models.py`. If network/download fails, the installer warns and the core app/search still works. British voice `bf_emma` is the default; see `VOICE_SETUP.md`.
+- **Optional local TTS (StreamTTS):** the Windows/Linux installer installs `requirements-voice.txt` and attempts to download StreamTTS ONNX voice files via `install_voice_models.py`. If network/download fails, the installer warns and the core app/search still works. British voice `vits-piper-en_GB-alan-medium` is the default; see `VOICE_SETUP.md`.
 - **Why no EmbeddingGemma/OpenJev yet:** true embeddings can match descriptions with little word overlap, but require a large model/runtime. OpenJev is a local decision-model wrapper rather than a file retrieval index, and the JEV Search project's optional reranking uses a remote API. For this phase we prefer responsive, transparent, local ranking. If testing shows synonym/BM25 search is insufficient, a small embedding model can be evaluated later.
 
 ## Start and shortcuts
@@ -139,14 +151,14 @@ A project licence has not yet been selected. Check the repository for the licenc
 - **Search window close safety:** the search launcher is a child dialog and closing its title-bar X or its own × button only closes that launcher. It must not exit Spatial Desktop. The application explicitly disables Qt's quit-on-last-window-closed behaviour for the launcher and quits only when the main overlay itself closes.
 - **Compact launcher:** search opens as a short bar with a dropdown arrow. The arrow reveals results and utility actions; typing or live Vosk dictation expands results automatically unless the user deliberately collapses the details.
 - **Voice commands:** `close window` requests WM_CLOSE for the last focused external Windows window. When Search is open, it targets the external window that was active before Search took focus. `open user folder` opens the user's home directory in Explorer/Finder/the default file manager. The commands are handled before search dictation consumes recognised text.
-- **Startup speech:** Kokoro speaks a time-of-day greeting after launch (morning/afternoon/evening/night), using the enrolled display name if available and the operating-system username otherwise. The greeting is skipped if local TTS is not ready.
+- **Startup speech:** StreamTTS speaks a time-of-day greeting after launch (morning/afternoon/evening/night), using the enrolled display name if available and the operating-system username otherwise. The greeting is skipped if local TTS is not ready.
 
 ## Optional local face welcome
 
 - Open Settings and select **ENROL FACE FOR WELCOME-BACK**. Enrollment requires an explicit confirmation and a display name. Recognition stays disabled until the user enrolls.
 - OpenCV Zoo dynamic-input YuNet/SFace models are downloaded by the installer when available or automatically on first enrolment into a per-user cache. They run locally; face recognition is not an authentication or security feature.
 - On enrollment, the service samples several face embeddings from the existing camera stream. It stores only a numeric embedding and display name in `~/.spatial_desktop/face_profile.json`, not raw images or video. The profile can be re-enrolled or deleted from the same Settings button.
-- Once enabled, face checks run at low frequency to reduce CPU use. If the enrolled person reappears after more than 30 minutes without a successful match, Kokoro says `Welcome back, <name>`. Face embeddings are biometric information: enrollment is opt-in, local, and removable.
+- Once enabled, face checks run at low frequency to reduce CPU use. If the enrolled person reappears after more than 30 minutes without a successful match, StreamTTS says `Welcome back, <name>`. Face embeddings are biometric information: enrollment is opt-in, local, and removable.
 - Face Welcome downloads its local models automatically the first time you enrol (internet is needed only for this one-time setup). Downloads run in a background worker and do not block or close Spatial Desktop. If setup fails due to connectivity, it retries automatically while enrollment is pending; the optional `install_face_models.py` script is available only as a manual retry. Without the models, all other features continue working.
 
 ## Validation note
@@ -234,7 +246,7 @@ Text selection uses the app's normal mouse-drag selection, so the source applica
 
 - **Settings sub-pages:** Interaction, Notifications, and Voice keep the glass settings panel compact and make controls easier to find.
 - **Notification placement:** the tracking-paused banner and Vosk heard/transcript bar can each cycle independently through top-left, top-centre, top-right, bottom-left, bottom-centre and bottom-right. Positions are saved in `ui_settings.json`.
-- **Voice settings:** cycle through the installed Kokoro voice IDs, enable/disable local TTS, set speech speed from `0.7x` to `1.5x`, test the voice, and manage optional face welcome from the Voice page. The first engine load starts in a background thread at application startup (or when TTS is enabled) to reduce first-speech delay.
+- **Voice settings:** cycle through the installed StreamTTS voice IDs, enable/disable local TTS, set speech speed from `0.7x` to `1.5x`, test the voice, and manage optional face welcome from the Voice page. The first engine load starts in a background thread at application startup (or when TTS is enabled) to reduce first-speech delay.
 - **Voice navigation:** `show menu` toggles the glass menu; `show context` toggles the Pinch Menu at the current TLI/cursor position. Both are handled before search dictation.
 - **Scroll direction:** the Interaction page includes a `SCROLL · NORMAL/INVERTED` toggle. Its state persists in `gestures.txt` and applies to Windows targeted scrolling and the PyAutoGUI fallback.
 - **Move-mode feedback:** after fist-shake recognition has armed a window drag, expanding cyan waves and sparkles animate from the hand/TLI in addition to the target window highlight. The effect is absent during the shake itself.

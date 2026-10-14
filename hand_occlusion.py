@@ -39,7 +39,21 @@ DEPTH_MARGIN = 0.06           # must be this much behind the covering part
 # palm: in a side-on open hand the straight fingers overlap each other in the image,
 # but they are not tucked.
 FOLDED_FINGER_REACH = 1.25    # fingertip within this of the wrist
-FOLDED_THUMB_REACH = 0.95     # thumb tip within this of the middle knuckle
+# A folded thumb lies across the palm: its tip is near the middle knuckle AND over the
+# fingers rather than out past the index side (across = 0 at the index knuckle, 1 at
+# the pinky knuckle). Distance alone is not enough: a relaxed or pinching thumb tip is
+# also within a palm length of the middle knuckle.
+FOLDED_THUMB_REACH = 0.80     # thumb tip within this of the middle knuckle
+FOLDED_THUMB_ACROSS = 0.0
+# Once a digit is drawn tucked it stays tucked until it is clearly out again: looser
+# reach limits, and several frames in a row of it showing (hysteresis). The tracker's
+# guesses for fingers it can't see wander, and without this the drawn fingers flap.
+STAY_FOLDED_FINGER_REACH = 1.45
+STAY_FOLDED_THUMB_REACH = 0.95
+STAY_FOLDED_THUMB_ACROSS = -0.15
+RELEASE_FRAMES = 4            # camera frames (~130 ms) a tucked digit must be seen out
+# The palm faces away from the camera when its palm-side normal points this far away.
+PALM_AWAY_Z = 0.35
 # Two fingertips this close are touching (a pinch), not tucked.
 TOUCHING_TIPS = 0.35
 # Nominal phalanx lengths (proximal, middle, distal) used to sanity-limit tracked ones.
@@ -142,8 +156,56 @@ def _dist3(a, b):
     return math.sqrt((a[0]-b[0])**2 + (a[1]-b[1])**2 + (a[2]-b[2])**2)
 
 
-def hidden_digits(points):
-    """{digit: True/False}: which fingertips/thumb tip the camera can't see."""
+# Strong evidence from the tracked fingers overrides the handedness rule (a hand whose
+# left/right label the tracker got wrong for a moment): the mean fold of at least two
+# folded fingers, in palm lengths, pointing the other way.
+LEAN_OVERRIDE = 0.25
+
+
+def palm_side_normal(p, side=None):
+    """Unit vector out of the palm (the side fingers fold to), or None.
+
+    The landmarks of a left and a right hand are mirror images, so for a known hand
+    the palm side follows from the knuckle order alone, not from where the tracker
+    guesses hidden fingertips are. With up = wrist->middle knuckle and across =
+    pinky->index knuckle, the palm is on the +(up x across) side of a physical right
+    hand and the -(up x across) side of a left one. (Checked with MediaPipe's Tasks
+    hand landmarker, which the app uses, on a mirrored frame; the app's left/right are
+    the opposite of MediaPipe's label.)
+    """
+    arr = np.asarray(p, dtype=np.float64)
+    up = _normalize(arr[9]-arr[0])
+    across = arr[5]-arr[17]
+    across = _normalize(across - up*float(across @ up))
+    normal = _normalize(np.cross(up, across))
+    if float(np.linalg.norm(normal)) < 0.5 or side not in ("left", "right"):
+        return None
+    palm_side = normal if side == "right" else -normal
+    # Safety net: clearly folded fingers already show which way they bend.
+    palm_len = float(np.linalg.norm(arr[9]-arr[0]))
+    leans = [float((arr[DIGITS[f][-1]]-arr[DIGITS[f][0]]) @ palm_side)/palm_len
+             for f in FINGERS if np.linalg.norm(arr[DIGITS[f][-1]]-arr[0]) < FOLDED_FINGER_REACH*palm_len]
+    if len(leans) >= 2 and sum(leans)/len(leans) < -LEAN_OVERRIDE:
+        palm_side = -palm_side
+    return palm_side
+
+
+def thumb_across(p):
+    """Thumb tip across the palm: 0 at the index knuckle, 1 at the pinky knuckle,
+    negative out past the index side."""
+    ax = [p[17][k]-p[5][k] for k in range(3)]
+    width_sq = sum(c*c for c in ax)
+    if width_sq < 1e-12:
+        return -1.0
+    return sum((p[4][k]-p[5][k])*ax[k] for k in range(3))/width_sq
+
+
+def hidden_digits(points, side=None, tucked=frozenset()):
+    """{digit: True/False}: which fingertips/thumb tip the camera can't see.
+
+    side: "left"/"right" (the physical hand) enables the palm-facing-away rule.
+    tucked: digits currently drawn tucked, which use looser limits to stay tucked.
+    """
     arr = _to_space(points)
     result = {name: False for name in DIGITS}
     if arr is None:
@@ -167,18 +229,35 @@ def hidden_digits(points):
     def palm_depth(x, y):
         return p[0][2] - (normal[0]*(x-p[0][0]) + normal[1]*(y-p[0][1]))/normal[2]
 
+    # With the palm turned away from the camera, folded fingers are behind the hand.
+    palm_side = palm_side_normal(arr, side)
+    palm_away = palm_side is not None and float(palm_side[2]) > PALM_AWAY_Z
+
+    folded_by_name = {}
     for name, chain in DIGITS.items():
         tip = p[chain[-1]]
         raw = points[chain[-1]]
         if not (0.0 <= float(raw[0]) <= 1.0 and 0.0 <= float(raw[1]) <= 1.0):
             continue  # cut off by the frame edge, not tucked
-        hidden = (palm_faces_camera_enough and tip[2] > palm_depth(tip[0], tip[1]) + margin and
-                  _near_hull(hull, tip[0], tip[1], radius))
+        staying = name in tucked
+        if name == "thumb":
+            reach = STAY_FOLDED_THUMB_REACH if staying else FOLDED_THUMB_REACH
+            min_across = STAY_FOLDED_THUMB_ACROSS if staying else FOLDED_THUMB_ACROSS
+            folded = _dist3(tip, p[9]) < reach*palm_len and thumb_across(p) >= min_across
+        else:
+            reach = STAY_FOLDED_FINGER_REACH if staying else FOLDED_FINGER_REACH
+            folded = _dist3(tip, p[0]) < reach*palm_len
+        folded_by_name[name] = folded
+        # Thumb and a fingertip touching is a pinch or an "OK" ring, not a tucked digit.
+        if name == "thumb":
+            touching_thumb = any(_dist3(tip, p[DIGITS[f][-1]]) < TOUCHING_TIPS*palm_len for f in FINGERS)
+        else:
+            touching_thumb = _dist3(tip, p[4]) < TOUCHING_TIPS*palm_len
+        hidden = folded and palm_away and not touching_thumb
         if not hidden:
-            if name == "thumb":
-                folded = _dist3(tip, p[9]) < FOLDED_THUMB_REACH*palm_len
-            else:
-                folded = _dist3(tip, p[0]) < FOLDED_FINGER_REACH*palm_len
+            hidden = (palm_faces_camera_enough and tip[2] > palm_depth(tip[0], tip[1]) + margin and
+                      _near_hull(hull, tip[0], tip[1], radius))
+        if not hidden:
             for other, other_chain in DIGITS.items():
                 if not folded:
                     break
@@ -197,10 +276,16 @@ def hidden_digits(points):
                 if hidden:
                     break
         result[name] = hidden
+    # A fist: once one finger is hidden, the other folded fingers are tucked with it,
+    # rather than each following the tracker's wandering guess on its own.
+    if any(result[f] for f in FINGERS):
+        for f in FINGERS:
+            if folded_by_name.get(f):
+                result[f] = True
     return result
 
 
-def tucked_landmarks(points, digits):
+def tucked_landmarks(points, digits, side=None):
     """The landmarks with each digit in `digits` folded into a fist position.
 
     The palm, wrist and thumb base keep their tracked positions.
@@ -216,14 +301,16 @@ def tucked_landmarks(points, digits):
     across = p[5]-p[17]
     across = _normalize(across - up*float(across @ up))
     normal = _normalize(np.cross(up, across))
-    # Which side of the palm the fingers fold to: the side the tracked (guessed) hidden
-    # tips are already on. Failing that, away from the camera, since a tip hidden by
-    # the palm is behind it.
-    lean = sum(float((p[DIGITS[d][-1]]-p[DIGITS[d][0]]) @ normal) for d in digits)
-    if abs(lean) > 0.05*palm_len:
-        palm_side = normal if lean > 0 else -normal
-    else:
-        palm_side = normal if normal[2] >= 0 else -normal
+    # Which side of the palm the fingers fold to. For a known hand this is fixed by its
+    # handedness; otherwise the side the tracked (guessed) hidden tips are on, or away
+    # from the camera, since a tip hidden by the palm is behind it.
+    palm_side = palm_side_normal(p, side)
+    if palm_side is None:
+        lean = sum(float((p[DIGITS[d][-1]]-p[DIGITS[d][0]]) @ normal) for d in digits)
+        if abs(lean) > 0.05*palm_len:
+            palm_side = normal if lean > 0 else -normal
+        else:
+            palm_side = normal if normal[2] >= 0 else -normal
 
     for name in FINGERS:
         if name not in digits:
@@ -259,6 +346,9 @@ class TuckSmoother:
     def __init__(self):
         self.weights = {}
         self.last_seen = {}
+        self.tucked = {}     # side -> digits currently tucked (after hysteresis)
+        self.seen_out = {}   # side -> {digit: frames in a row it has been seen out}
+        self._last_input = {}  # side -> last camera frame's points (count each frame once)
         self._cache = {}     # side -> (input points, output) once the fade has settled
 
     def update(self, side, points, now):
@@ -273,12 +363,29 @@ class TuckSmoother:
         p = _to_space(points)
         if p is None:
             return points
-        hidden = hidden_digits(points)
+        if fresh:
+            self.tucked[side] = set()
+            self.seen_out[side] = {}
+        tucked = self.tucked.setdefault(side, set())
+        seen_out = self.seen_out.setdefault(side, {})
+        hand = side if side in ("left", "right") else None
+        new_frame = fresh or self._last_input.get(side) != points
+        self._last_input[side] = list(points)
+        hidden = hidden_digits(points, hand, frozenset(tucked)) if new_frame else None
+        for name in (DIGITS if new_frame else ()):
+            if hidden[name]:
+                tucked.add(name)
+                seen_out[name] = 0
+            elif name in tucked:
+                seen_out[name] = seen_out.get(name, 0) + 1
+                if seen_out[name] >= RELEASE_FRAMES:
+                    tucked.discard(name)
+                    seen_out[name] = 0
         self.last_seen[side] = now
         weights = self.weights.setdefault(side, {name: 0.0 for name in DIGITS})
         step = 1.0 if fresh else min(1.0, max(0.0, (now-last)*BLEND_RATE))
         for name in DIGITS:
-            target = 1.0 if hidden[name] else 0.0
+            target = 1.0 if name in tucked else 0.0
             weights[name] += (target-weights[name])*step
             if abs(weights[name]-target) < 0.01:
                 weights[name] = target
@@ -287,19 +394,22 @@ class TuckSmoother:
         if not active:
             result = points
         else:
-            tucked = _to_space(tucked_landmarks(points, set(active)))
+            folded = _to_space(tucked_landmarks(points, set(active), hand))
             blended = p.copy()
             for name in active:
                 w = weights[name]
                 joints = DIGITS[name][1:] if name != "thumb" else (3, 4)
                 for j in joints:
-                    blended[j] = p[j]*(1.0-w) + tucked[j]*w
+                    blended[j] = p[j]*(1.0-w) + folded[j]*w
             result = _from_space(blended, points)
-        if settled:
+        if settled and not any(seen_out.values()):
             self._cache[side] = (list(points), result)
         return result
 
     def forget(self, side):
         self.weights.pop(side, None)
         self.last_seen.pop(side, None)
+        self.tucked.pop(side, None)
+        self.seen_out.pop(side, None)
+        self._last_input.pop(side, None)
         self._cache.pop(side, None)

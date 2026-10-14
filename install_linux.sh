@@ -53,16 +53,16 @@ if ! "$VPY" -u -m pip install -r "$APP_DIR/requirements-3d.txt"; then
     echo "Retry later with: $VPY -m pip install -r $APP_DIR/requirements-3d.txt" >&2
 fi
 
-echo '[5/9] Installing optional offline Kokoro TTS runtime...'
+echo '[5/9] Installing optional offline StreamTTS runtime...'
 if "$VPY" -u -m pip install --verbose -r "$APP_DIR/requirements-voice.txt"; then
-    echo '[6/9] Downloading Kokoro voice files for offline speech...'
+    echo '[6/9] Downloading StreamTTS voice files for offline speech...'
     echo 'This download is only needed once and is skipped if files already exist.'
     if ! "$VPY" -u "$APP_DIR/install_voice_models.py"; then
-        echo 'WARNING: Kokoro model download failed. The app will still install.' >&2
+        echo 'WARNING: StreamTTS model download failed. The app will still install.' >&2
         echo "Retry later with: $VPY $APP_DIR/install_voice_models.py" >&2
     fi
 else
-    echo 'WARNING: Kokoro TTS dependencies could not be installed. Hand tracking and file search will still work.' >&2
+    echo 'WARNING: StreamTTS dependencies could not be installed. Hand tracking and file search will still work.' >&2
     echo "Retry later with: $VPY -m pip install -r $APP_DIR/requirements-voice.txt" >&2
 fi
 
@@ -104,6 +104,6 @@ echo 'INSTALLATION COMPLETE'
 echo "Launcher: $APPS_DIR/spatial-desktop-prototype.desktop"
 echo 'Find Spatial Desktop Prototype in your app launcher.'
 echo 'Local search uses SQLite and remains available without d1. d1 is an optional local decision model.'
-echo 'Kokoro runs offline when its runtime and voice files are installed.'
+echo 'StreamTTS runs offline when its runtime and voice files are installed.'
 echo 'Face Welcome is optional and local-only; enroll a user through Settings to enable it.'
 echo '============================================================'

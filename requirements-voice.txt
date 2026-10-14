@@ -1,3 +1,5 @@
-# Optional offline neural TTS. Install only when enabling Kokoro speech output.
-kokoro-onnx>=0.4.9
-soundfile>=0.12
+# Optional offline StreamTTS speech output (Piper/VITS via sherpa-onnx).
+sherpa-onnx
+sherpa-onnx-bin
+numpy
+sounddevice

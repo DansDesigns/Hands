@@ -62,18 +62,18 @@ if errorlevel 1 (
 )
 
 echo.
-echo [5/8] Installing optional offline Kokoro TTS runtime...
+echo [5/8] Installing optional offline StreamTTS runtime...
 "%VPY%" -u -m pip install --verbose -r requirements-voice.txt
 if errorlevel 1 (
-  echo WARNING: Kokoro TTS dependencies could not be installed. Hand tracking and file search will still work.
+  echo WARNING: StreamTTS dependencies could not be installed. Hand tracking and file search will still work.
   echo You can retry later with: .venv\Scripts\python.exe -m pip install -r requirements-voice.txt
 ) else (
   echo.
-  echo [6/9] Downloading Kokoro voice files for offline speech...
+  echo [6/9] Downloading StreamTTS voice files for offline speech...
   echo This download is only needed once and is skipped if files already exist.
   "%VPY%" -u install_voice_models.py
   if errorlevel 1 (
-    echo WARNING: Kokoro model download failed. The app will still install.
+    echo WARNING: StreamTTS model download failed. The app will still install.
     echo Retry later with: .venv\Scripts\python.exe install_voice_models.py
   )
 )
@@ -112,7 +112,7 @@ echo INSTALLATION COMPLETE
 echo Start Menu shortcut: Spatial Desktop Prototype
 echo Project folder: %CD%
 echo Local search uses SQLite and remains available without d1. d1 is an optional local decision model.
-echo Kokoro runs offline when its runtime and voice files are installed. d1 runs locally after its model is cached.
+echo StreamTTS runs offline when its runtime and voice files are installed. d1 runs locally after its model is cached.
 echo Face Welcome is optional and local-only; enroll a user through Settings to enable it.
 echo ============================================================
 pause

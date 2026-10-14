@@ -1,7 +1,6 @@
 """Optional offline speech services for Spatial Desktop.
 
-Speech recognition stays on Vosk. Kokoro TTS is optional and only loads its
-model when the local model files and `kokoro-onnx` package are available.
+Speech recognition stays on Vosk. StreamTTS provides optional offline, low-latency streaming speech output.
 """
 from __future__ import annotations
 
@@ -14,9 +13,8 @@ from typing import Callable, Optional
 
 ROOT = Path(__file__).resolve().parent
 VOSK_MODEL = ROOT / "models" / "vosk-model-small-en-us-0.15"
-TTS_DIR = ROOT / "models" / "tts"
-TTS_MODEL = TTS_DIR / "kokoro-v1.0.onnx"
-TTS_VOICES = TTS_DIR / "voices-v1.0.bin"
+STREAMTTS_DIR = ROOT / "streamtts"
+TTS_MODELS_DIR = ROOT / "models"
 TTS_SETTINGS = ROOT / "voice_settings.json"
 
 try:
@@ -27,38 +25,44 @@ try:
     import vosk
 except Exception:
     vosk = None
-try:
-    from kokoro_onnx import Kokoro
-except Exception:
-    Kokoro = None
+
+
+DEFAULT_STREAMTTS_VOICE = "vits-piper-en_GB-alan-medium"
+STREAMTTS_VOICES = (
+    "vits-piper-en_GB-alan-medium",
+    "vits-piper-en_GB-alba-medium",
+    "vits-piper-en_GB-cori-medium",
+    "vits-piper-en_GB-jenny_dioco-medium",
+    "vits-piper-en_US-amy-low",
+    "vits-piper-en_US-ryan-medium",
+)
 
 
 def load_tts_settings() -> dict:
-    defaults = {"enabled": True, "voice": "bf_emma", "speed": 1.0, "language": "en-gb"}
+    defaults = {"enabled": True, "voice": DEFAULT_STREAMTTS_VOICE, "speed": 1.0, "language": "en-gb"}
     try:
         supplied = json.loads(TTS_SETTINGS.read_text(encoding="utf-8"))
     except (OSError, ValueError, TypeError):
         return defaults
-    result = defaults.copy()
     if isinstance(supplied, dict):
-        result["enabled"] = bool(supplied.get("enabled", defaults["enabled"]))
-        voice = supplied.get("voice", defaults["voice"])
-        if isinstance(voice, str) and voice in {
-            "bf_alice", "bf_emma", "bf_isabella", "bf_lily",
-            "bm_daniel", "bm_fable", "bm_george", "bm_lewis",
-            "af_heart", "af_bella", "af_sarah", "am_adam", "am_michael",
-        }:
-            result["voice"] = voice
+        defaults["enabled"] = bool(supplied.get("enabled", defaults["enabled"]))
+        voice = supplied.get("voice")
+        # Migrate the former Kokoro voice setting to the new British English default.
+        if isinstance(voice, str):
+            if voice in STREAMTTS_VOICES:
+                defaults["voice"] = voice
+            elif voice.startswith("vits-piper-"):
+                defaults["voice"] = voice
         try:
             speed = float(supplied.get("speed", defaults["speed"]))
-            if speed == speed and 0.7 <= speed <= 1.5:
-                result["speed"] = speed
+            if speed == speed and 0.5 <= speed <= 2.0:
+                defaults["speed"] = speed
         except (TypeError, ValueError):
             pass
         lang = supplied.get("language", defaults["language"])
         if lang in ("en-gb", "en-us"):
-            result["language"] = lang
-    return result
+            defaults["language"] = lang
+    return defaults
 
 
 class Speech:
@@ -220,47 +224,45 @@ class Speech:
         self._clear_queue()
 
 
+
 class KokoroTTS:
-    """Optional, local Kokoro ONNX TTS with queued, non-blocking synthesis."""
-    def __init__(self, status_callback: Optional[Callable[[str], None]] = None,
-                 activity_callback: Optional[Callable[[bool], None]] = None):
+    """Compatibility facade for Spatial Desktop, backed by StreamTTS/Piper.
+
+    Existing Spatial Desktop call sites keep using speak(), set_voice(), and
+    update_settings(); speech is segmented and synthesized by StreamTTS.
+    Voice models are downloaded on demand and kept under models/.
+    """
+    def __init__(self, status_callback=None, activity_callback=None):
         self.status_callback = status_callback or (lambda _text: None)
         self.activity_callback = activity_callback or (lambda _active: None)
         self.settings = load_tts_settings()
         self.enabled = bool(self.settings["enabled"])
-        self._queue: queue.Queue = queue.Queue(maxsize=4)
-        self._stop = threading.Event()
-        self._thread: Optional[threading.Thread] = None
+        self.status = "StreamTTS starting"
+        self._lock = threading.RLock()
         self._engine = None
-        self._engine_lock = threading.Lock()
-        self._engine_ready = threading.Event()
-        self._error_reported = False
-        self._prewarm_thread = None
-        # Start loading the small local model immediately in the background. The first
-        # spoken reply no longer pays the full ONNX/model initialisation cost.
-        if self.ready:
-            self._prewarm_thread = threading.Thread(target=self._preload_engine, name="Kokoro-preload", daemon=True)
-            self._prewarm_thread.start()
+        self._thread = None
+        self._stop = threading.Event()
+        self._pending = queue.Queue(maxsize=20)
+        self._downloading = False
+        self._download_error = ""
+        self._worker = threading.Thread(target=self._run, name="StreamTTS-output", daemon=True)
+        self._worker.start()
 
     @property
-    def model_files_present(self) -> bool:
-        return TTS_MODEL.is_file() and TTS_VOICES.is_file()
+    def ready(self):
+        return self.enabled and not self._stop.is_set()
 
     @property
-    def ready(self) -> bool:
-        return bool(self.enabled and Kokoro is not None and sd is not None and self.model_files_present)
+    def model_files_present(self):
+        folder = TTS_MODELS_DIR / self.settings["voice"]
+        return folder.is_dir() and any(folder.glob("*.onnx")) and (folder / "tokens.txt").is_file()
 
-    @property
-    def status(self) -> str:
-        if not self.enabled:
-            return "TTS disabled in voice_settings.json"
-        if Kokoro is None:
-            return "TTS package missing; install requirements-voice.txt"
-        if sd is None:
-            return "TTS audio output unavailable; install sounddevice"
-        if not self.model_files_present:
-            return "TTS model missing; run install_voice_models.py"
-        return "Kokoro TTS ready (local/offline)"
+    def _set_status(self, message):
+        self.status = str(message)
+        try:
+            self.status_callback(self.status)
+        except Exception:
+            pass
 
     def save_settings(self):
         try:
@@ -269,138 +271,165 @@ class KokoroTTS:
             pass
 
     def update_settings(self, *, enabled=None, voice=None, speed=None, language=None, persist=True):
-        voices = {"bf_alice", "bf_emma", "bf_isabella", "bf_lily", "bm_daniel", "bm_fable", "bm_george", "bm_lewis", "af_heart", "af_bella", "af_sarah", "am_adam", "am_michael"}
-        if enabled is not None:
-            self.enabled = bool(enabled)
-            self.settings["enabled"] = self.enabled
-        if voice in voices:
-            self.settings["voice"] = voice
-        if speed is not None:
-            try:
-                value = float(speed)
-                if 0.7 <= value <= 1.5:
-                    self.settings["speed"] = round(value, 2)
-            except (TypeError, ValueError):
-                pass
-        if language in ("en-gb", "en-us"):
-            self.settings["language"] = language
+        changed_voice = False
+        with self._lock:
+            if enabled is not None:
+                self.enabled = bool(enabled)
+                self.settings["enabled"] = self.enabled
+            if isinstance(voice, str) and voice.startswith("vits-piper-") and voice != self.settings["voice"]:
+                self.settings["voice"] = voice
+                changed_voice = True
+            if speed is not None:
+                try:
+                    value = float(speed)
+                    if 0.5 <= value <= 2.0:
+                        self.settings["speed"] = round(value, 2)
+                        if self._engine is not None:
+                            self._engine.set_speed(value)
+                except (TypeError, ValueError, RuntimeError):
+                    pass
+            if language in ("en-gb", "en-us"):
+                self.settings["language"] = language
+            if changed_voice:
+                old, self._engine = self._engine, None
+                if old is not None:
+                    threading.Thread(target=self._close_engine, args=(old,), daemon=True).start()
         if persist:
             self.save_settings()
-        # If TTS was disabled at startup, enabling it in Settings should also warm
-        # the engine in the background rather than making the next phrase wait.
-        if self.enabled and self.ready and self._engine is None and (self._prewarm_thread is None or not self._prewarm_thread.is_alive()):
-            self._prewarm_thread = threading.Thread(target=self._preload_engine, name="Kokoro-preload", daemon=True)
-            self._prewarm_thread.start()
+        if self.enabled:
+            self._set_status("StreamTTS ready" if self.model_files_present else "StreamTTS downloading voice model…")
 
-    def set_enabled(self, enabled: bool):
+    def set_enabled(self, enabled):
         self.update_settings(enabled=enabled)
 
-    def set_voice(self, voice: str):
+    def set_voice(self, voice):
         self.update_settings(voice=voice)
 
-    def set_speed(self, speed: float):
+    def set_speed(self, speed):
         self.update_settings(speed=speed)
 
-    def _ensure_engine(self):
-        with self._engine_lock:
-            if self._engine is None:
-                from kokoro_onnx import Kokoro as KokoroEngine
-                self._engine = KokoroEngine(str(TTS_MODEL), str(TTS_VOICES))
-                self._engine_ready.set()
-            return self._engine
-
-    def _preload_engine(self):
+    def _close_engine(self, engine):
         try:
-            self._ensure_engine()
-        except Exception as exc:
-            self._engine_ready.set()
-            if not self._error_reported:
-                self._error_reported = True
-                self.status_callback(f"TTS preload failed: {exc}")
+            engine.close()
+        except Exception:
+            pass
 
-    def speak(self, text: str) -> bool:
-        text = " ".join(str(text).split())
-        if not text or not self.ready or self._stop.is_set():
+    def _download_model(self, voice):
+        import tarfile
+        import urllib.request
+        import shutil
+        import tempfile
+
+        TTS_MODELS_DIR.mkdir(parents=True, exist_ok=True)
+        archive = TTS_MODELS_DIR / (voice + ".tar.bz2")
+        temp = archive.with_suffix(archive.suffix + ".part")
+        url = f"https://github.com/k2-fsa/sherpa-onnx/releases/download/tts-models/{voice}.tar.bz2"
+        try:
+            self._set_status(f"Downloading StreamTTS voice: {voice}…")
+            with urllib.request.urlopen(url, timeout=180) as response, temp.open("wb") as dest:
+                shutil.copyfileobj(response, dest, length=1024 * 1024)
+            temp.replace(archive)
+            base = TTS_MODELS_DIR.resolve()
+            with tarfile.open(archive, "r:bz2") as tf:
+                for member in tf.getmembers():
+                    target = (TTS_MODELS_DIR / member.name).resolve()
+                    if target != base and base not in target.parents:
+                        raise RuntimeError("Unsafe path in voice model archive")
+                    if member.issym() or member.islnk():
+                        raise RuntimeError("Voice model archive contains a link")
+                tf.extractall(TTS_MODELS_DIR)
+        finally:
+            temp.unlink(missing_ok=True)
+        folder = TTS_MODELS_DIR / voice
+        if not (folder / "tokens.txt").is_file() or not list(folder.glob("*.onnx")):
+            # Archives occasionally wrap files in a differently named directory.
+            matches = list(TTS_MODELS_DIR.rglob("tokens.txt"))
+            folder = next((p.parent for p in matches if list(p.parent.glob("*.onnx")) and p.parent.name == voice), folder)
+        if not (folder / "tokens.txt").is_file() or not list(folder.glob("*.onnx")):
+            raise RuntimeError(f"Downloaded model {voice} is missing its ONNX model or tokens.txt")
+        return folder
+
+    def _ensure_engine(self, voice):
+        with self._lock:
+            if self._engine is not None and self._engine_voice == voice:
+                return self._engine
+        folder = TTS_MODELS_DIR / voice
+        if not (folder.is_dir() and list(folder.glob("*.onnx")) and (folder / "tokens.txt").is_file()):
+            folder = self._download_model(voice)
+        import sys
+        python_dir = str(STREAMTTS_DIR / "python")
+        if python_dir not in sys.path:
+            sys.path.insert(0, python_dir)
+        from streamtts_python import StreamingTTS
+        engine = StreamingTTS(
+            folder, mode="balanced", num_threads=2,
+            speed=float(self.settings["speed"]), pitch_semitones=0.0,
+        )
+        with self._lock:
+            old = self._engine
+            self._engine = engine
+            self._engine_voice = voice
+        if old is not None:
+            threading.Thread(target=self._close_engine, args=(old,), daemon=True).start()
+        self._set_status("StreamTTS ready")
+        return engine
+
+    def speak(self, text):
+        text = " ".join(str(text).split())[:1000]
+        if not text or not self.enabled or self._stop.is_set():
             return False
-        # Keep spoken replies short and responsive on lower-end CPUs.
-        text = text[:500]
         try:
-            self._queue.put_nowait(text)
+            self._pending.put_nowait(text)
         except queue.Full:
             try:
-                self._queue.get_nowait()
-                self._queue.put_nowait(text)
-            except (queue.Empty, queue.Full):
+                self._pending.get_nowait()
+                self._pending.put_nowait(text)
+            except queue.Full:
                 return False
-        if self._thread is None or not self._thread.is_alive():
-            self._thread = threading.Thread(target=self._run, name="Kokoro-TTS", daemon=True)
-            self._thread.start()
         return True
 
     def _run(self):
-        active = False
-        try:
-            while not self._stop.is_set():
-                try:
-                    text = self._queue.get(timeout=0.5)
-                except queue.Empty:
-                    break
-                if text is None:
-                    break
-                if not active:
-                    active = True
-                    try:
-                        self.activity_callback(True)
-                    except Exception:
-                        pass
-                    self.status_callback("Speaking locally…")
-                try:
-                    # Engine is usually already warm from the background preload thread.
-                    engine = self._ensure_engine()
-                    audio, sample_rate = engine.create(
-                        text, voice=self.settings["voice"], speed=float(self.settings["speed"]),
-                        lang=self.settings["language"]
-                    )
-                    if not self._stop.is_set():
-                        sd.play(audio, sample_rate)
-                        sd.wait()
-                except Exception as exc:
-                    if not self._error_reported:
-                        self._error_reported = True
-                        self.status_callback(f"TTS unavailable: {exc}")
-                if self._queue.empty() and active:
-                    active = False
-                    try:
-                        self.activity_callback(False)
-                    except Exception:
-                        pass
-                    self.status_callback("TTS ready")
-        finally:
-            if active:
+        while not self._stop.is_set():
+            try:
+                text = self._pending.get(timeout=0.25)
+            except queue.Empty:
+                continue
+            if text is None:
+                self._pending.task_done()
+                break
+            try:
+                if not self.enabled:
+                    continue
+                voice = self.settings["voice"]
+                engine = self._ensure_engine(voice)
+                self.activity_callback(True)
+                self._set_status("Speaking with StreamTTS…")
+                engine.push_text(text)
+                engine.flush()
+                engine.wait_until_idle(timeout=120)
+                self._set_status("StreamTTS ready")
+            except Exception as exc:
+                self._set_status(f"StreamTTS unavailable: {exc}")
+            finally:
                 try:
                     self.activity_callback(False)
                 except Exception:
                     pass
-            self._thread = None
+                self._pending.task_done()
 
     def close(self):
         self._stop.set()
         try:
-            self._queue.put_nowait(None)
+            self._pending.put_nowait(None)
         except queue.Full:
             try:
-                self._queue.get_nowait()
-                self._queue.put_nowait(None)
+                self._pending.get_nowait()
+                self._pending.put_nowait(None)
             except queue.Empty:
                 pass
-        try:
-            if sd is not None:
-                sd.stop()
-        except Exception:
-            pass
-        thread = self._thread
-        if thread and thread.is_alive() and thread is not threading.current_thread():
-            thread.join(timeout=1.0)
-        prewarm = self._prewarm_thread
-        if prewarm and prewarm.is_alive() and prewarm is not threading.current_thread():
-            prewarm.join(timeout=0.3)
+        engine = self._engine
+        if engine is not None:
+            self._close_engine(engine)
+            self._engine = None
+        if self._worker.is_alive() and self._worker is not threading.current_thread():
+            self._worker.join(timeout=1.0)

@@ -42,6 +42,8 @@ from gesture_rules import (
     pinch_timer_release_before_buffer,
     pinch_timer_gap_restarts_buffer,
     quick_pinch_click_eligible,
+    pinch_release_click_verdict,
+    PINCH_DRAG_MIN_HOLD_SECONDS,
     quick_pinch_reentry_eligible,
     align_double_click_point,
     hand_apparent_size_scale,
@@ -54,6 +56,7 @@ from gesture_rules import (
 )
 from voice_services import Speech, KokoroTTS
 from hand_occlusion import TuckSmoother
+from hand_contact import contact_offsets as hand_contact_offsets
 from custom_gestures import (
     ACTION_IDS as CUSTOM_GESTURE_ACTION_IDS, ACTION_LABELS as CUSTOM_GESTURE_ACTION_LABELS,
     ACTION_GROUPS as CUSTOM_GESTURE_ACTION_GROUPS,
@@ -129,7 +132,14 @@ NOTIFICATION_SETTING_ROWS = (
     ("dictation_indicator_position", "DICTATION INDICATOR", "top-left"),
     ("stt_indicator_position", "STT INDICATOR", "top-right"),
 )
-TTS_VOICE_OPTIONS = ("bf_alice", "bf_emma", "bf_isabella", "bf_lily", "bm_daniel", "bm_fable", "bm_george", "bm_lewis", "af_heart", "af_bella", "af_sarah", "am_adam", "am_michael")
+TTS_VOICE_OPTIONS = (
+    "vits-piper-en_GB-alan-medium",
+    "vits-piper-en_GB-alba-medium",
+    "vits-piper-en_GB-cori-medium",
+    "vits-piper-en_GB-jenny_dioco-medium",
+    "vits-piper-en_US-amy-low",
+    "vits-piper-en_US-ryan-medium",
+)
 
 def load_ui_preferences() -> dict:
     defaults = {
@@ -503,6 +513,16 @@ def is_fist_or_grip_pose(landmarks, edge_tolerant=False):
     # A fist only counts with the thumb tucked in. Fingers closed with the thumb
     # sticking out is thumbs up / thumbs down, left free for custom gestures.
     return fingers_closed and not thumb_sticking_out(landmarks)
+
+
+def fingers_closed_pose(landmarks, edge_tolerant=False):
+    """The four fingers folded, whatever the thumb does (fist, thumbs up/down)."""
+    if landmarks is None or len(landmarks) < 21:
+        return False
+    straight = _finger_straightness_values(landmarks)
+    index_limit = 0.81 if edge_tolerant else 0.79
+    other_limit = 0.87 if edge_tolerant else 0.83
+    return straight[0] <= index_limit and sum(value <= other_limit for value in straight[1:]) >= 2
 
 
 def is_open_hand_pose(landmarks, edge_tolerant=False):
@@ -6067,6 +6087,55 @@ class SpatialDesktop(QWidget):
                 painter.drawText(text_rect, Qt.AlignLeft | Qt.AlignVCenter, text)
                 yy += line_h
 
+    def _update_hand_contact_display(self):
+        """Let nearly touching fingertips of the two drawn hands touch (see hand_contact).
+
+        Works in the drawn hands' screen space, with the same mapping as
+        _paint_hand_skeleton, and stores the result as display landmarks only.
+        """
+        style = getattr(self, "hand_render_style", "flat")
+        if style not in ("3d", "flat"):
+            return
+        displays = getattr(self, "hand_display_positions", {})
+        screen, palms, scales = {}, {}, {}
+        for side in ("left", "right"):
+            points = self.hand_positions.get(side)
+            display = displays.get(side)
+            if not points or len(points) < 21 or display is None or display[0] is not points:
+                return
+            shown = display[1]
+            origin, user_scale = self._hand_visual_transform(points, side)
+            if self.side_cursor_positions.get(side) is not None:
+                off_x, off_y = self.hand_draw_offset.get(side, (0.0, 0.0))
+            else:
+                off_x = off_y = 0.0
+            pts = []
+            for p in shown[:21]:
+                q = self.interactive_visual_point(p[0], p[1])
+                x, y = scale_hand_point((q.x(), q.y()), (origin.x(), origin.y()), user_scale)
+                pts.append((x+off_x, y+off_y))
+            palm = math.hypot(pts[9][0]-pts[0][0], pts[9][1]-pts[0][1])
+            screen[side] = pts
+            palms[side] = palm*self._landmark_foreshortening(shown, 0, 9)
+            scales[side] = user_scale
+        thickness = min(10.0, max(0.8, float(getattr(self, "finger_thickness", 4.24))))/4.24
+        offsets = hand_contact_offsets(screen["left"], screen["right"], palms["left"], palms["right"],
+                                       style, thickness)
+        px_x = max(1.0, self.width()-1)/0.60
+        px_y = max(1.0, self.height()-1)/0.68
+        for side in ("left", "right"):
+            moves = offsets.get(side)
+            if not moves:
+                continue
+            points, shown = displays[side]
+            adjusted = list(shown)
+            for index, (dx, dy) in moves.items():
+                p = adjusted[index]
+                nx = p[0] + dx/(px_x*scales[side])
+                ny = p[1] + dy/(px_y*scales[side])
+                adjusted[index] = (nx, ny) + tuple(p[2:])
+            displays[side] = (points, adjusted)
+
     def _hand_visual_transform(self, points, side=None):
         """Return one consistent fixed-scale transform for landmarks and the TLI.
 
@@ -7584,7 +7653,11 @@ class SpatialDesktop(QWidget):
                 "fist": effective_fist,
                 "open": raw_open,
                 "clear_left_pinch": clear_left_pinch,
+                # Fingers folded with or without the thumb out: a thumbs-up counts.
+                "fingers_closed": fingers_closed_pose(landmarks, edge_tolerant),
             }
+
+        self._update_hand_contact_display()
 
         # A pinch outside the visible Search launcher dismisses it, and is consumed so
         # it cannot activate anything underneath the window.
@@ -8104,9 +8177,14 @@ class SpatialDesktop(QWidget):
                     # Movement before that point means pick-up/drag instead: hold the
                     # native left mouse button so standard app drag/drop keeps working.
                     drag_origin = self.pinch_drag_origin_points.get(side)
+                    # A drag needs a pinch that has lasted a moment: closing the hand into
+                    # a thumbs up or fist sweeps a brief, moving pinch past the thumb, and
+                    # that must not press the mouse button.
+                    pulse_start = self.menu_pinch_pulse_started_at[side] or self.menu_pinch_started[side]
                     if (side not in self.menu_pinch_latched and
                             held < self.menu_pinch_hold_seconds and
                             not self.left_click_modifier_active and
+                            now - pulse_start >= PINCH_DRAG_MIN_HOLD_SECONDS and
                             pinch_drag_should_start(
                                 (drag_origin.x(), drag_origin.y()) if drag_origin is not None else None,
                                 (cursor.x(), cursor.y()),
@@ -8151,7 +8229,20 @@ class SpatialDesktop(QWidget):
                                 self.menu_pinch_release_candidate_since[side],
                                 self.pinch_buffer_seconds)):
                         pulse_start = self.menu_pinch_pulse_started_at[side] or self.menu_pinch_started[side]
+                        verdict = "click"
                         if quick_pinch_click_eligible(
+                                pulse_start,
+                                self.menu_pinch_release_candidate_since[side],
+                                self.quick_pinch_click_min_seconds,
+                                self.fist_quick_click_max_seconds):
+                            # Closing the hand (into a thumbs up, say) sweeps the index
+                            # past the thumb: that brief pinch is not a click. Decide once
+                            # the released hand shows whether it opened or closed.
+                            verdict = pinch_release_click_verdict(
+                                release_for, is_open, pose.get("fingers_closed", False))
+                            if verdict == "wait":
+                                continue
+                        if verdict == "click" and quick_pinch_click_eligible(
                                 pulse_start,
                                 self.menu_pinch_release_candidate_since[side],
                                 self.quick_pinch_click_min_seconds,

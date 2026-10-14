@@ -1,6 +1,6 @@
 # Offline voice and fast local file search
 
-Spatial Desktop keeps Vosk for offline speech recognition and Kokoro ONNX for optional natural-sounding local speech. The installer now installs the Kokoro runtime and attempts to download its voice files automatically. Search itself does **not** need an embedding model, LLM, or cloud service.
+Spatial Desktop keeps Vosk for offline speech recognition and StreamTTS ONNX for optional natural-sounding local speech. The installer now installs the StreamTTS runtime and attempts to download its voice files automatically. Search itself does **not** need an embedding model, LLM, or cloud service.
 
 ## Fast launcher-style file search
 
@@ -16,7 +16,7 @@ The launcher behaves like a compact application search bar:
 - Click **Dictate** or open the launcher by saying “search bar” to use Vosk dictation. Partial transcripts replace the search field as Vosk hears new words, so results update before a full sentence is finalised.
 - Use the Up/Down arrows to choose a result and Enter or double-click to open it.
 - Click **Add Folder** to include other locations. The index is incremental and is stored locally in `~/.spatial_desktop` (on Windows this folder is under your user profile).
-- Click **Speak** to have Kokoro read the selected file name and a matching excerpt when the local TTS runtime and model files are available.
+- Click **Speak** to have StreamTTS read the selected file name and a matching excerpt when the local TTS runtime and model files are available.
 - Say “close search” to dismiss the launcher, “open top result” to open the current selection, or “stop dictation” to stop updating the query from speech.
 
 The default index roots are common personal folders such as Desktop, Documents, Downloads, Pictures, Videos and Music (where they exist). It never indexes the whole home folder by default. Hidden and common development/cache folders are skipped. It indexes file names and paths for all files; small text and source files plus PDF and DOCX files also contribute searchable content. PDF and DOCX parsers are installed by the main installer.
@@ -33,7 +33,7 @@ This is a quick local *semantic-style* finder, not a neural semantic embedding s
 - **OpenJev** is a local decision-model approach built on top of a small language model (the documented quick-start uses Qwen3-0.6B, with around a 1.5 GB model download). It is designed to classify/score choices, not to replace a file index. It adds model memory and inference cost without being the simplest fit for incremental file search.
 - **EmbeddingGemma 2** is a proper embedding/retrieval model and is the more relevant of the model-based options for semantic file matching, but its checkpoint is large compared with SQLite FTS and it needs a model inference runtime. We are deliberately leaving it out until the fast indexed baseline has been tested.
 
-## Kokoro local TTS
+## StreamTTS local TTS
 
 The installer runs `pip install -r requirements-voice.txt` and `python install_voice_models.py`. If either optional step fails because a network/package is unavailable, the installer warns and keeps the hand controls and search usable; retry manually from the project folder:
 
@@ -64,7 +64,7 @@ With Voice Input enabled from the glass menu, built-in commands include `pause t
 
 The Windows/Linux installer attempts to download the OpenCV Zoo dynamic-input YuNet face detector and quantized SFace recognizer into the per-user cache. If that initial download fails or was skipped, pressing Enrol Face downloads the models automatically in a background worker; you do not need to run a Python script manually. Model downloading happens off the GUI thread and the app stays running. Face Welcome is inert until you explicitly enroll a face through Settings. The saved profile contains only a numeric embedding and a display name at `~/.spatial_desktop/face_profile.json`; it does not store camera images. You can remove it via the same Settings button.
 
-At startup, Kokoro speaks a time-of-day greeting when its voice runtime and model files are ready. The text includes the enrolled display name if present, otherwise the operating-system username. Voice commands now include `close window` and `open user folder`.
+At startup, StreamTTS speaks a time-of-day greeting when its voice runtime and model files are ready. The text includes the enrolled display name if present, otherwise the operating-system username. Voice commands now include `close window` and `open user folder`.
 
 
 ## Voice-controlled PC commands (v32)
@@ -113,7 +113,7 @@ The command router is deterministic and offline. It is evaluated before search d
 
 In the glass menu open **Settings**, then choose **Interaction**, **Notifications**, or **Voice** from the tabs. The Notifications page independently controls the `HAND TRACKING PAUSED` banner and the Vosk heard/transcript bar. Each button cycles between six screen corners/centres and saves to `ui_settings.json`.
 
-The Voice page lets you toggle local TTS, cycle installed Kokoro voice IDs, adjust speech speed from `0.7x` to `1.5x`, play a test phrase, and enrol/manage Face Welcome. Kokoro's ONNX engine begins loading in the background when the installed model files are available, reducing first-speech initialisation delay.
+The Voice page lets you toggle local TTS, cycle installed StreamTTS voice IDs, adjust speech speed from `0.7x` to `1.5x`, play a test phrase, and enrol/manage Face Welcome. StreamTTS's ONNX engine begins loading in the background when the installed model files are available, reducing first-speech initialisation delay.
 
 Say **`show menu`** to toggle the glass menu, or **`show context`** to toggle the Pinch Menu near the current TLI/cursor. Say **`help`** for the command summary.
 

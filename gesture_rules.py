@@ -26,6 +26,28 @@ def quick_pinch_click_eligible(pinch_started_at, release_started_at,
 
 
 
+# How long a released quick pinch may wait for the hand to show whether it opened
+# (a click) or closed (a pinch seen in passing while making a thumbs up or a fist).
+PINCH_RELEASE_SETTLE_SECONDS = 0.30
+# A pinch must last this long before moving it starts a drag (mouse button held).
+PINCH_DRAG_MIN_HOLD_SECONDS = 0.15
+
+
+def pinch_release_click_verdict(release_for, is_open, fingers_closed,
+                                settle_seconds=PINCH_RELEASE_SETTLE_SECONDS):
+    """'click', 'cancel' or 'wait' for a released quick pinch.
+
+    Closing the hand (into a thumbs up, thumbs down or fist) sweeps the index finger
+    past the thumb, which reads as a brief pinch. A real click releases into an open
+    hand; a pass-through pinch releases into folded fingers.
+    """
+    if fingers_closed:
+        return "cancel"
+    if is_open or float(release_for) >= float(settle_seconds):
+        return "click"
+    return "wait"
+
+
 def pinch_drag_should_start(origin, point, movement_threshold=10.0):
     """Start a click-and-hold drag when a held pinch moves beyond tracking jitter.
 
