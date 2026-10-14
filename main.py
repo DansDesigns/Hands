@@ -5569,9 +5569,19 @@ class SpatialDesktop(QWidget):
                        min(max(0.0, point.y()), max(1, self.height()-1)))
 
     def interactive_visual_point(self, x, y):
-        """Map camera landmarks to screen space, including the calibrated touch-anchor offset."""
+        """Map camera landmarks across the full physical screen, including Qtile bars.
+
+        Qtile's usable work area excludes reserved top/bottom bars. Using this widget's
+        dimensions can therefore trap the OS pointer inside the work area on X11/XLibre.
+        The hand-to-screen transform must use the actual screen geometry instead.
+        Coordinates remain screen-local because the main overlay is fullscreen.
+        """
         nx = (float(x)-0.20)/(0.80-0.20)
         ny = (float(y)-0.16)/(0.84-0.16)
+        screen = QApplication.primaryScreen()
+        screen_geometry = screen.geometry() if screen is not None else None
+        screen_width = screen_geometry.width() if screen_geometry is not None else self.width()
+        screen_height = screen_geometry.height() if screen_geometry is not None else self.height()
         calibration = getattr(self, "hand_calibration", {})
         offset = (calibration.get("screen_offset", {})
                   if calibration.get("calibrated", False) and not getattr(self, "hand_calibration_active", False)
@@ -5581,7 +5591,7 @@ class SpatialDesktop(QWidget):
             ny += min(0.65, max(-0.65, float(offset.get("y", 0.0))))
         except (TypeError, ValueError, AttributeError):
             pass
-        return QPointF(nx*max(1, self.width()-1), ny*max(1, self.height()-1))
+        return QPointF(nx*max(1, screen_width-1), ny*max(1, screen_height-1))
 
     def interactive_hand_anchor(self, landmarks, side=None):
         """Map the calibrated palm-relative TLI before the common hand-scale transform."""
