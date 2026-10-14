@@ -6083,12 +6083,13 @@ class SpatialDesktop(QWidget):
         painter.restore()
 
     # Joint radii (before finger-thickness and size scaling) from knuckle to tip.
+    # Cartoon proportions: chunky fingers with little taper and rounded, full tips.
     HAND_FINGER_CHAINS = (
-        ("thumb", (1, 2, 3, 4), (4.6, 4.1, 3.4, 2.8)),
-        ("index", (5, 6, 7, 8), (3.9, 3.3, 2.75, 2.35)),
-        ("middle", (9, 10, 11, 12), (4.0, 3.4, 2.85, 2.4)),
-        ("ring", (13, 14, 15, 16), (3.75, 3.2, 2.7, 2.3)),
-        ("pinky", (17, 18, 19, 20), (3.3, 2.85, 2.4, 2.1)),
+        ("thumb", (1, 2, 3, 4), (5.0, 4.6, 4.2, 3.95)),
+        ("index", (5, 6, 7, 8), (4.2, 3.9, 3.65, 3.55)),
+        ("middle", (9, 10, 11, 12), (4.3, 4.0, 3.75, 3.65)),
+        ("ring", (13, 14, 15, 16), (4.1, 3.8, 3.55, 3.45)),
+        ("pinky", (17, 18, 19, 20), (3.6, 3.4, 3.2, 3.1)),
     )
     # Key light from the upper left of the screen.
     HAND_LIGHT = (-0.55, -0.835)
@@ -6180,7 +6181,12 @@ class SpatialDesktop(QWidget):
         def depth_tone(i):  # farther parts are a touch darker
             return 1.0-min(0.2, max(-0.1, 0.3*depth[i]))
 
-        size = finger_thickness*width_scale
+        # Finger thickness is proportional to this hand's own palm length (corrected
+        # for rotation), so fingers stay in cartoon proportion to the palm at any
+        # distance or angle. Finger Thickness scales it around its 4.24 default.
+        palm_px = math.hypot(joints[9].x()-joints[0].x(), joints[9].y()-joints[0].y())
+        palm_px *= self._landmark_foreshortening(points, 0, 9)
+        size = (0.125/4.3)*palm_px*(finger_thickness/4.24)
         radii = {}
         for _name, chain, base_radii in self.HAND_FINGER_CHAINS:
             for index, r in zip(chain, base_radii):
@@ -6203,7 +6209,7 @@ class SpatialDesktop(QWidget):
         vx, vy = joints[9].x()-joints[0].x(), joints[9].y()-joints[0].y()
         vl = max(1e-6, math.hypot(vx, vy))
         px, py = -vy/vl, vx/vl
-        half_wrist = 0.36*knuckle_width
+        half_wrist = 0.40*knuckle_width
         base_pt = QPointF(joints[0].x()+vx*0.04, joints[0].y()+vy*0.04)
         wrist_pts = [QPointF(base_pt.x()+px*half_wrist, base_pt.y()+py*half_wrist),
                      QPointF(base_pt.x()-px*half_wrist, base_pt.y()-py*half_wrist)]
@@ -6212,7 +6218,7 @@ class SpatialDesktop(QWidget):
                       joints[2].y()*0.45+joints[5].y()*0.4+joints[1].y()*0.15)
         palm_pts.append(web)
         hull = self._convex_hull(palm_pts)
-        palm_round = max(1.0, 1.0*radii[9])
+        palm_round = max(1.0, 1.25*radii[9])
         palm_core = QPainterPath()
         if len(hull) >= 3:
             palm_core.addPolygon(QPolygonF(hull))
@@ -6235,7 +6241,13 @@ class SpatialDesktop(QWidget):
         for name, chain, _r in self.HAND_FINGER_CHAINS:
             proximal = [(chain[0], chain[1])]
             distal = [(chain[1], chain[2]), (chain[2], chain[3])]
-            for segs in (proximal, distal):
+            groups = (proximal, distal)
+            prox_z = (depth[chain[0]]+depth[chain[1]])*0.5
+            dist_z = (depth[chain[1]]+depth[chain[2]]+depth[chain[3]])/3.0
+            if abs(dist_z-prox_z) < 0.18:
+                # Not strongly curled: draw the finger as one smooth piece (no crease).
+                groups = (proximal+distal,)
+            for segs in groups:
                 idx = sorted({i for seg in segs for i in seg})
                 parts.append((name, segs, sum(depth[i] for i in idx)/len(idx)))
         parts.sort(key=lambda part: part[2], reverse=True)  # far first
@@ -6286,9 +6298,9 @@ class SpatialDesktop(QWidget):
                     centre_pt = bounds.center()
                     shade = QRadialGradient(QPointF(centre_pt.x()+light_x*extent*0.35,
                                                     centre_pt.y()+light_y*extent*0.35), extent*1.15)
-                    shade.setColorAt(0.0, self._shade_colour(base, 1.13*tone))
-                    shade.setColorAt(0.55, self._shade_colour(base, 0.98*tone))
-                    shade.setColorAt(1.0, self._shade_colour(base, 0.74*tone))
+                    shade.setColorAt(0.0, self._shade_colour(base, 1.11*tone))
+                    shade.setColorAt(0.6, self._shade_colour(base, 1.0*tone))
+                    shade.setColorAt(1.0, self._shade_colour(base, 0.83*tone))
                     lp.setPen(Qt.NoPen)
                     lp.setBrush(QBrush(shade))
                     lp.drawPath(palm_shape)
@@ -6319,11 +6331,10 @@ class SpatialDesktop(QWidget):
                 # Cylinder shading across the finger: lit edge, highlight, core, shadow.
                 shade = QLinearGradient(QPointF(mid.x()+nx*r, mid.y()+ny*r),
                                         QPointF(mid.x()-nx*r, mid.y()-ny*r))
-                shade.setColorAt(0.0, self._shade_colour(base, 1.03*tone))
-                shade.setColorAt(0.28, self._shade_colour(base, 1.17*tone))
-                shade.setColorAt(0.58, self._shade_colour(base, 0.97*tone))
-                shade.setColorAt(0.86, self._shade_colour(base, 0.80*tone))
-                shade.setColorAt(1.0, self._shade_colour(base, 0.70*tone))
+                shade.setColorAt(0.0, self._shade_colour(base, 1.05*tone))
+                shade.setColorAt(0.3, self._shade_colour(base, 1.12*tone))
+                shade.setColorAt(0.62, self._shade_colour(base, 0.99*tone))
+                shade.setColorAt(1.0, self._shade_colour(base, 0.82*tone))
                 lp.setBrush(QBrush(shade))
                 lp.drawPath(body)
         finally:
