@@ -33,6 +33,7 @@ from gesture_rules import (
     drag_scroll_rate_from_offset,
     smooth_scroll_delta,
     should_recognize_menu_pinch,
+    thumb_pinches_index,
     should_prefer_clear_left_pinch_over_fist,
     is_plausible_hand_landmarks,
     scale_hand_point,
@@ -247,7 +248,7 @@ def save_gesture_settings(values: dict) -> None:
         "# LEFT MODIFIER: hold LEFT fist; quick RIGHT pinch/release = right-click/context menu; held RIGHT grip = drag a native window (OS) or virtual canvas/app (3D).",
         "# Modifier gestures suppress the regular Pinch Menu timer; open RIGHT hand to release a modifier drag.",
         "# DOUBLE-CLICK: two quick thumb/index pinches near the same point are snapped to one target for a native double-click.",
-        "# PINCH MENU: hold thumb/index pinch continuously for 0.8s; then the circle fills for menu_pinch_hold_seconds (default 0.6s).",
+        "# PINCH MENU: hold thumb/index pinch continuously for pinch_buffer_seconds (default 0.8s); then the circle fills for the hold timer.",
         "# PINCH MENU: while open, a fresh pinch/grab outside the popup closes it without clicking through.",
         "# FIST MOVEMENT: a moving RIGHT-only fist starts smooth vertical page scrolling without a fist timer; left fist remains the modifier, and two-fist window drag remains available.",
         "# TIMERS: only Pinch Menu and peace-sign gestures show countdowns. Right-fist scrolling starts on deliberate vertical movement and has no circle timer.",
@@ -288,7 +289,7 @@ def save_gesture_settings(values: dict) -> None:
         "# HAND ONBOARDING: on first run, extend an arm and touch below the camera, then capture a palm-facing pose and a two-hand contact pose.",
         "# Hand scale/proximity calibration is saved in hand_calibration.json and can be repeated from Settings -> Hands.",
         "# Scroll input is injected as native wheel input at the live cursor so Explorer/Office controls receive it, not a posted event to the wrong top-level window.",
-        "# The Pinch Menu confirmation buffer is fixed at 0.8 seconds and is not a setting; releasing early cancels the sequence.",
+        "# pinch_buffer_seconds: Pinch Menu confirmation buffer before the circle starts, 0.3 to 2.0 seconds; default 0.8. Releasing early cancels the sequence (or clicks, if quick).",
         "# hand_tracking_sensitivity: drag movement gain and gentle scroll gain, 0.5 to 1.5; higher moves faster.",
         "# custom_gesture_hold_seconds: how long a recorded custom gesture must be held to fire, 0.2 to 1.5 s; default 0.5.",
         "# custom_gesture_tolerance: how loosely a live pose may match a recorded one, 0.08 to 0.40; default 0.18.",
@@ -338,6 +339,7 @@ def save_gesture_settings(values: dict) -> None:
         f"click_debounce_seconds={clamped('click_debounce_seconds', 0.04, 0.25, 0.085):.3f}",
         f"menu_pinch_hold_seconds={clamped('menu_pinch_hold_seconds', 0.5, 5.0, 0.6):.2f}",
         f"default_gesture_hold_seconds={clamped('default_gesture_hold_seconds', 0.5, 5.0, 0.5):.2f}",
+        f"pinch_buffer_seconds={clamped('pinch_buffer_seconds', 0.3, 2.0, 0.8):.2f}",
         f"invert_scroll={str(bool(values.get('invert_scroll', True))).lower()}",
         f"cursor_lock_priority={values.get('cursor_lock_priority', 'right') if values.get('cursor_lock_priority', 'right') in ('right', 'left') else 'right'}",
         f"left_click_color={colors['left_click_color']}",
@@ -381,6 +383,7 @@ def load_gesture_settings() -> dict:
         "click_debounce_seconds": 0.085,
         "menu_pinch_hold_seconds": 0.6,
         "default_gesture_hold_seconds": 0.5,
+        "pinch_buffer_seconds": 0.8,
         "invert_scroll": True,
         "cursor_lock_priority": "right",
         "left_click_color": "#ff5555",
@@ -412,6 +415,7 @@ def load_gesture_settings() -> dict:
         "click_debounce_seconds": (0.04, 0.25),
         "menu_pinch_hold_seconds": (0.5, 5.0),
         "default_gesture_hold_seconds": (0.5, 5.0),
+        "pinch_buffer_seconds": (0.3, 2.0),
     }
     try:
         content = GESTURES_FILE.read_text(encoding="utf-8").splitlines()
@@ -503,13 +507,17 @@ def is_open_hand_pose(landmarks, edge_tolerant=False):
 
 
 def is_thumb_index_menu_pinch(landmarks, edge_tolerant=False):
-    """Robust thumb/index pinch with at least two other fingers extended.
+    """Robust thumb/index pinch (index only) with at least two other fingers extended.
 
     The index finger naturally bends while making a pinch, so its straightness must not
     be a prerequisite. A closed fist still fails because it has fewer than two extended
     non-index fingers. This makes the timed Pinch Menu much less likely to keep restarting.
     """
     if landmarks is None or len(landmarks) < 21:
+        return False
+    # Only the index finger makes the built-in pinch: thumb-to-middle/ring/pinky
+    # pinches are reserved for custom gestures.
+    if not thumb_pinches_index([distance3d(landmarks, 4, tip) for tip in (8, 12, 16, 20)]):
         return False
     palm = max(1e-5, distance3d(landmarks, 0, 9))
     pinch_gap = distance3d(landmarks, 4, 8) / palm
@@ -791,6 +799,11 @@ class SearchHandOverlay(QWidget):
             return
         painter.setRenderHint(QPainter.Antialiasing, True)
         now = time.monotonic()
+        # The completion ring fades out while the Pinch Menu fades in/out. Paint the
+        # menu before the hands so the hand and TLI both appear on top of it.
+        for side in ("right", "left"):
+            owner._paint_gesture_timer_fade(painter, side, now)
+            owner._paint_pinch_menu(painter, side, now)
         # This overlay is the sole hand-visual owner while Search is visible; the main
         # window skips the identical layer to avoid double-painted ghost silhouettes.
         for side in ("left", "right"):
@@ -830,11 +843,11 @@ class SearchHandOverlay(QWidget):
                                  f"{remaining:.1f}s")
             if started is not None:
                 elapsed = owner._menu_pinch_elapsed_seconds(side, now)
-                delay = owner.gesture_timer_delay_seconds
+                delay = owner.pinch_buffer_seconds
                 duration = owner.menu_pinch_hold_seconds
                 total_duration = delay + duration
                 # The confirmation buffer is deliberately unfilled; the ring advances
-                # only once the fixed 0.8s buffer has elapsed.
+                # only once the pinch buffer has elapsed.
                 progress = min(1.0, max(0.0, elapsed/max(0.01, duration)))
                 buffer_remaining = max(0.0, delay-(now-started))
                 remaining = buffer_remaining if buffer_remaining > 0.0 else max(0.0, duration-elapsed)
@@ -848,10 +861,6 @@ class SearchHandOverlay(QWidget):
                 painter.setFont(QFont("Sans", 8, QFont.DemiBold))
                 painter.drawText(QRectF(cursor.x()-22, cursor.y()+23, 44, 16), Qt.AlignCenter,
                                  f"{remaining:.1f}s")
-        # The completion ring fades out while the Pinch Menu fades in/out.
-        for side in ("right", "left"):
-            owner._paint_gesture_timer_fade(painter, side, now)
-            owner._paint_pinch_menu(painter, side, now)
         # Repaint the TLI last so it remains visible over both launcher and menu buttons.
         for side in ("right", "left"):
             points = owner.hand_positions.get(side, [])
@@ -1452,6 +1461,9 @@ class SpatialDesktop(QWidget):
         # Mutually exclusive per-hand gesture states; no depth-calibration state exists.
         sides = ("left", "right")
         self.gesture_timer_delay_seconds = 0.8  # FIXED soft gesture buffer: do not remove or shorten
+        # Pinch Menu confirmation buffer before the circle timer starts; adjustable in
+        # Settings -> Interaction (PINCH BUFFER). Fist holds keep the fixed buffer above.
+        self.pinch_buffer_seconds = float(settings.get("pinch_buffer_seconds", 0.8))
         self.fist_quick_click_max_seconds = 0.65
         self.fist_started_at = {side: None for side in sides}
         self.fist_release_candidate_since = {side: None for side in sides}
@@ -1597,6 +1609,7 @@ class SpatialDesktop(QWidget):
             "click_debounce_seconds": self.click_debounce_seconds,
             "menu_pinch_hold_seconds": self.menu_pinch_hold_seconds,
             "default_gesture_hold_seconds": self.default_gesture_hold_seconds,
+            "pinch_buffer_seconds": self.pinch_buffer_seconds,
             "invert_scroll": self.invert_scroll,
             "cursor_lock_priority": self.cursor_lock_priority,
             "left_click_color": self.left_click_color.name(),
@@ -1828,7 +1841,9 @@ class SpatialDesktop(QWidget):
             texts["status"] = (L, y, W, 48.0)
             y += 48.0 + gap
         elif page == "update":
-            stack("update_action", h=46.0, after=14.0)
+            # The single UPDATE / INSTALL / RESTART button is centred in the panel.
+            buttons["update_action"] = (-W*0.5, y, W, 46.0)
+            y += 46.0 + 14.0
             # Status and description span both columns: this page has no sliders.
             texts["status"] = (L, y, 2*W+(R-(L+W)), 72.0)
             y += 80.0
@@ -2219,6 +2234,7 @@ class SpatialDesktop(QWidget):
                 ("sensitivity", self.hand_tracking_sensitivity, 0.5, 1.5, "DRAG/SCROLL SENSITIVITY"),
                 ("smoothing", self.cursor_smoothing, 0.0, 0.95, "CURSOR SMOOTHING"),
                 ("default_gesture_hold_seconds", self.default_gesture_hold_seconds, 0.5, 5.0, "DEFAULT GESTURE HOLD TIMER"),
+                ("pinch_buffer_seconds", self.pinch_buffer_seconds, 0.3, 2.0, "PINCH BUFFER (BEFORE HOLD TIMER)"),
                 ("scroll_acceleration", self.scroll_acceleration, 0.5, 10.0, "SCROLL ACCELERATION"),
                 ("scroll_deadzone", self.scroll_deadzone, 4.0, 120.0, "SCROLL DEAD ZONE"),
                 ("scroll_backdrop_opacity", self.scroll_backdrop_opacity, 0.0, 100.0, "SCROLL CIRCLE TRANSPARENCY"),
@@ -2922,6 +2938,7 @@ class SpatialDesktop(QWidget):
             "smoothing": ("cursor_smoothing", 0.005),
             "pinch_timer": ("menu_pinch_hold_seconds", 0.01),
             "default_gesture_hold_seconds": ("default_gesture_hold_seconds", 0.01),
+            "pinch_buffer_seconds": ("pinch_buffer_seconds", 0.01),
             "hand_transparency": ("hand_transparency", 1.0),
             "skin_tone_darkness": ("skin_tone_darkness", -50.5),
             "finger_thickness": ("finger_thickness", 0.01),
@@ -5722,7 +5739,7 @@ class SpatialDesktop(QWidget):
             return f"{value:.2f}"
         if name == "pinch_timer":
             return f"{value:.1f}s"
-        if name == "custom_gesture_hold_seconds":
+        if name in ("custom_gesture_hold_seconds", "default_gesture_hold_seconds", "pinch_buffer_seconds"):
             return f"{value:.2f}s"
         if name == "custom_gesture_tolerance":
             return f"{value:.2f}"
@@ -6363,7 +6380,7 @@ class SpatialDesktop(QWidget):
         self.modifier_click_armed[side] = True
 
     def _menu_pinch_elapsed_seconds(self, side, now=None):
-        """Count only held pinch time after a continuous 0.8s confirmation buffer."""
+        """Count only held pinch time after the continuous pinch confirmation buffer."""
         if now is None:
             now = time.monotonic()
         return pinch_timer_elapsed_seconds(
@@ -6372,7 +6389,7 @@ class SpatialDesktop(QWidget):
             self.menu_pinch_pulse_started_at.get(side),
             self.menu_pinch_release_candidate_since.get(side),
             now,
-            self.gesture_timer_delay_seconds,
+            self.pinch_buffer_seconds,
         )
 
     def _start_menu_pinch_sequence(self, side, cursor, now):
@@ -7472,7 +7489,7 @@ class SpatialDesktop(QWidget):
                                 release_started, now,
                                 self.menu_pinch_click_fired[side],
                                 side in self.menu_pinch_latched,
-                                self.gesture_timer_delay_seconds,
+                                self.pinch_buffer_seconds,
                                 min_release_gap=0.0,
                                 min_pulse_seconds=self.quick_pinch_click_min_seconds,
                                 max_pulse_seconds=self.fist_quick_click_max_seconds):
@@ -7489,7 +7506,7 @@ class SpatialDesktop(QWidget):
                             self.menu_pinch_click_fired[side] = True
                         if pinch_timer_gap_restarts_buffer(
                                 self.menu_pinch_started[side], release_started, now,
-                                self.gesture_timer_delay_seconds):
+                                self.pinch_buffer_seconds):
                             # A real pinch release during the 0.8s buffer invalidates that
                             # sequence; a quick re-pinch gets a new full buffer and no credit.
                             self._clear_menu_pinch_sequence(side)
@@ -7499,7 +7516,7 @@ class SpatialDesktop(QWidget):
                                 self.menu_pinch_started[side],
                                 self.menu_pinch_pulse_started_at[side],
                                 release_started,
-                                self.gesture_timer_delay_seconds,
+                                self.pinch_buffer_seconds,
                             )
                             self.menu_pinch_pulse_started_at[side] = now
                             self.menu_pinch_origin_points[side] = QPointF(cursor)
@@ -7555,7 +7572,7 @@ class SpatialDesktop(QWidget):
                             pinch_timer_release_before_buffer(
                                 self.menu_pinch_started[side],
                                 self.menu_pinch_release_candidate_since[side],
-                                self.gesture_timer_delay_seconds)):
+                                self.pinch_buffer_seconds)):
                         pulse_start = self.menu_pinch_pulse_started_at[side] or self.menu_pinch_started[side]
                         if quick_pinch_click_eligible(
                                 pulse_start,
@@ -7575,7 +7592,7 @@ class SpatialDesktop(QWidget):
                     # Quick pinches cannot pool against one old wall-clock start time.
                     if pinch_timer_release_before_buffer(
                             self.menu_pinch_started[side], self.menu_pinch_release_candidate_since[side],
-                            self.gesture_timer_delay_seconds):
+                            self.pinch_buffer_seconds):
                         self._clear_menu_pinch_sequence(side)
                         if self.gesture_owner == side:
                             self.gesture_owner = None
@@ -8282,7 +8299,7 @@ class SpatialDesktop(QWidget):
                             ("LONG GESTURES", True),
                             ("Move held pinch before timer: drag/drop.", False),
                             ("Stationary pinch opens Pinch Menu.", False),
-                            ("Ring fills after the 0.8s buffer.", False),
+                            ("Ring fills after the pinch buffer.", False),
                         ],
                         [
                             ("PINCH MENU", True),
@@ -8697,6 +8714,12 @@ class SpatialDesktop(QWidget):
              self.hand_calibration_window.isVisible())
         )
         if not search_overlay_draws_hand_layer and not calibration_window_owns_hand_layer:
+            # The floating Pinch Menu (and the completed gesture ring fading away as it
+            # fades in) is painted first, so the virtual hand and its TLI draw on top of it.
+            for side in ("left", "right"):
+                self._paint_gesture_timer_fade(painter, side, now)
+                self._paint_pinch_menu(painter, side, now)
+
             # Reticle and skeleton use the fixed hand-relative (optionally calibrated) TLI anchor.
             # During TLI calibration the dedicated target window is the sole visual owner;
             # painting here as well produced a second, differently transformed skeleton.
@@ -8810,9 +8833,9 @@ class SpatialDesktop(QWidget):
                 cursor = self._visual_tli_position(side, cursor)
                 elapsed = self._menu_pinch_elapsed_seconds(side, now)
                 duration = self.menu_pinch_hold_seconds
-                total_duration = self.gesture_timer_delay_seconds + duration
+                total_duration = self.pinch_buffer_seconds + duration
                 progress = min(1.0, max(0.0, elapsed/max(0.01, duration)))
-                buffer_remaining = max(0.0, self.gesture_timer_delay_seconds-(now-started))
+                buffer_remaining = max(0.0, self.pinch_buffer_seconds-(now-started))
                 # During the initial buffer the ring stays empty and the label shows only
                 # the 0.8s confirmation countdown; the hold countdown begins afterward.
                 remaining = buffer_remaining if buffer_remaining > 0.0 else max(0.0, duration-elapsed)
@@ -8828,10 +8851,6 @@ class SpatialDesktop(QWidget):
                 painter.drawText(QRectF(cursor.x()-22, cursor.y()+23, 44, 16), Qt.AlignCenter,
                                  f"{remaining:.1f}s")
 
-            # The completed gesture ring fades away as the floating Pinch Menu fades in.
-            for side in ("left", "right"):
-                self._paint_gesture_timer_fade(painter, side, now)
-                self._paint_pinch_menu(painter, side, now)
 
         if self.menu_open and self.hub_visible:
             # Keep the normal gesture legend visible while the glass menu is open,

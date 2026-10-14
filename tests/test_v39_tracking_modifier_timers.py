@@ -45,7 +45,7 @@ class V39TrackingModifierTimersTests(unittest.TestCase):
 
     def test_general_gesture_countdowns_show_numeric_seconds(self):
         self.assertGreaterEqual(self.main.count('f"{remaining:.1f}s"'), 3)
-        self.assertIn('total_duration = self.gesture_timer_delay_seconds + duration', self.main)
+        self.assertIn('total_duration = self.pinch_buffer_seconds + duration', self.main)
         self.assertIn('total_duration = delay + duration', self.main)
 
     def test_documentation_updated(self):

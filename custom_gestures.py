@@ -213,14 +213,29 @@ def builtin_conflict(features, pinch_ratio=None):
     return None
 
 
+# Returned by pinch_ratio when the thumb is pinching a finger other than the index.
+NOT_AN_INDEX_PINCH = 99.0
+
+
 def pinch_ratio(landmarks):
-    """Thumb-tip to index-tip distance divided by palm size."""
+    """Thumb-tip to index-tip distance divided by palm size.
+
+    When the thumb tip is nearer the middle, ring or pinky tip than the index tip,
+    the pose is not the built-in index pinch, so a large ratio is returned and the
+    pose stays available for custom gestures.
+    """
     try:
         p = [_pt(landmarks[i]) for i in (0, 4, 5, 8, 9, 17)]
+        other_tips = [_pt(landmarks[i]) for i in (12, 16, 20)]
     except (TypeError, ValueError, AttributeError, IndexError):
         return None
     palm = math.sqrt(max(0.0, _dist(p[0], p[4]) * _dist(p[2], p[5])))
-    return _dist(p[1], p[3]) / palm if palm > 1e-6 else None
+    if palm <= 1e-6:
+        return None
+    to_index = _dist(p[1], p[3])
+    if any(_dist(p[1], tip) <= to_index for tip in other_tips):
+        return NOT_AN_INDEX_PINCH
+    return to_index / palm
 
 
 # The thumb is described by 2 of the 10 values but is often the only difference

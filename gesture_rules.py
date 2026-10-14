@@ -254,6 +254,23 @@ def should_prefer_clear_left_pinch_over_fist(*, is_pinch, normalized_gap):
     return math.isfinite(gap) and 0.0 <= gap <= 0.40
 
 
+def thumb_pinches_index(thumb_to_fingertip_distances):
+    """True only when the thumb tip is nearer the index fingertip than any other fingertip.
+
+    Distances are thumb-tip to (index, middle, ring, pinky) tips. Thumb-to-middle,
+    -ring or -pinky pinches leave the index tip close to the thumb too, so the
+    thumb/index gap alone cannot tell them apart; those poses are kept free for
+    custom gestures and must never trigger the built-in index pinch.
+    """
+    try:
+        d = [float(value) for value in thumb_to_fingertip_distances]
+    except (TypeError, ValueError):
+        return False
+    if len(d) < 4 or not all(math.isfinite(value) for value in d[:4]):
+        return False
+    return d[0] < min(d[1:4])
+
+
 def should_recognize_menu_pinch(*, normalized_gap, finger_straightness, edge_tolerant=False):
     """Recognise a natural thumb/index pinch even if the index bends slightly.
 

@@ -6,8 +6,8 @@ import subprocess
 import sys
 from pathlib import Path
 
-from PySide6.QtCore import Qt, QTimer, QThread, Signal, QSize, QUrl
-from PySide6.QtGui import QDesktopServices, QFont, QKeySequence, QShortcut
+from PySide6.QtCore import Qt, QTimer, QThread, Signal, QSize, QUrl, QRectF
+from PySide6.QtGui import QDesktopServices, QFont, QKeySequence, QShortcut, QPainter, QColor, QPen
 from PySide6.QtWidgets import (
     QDialog, QVBoxLayout, QHBoxLayout, QLineEdit, QListWidget, QListWidgetItem,
     QLabel, QPushButton, QFileDialog, QMessageBox, QApplication, QAbstractItemView, QWidget,
@@ -54,6 +54,10 @@ class SearchLauncherDialog(QDialog):
         # Spatial Desktop overlay is a Qt.Tool window and may not count as a normal
         # top-level window for last-window-close purposes.
         self.setAttribute(Qt.WA_QuitOnClose, False)
+        # The window itself is transparent and paintEvent draws the rounded glass
+        # panel, so all four corners are rounded on every OS/compositor (an opaque
+        # frameless window keeps square corners behind a stylesheet radius).
+        self.setAttribute(Qt.WA_TranslucentBackground, True)
         self._details_expanded = False
         self._user_collapsed_details = False
         self._compact_height = 78
@@ -61,7 +65,7 @@ class SearchLauncherDialog(QDialog):
         self.resize(680, self._compact_height)
         self.setMinimumSize(480, 68)
         self.setStyleSheet("""
-            QDialog { background:#0b1320; color:#e8f7ff; border:1px solid #3e8198; border-radius:16px; }
+            QDialog { background:transparent; color:#e8f7ff; border:none; }
             QLabel { color:#a9c6d8; }
             QLineEdit { background:#111f31; color:#f3fbff; border:1px solid #47758e;
                         border-radius:12px; padding:7px 12px; font-size:17px; selection-background-color:#267a9c; }
@@ -157,6 +161,14 @@ class SearchLauncherDialog(QDialog):
 
         self._toggle_shortcut = QShortcut(QKeySequence("Ctrl+Space"), self)
         self._toggle_shortcut.activated.connect(self.close)
+
+    def paintEvent(self, event):
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.Antialiasing, True)
+        painter.setPen(QPen(QColor("#3e8198"), 1.0))
+        painter.setBrush(QColor("#0b1320"))
+        painter.drawRoundedRect(QRectF(self.rect()).adjusted(0.5, 0.5, -0.5, -0.5), 16, 16)
+        painter.end()
 
     def _set_details_expanded(self, expanded: bool, user_action: bool = False):
         self._details_expanded = bool(expanded)
