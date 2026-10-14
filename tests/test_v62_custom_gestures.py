@@ -6,7 +6,7 @@ from pathlib import Path
 from custom_gestures import (
     FINGERS, HoldTrigger, best_pose_match, builtin_conflict, describe, feature_distance,
     hand_features, load_custom_gestures, mean_features, save_custom_gestures, tli_overlap,
-    pyautogui_key_combo, display_key_combo,
+    pyautogui_key_combo, display_key_combo, windows_shortcut_from_vk,
 )
 
 KN = {"index": (-30, 90), "middle": (-10, 95), "ring": (10, 90), "pinky": (28, 80)}
@@ -99,6 +99,27 @@ class CustomGestureTests(unittest.TestCase):
         self.assertEqual(display_key_combo("CTRL+META+K", "linux"), "CTRL+SUPER+K")
         self.assertEqual(display_key_combo("WIN+K", "win32"), "WIN+K")
         self.assertEqual(display_key_combo("SUPER+K", "darwin"), "COMMAND+K")
+
+    def test_windows_native_capture_maps_win_tab_and_modifier_chords(self):
+        self.assertEqual(windows_shortcut_from_vk(0x09, {0x5B, 0x09}), "meta+tab")
+        self.assertEqual(pyautogui_key_combo(windows_shortcut_from_vk(0x09, {0x5B, 0x09}), "win32"),
+                         ["win", "tab"])
+        self.assertEqual(display_key_combo("META+TAB", "win32"), "WIN+TAB")
+        self.assertEqual(windows_shortcut_from_vk(0x4B, {0x11, 0x12, 0x10, 0x4B}),
+                         "ctrl+alt+shift+k")
+
+    def test_gesture_rows_have_explicit_key_capture_button_before_remove(self):
+        main = (Path(__file__).resolve().parents[1] / "main.py").read_text(encoding="utf-8")
+        self.assertIn('list_width = self.SETTINGS_RIGHT_X + self.SETTINGS_COLUMN_W - L', main)
+        self.assertIn('"row": r(L, y, list_width, 38)', main)
+        self.assertIn('"action": r(action_x, y+3, action_width, 32)', main)
+        self.assertIn('"capture": r(capture_x, y+3, 48, 32)', main)
+        self.assertIn('"delete": r(delete_x, y+3, 20, 32)', main)
+        self.assertIn('if row["capture"].contains(point):', main)
+        self.assertIn('self._start_custom_gesture_key_capture(index)', main)
+        self.assertIn('"PRESS" if capturing else "KEY"', main)
+        self.assertIn("click KEY to capture a shortcut", main)
+        self.assertIn("Win+Tab is captured without opening the app switcher", main)
 
     def test_key_capture_uses_portable_meta_token(self):
         main = (Path(__file__).resolve().parents[1] / "main.py").read_text(encoding="utf-8")

@@ -63,6 +63,7 @@ from custom_gestures import (
     MAX_GESTURES as CUSTOM_GESTURE_MAX, INSTANT_HOLD_SECONDS as CUSTOM_GESTURE_INSTANT_HOLD, HoldTrigger, hand_features, mean_features, describe as describe_pose,
     builtin_conflict, pinch_ratio as custom_pinch_ratio, best_pose_match, tli_overlap,
     load_custom_gestures, save_custom_gestures, pyautogui_key_combo, display_key_combo,
+    WindowsShortcutCapture,
 )
 from voice_pc_commands import match_pc_command, aliases_for_help
 from voice_assistant_commands import live_answer, file_query
@@ -1539,6 +1540,7 @@ class SpatialDesktop(QWidget):
         self.custom_gesture_rings = {}
         self.custom_gesture_dropdown = None  # row index whose action list is open
         self.custom_gesture_key_capture = None  # gesture row awaiting a physical keyboard shortcut
+        self._native_shortcut_capture = None
         self.custom_gesture_triggers = {"left": HoldTrigger(), "right": HoldTrigger(), "overlap": HoldTrigger()}
         self.custom_gesture_live = {}
         self.cursor_smoothing = settings["cursor_smoothing"]
@@ -1854,6 +1856,9 @@ class SpatialDesktop(QWidget):
         self.timer = QTimer(self)
         self.timer.timeout.connect(self.update_scene)
         self.timer.start(50)
+        self.custom_key_capture_poll_timer = QTimer(self)
+        self.custom_key_capture_poll_timer.setInterval(20)
+        self.custom_key_capture_poll_timer.timeout.connect(self._poll_custom_key_capture)
         QTimer.singleShot(1200, self._maybe_start_hand_onboarding)
         QTimer.singleShot(2400, self.speak_startup_greeting)
 
@@ -2325,7 +2330,10 @@ class SpatialDesktop(QWidget):
         self.hub_visible = visible
         if not visible:
             self.custom_gesture_dropdown = None
-            self.custom_gesture_key_capture = None
+            if self.custom_gesture_key_capture is not None:
+                self._cancel_custom_gesture_key_capture("Shortcut capture cancelled because the menu closed.")
+            else:
+                self._stop_native_custom_key_capture()
             # The search launcher is a companion to the glass menu. Never leave it
             # floating over the desktop after a gesture closes the glass menu.
             search_dialog = getattr(self, "search_dialog", None)
@@ -5667,10 +5675,16 @@ class SpatialDesktop(QWidget):
 
     def _custom_gesture_layout(self, cx, cy, scale):
         """Single source of truth for Gestures-page geometry (drawing and hit-testing)."""
-        # Positioned in the shared left Settings column, starting below the tab strip
-        # (the page layout reserves 394 logical units for this block).
+        # The editor controls above the list stay in the left settings column.
+        # Gesture rows alone span both columns, using the full width beneath the
+        # sliders so action labels have room and the list fills the panel.
         top = self._settings_layout("gestures")["top"]
         L, W = self.SETTINGS_LEFT_X, self.SETTINGS_COLUMN_W
+        list_width = self.SETTINGS_RIGHT_X + self.SETTINGS_COLUMN_W - L
+        capture_x = L + list_width - 74.0
+        delete_x = L + list_width - 23.0
+        action_x = L + 146.0
+        action_width = capture_x - action_x - 2.0
 
         def r(x, y, w, h):
             return QRectF(cx+x*scale, cy+(top+y)*scale, w*scale, h*scale)
@@ -5678,12 +5692,13 @@ class SpatialDesktop(QWidget):
         for index in range(CUSTOM_GESTURE_MAX):
             y = 156 + index*40
             rows.append({
-                "row": r(L, y, W, 38),
+                "row": r(L, y, list_width, 38),
                 "side": r(L+2, y+3, 40, 32),
                 "timer": r(L+44, y+3, 42, 32),
                 "label": r(L+88, y+3, 56, 32),
-                "action": r(L+146, y+3, 128, 32),
-                "delete": r(L+277, y+3, 20, 32),
+                "action": r(action_x, y+3, action_width, 32),
+                "capture": r(capture_x, y+3, 48, 32),
+                "delete": r(delete_x, y+3, 20, 32),
             })
         half = (W-8)*0.5
         return {
@@ -5780,9 +5795,7 @@ class SpatialDesktop(QWidget):
         if action == "custom_key":
             combo = str(gesture.get("key_combo") or "").strip()
             if not combo:
-                self.custom_gesture_key_capture = index
-                self.custom_gesture_message = "Press the keyboard shortcut to assign it to this gesture."
-                self.setFocus()
+                self._start_custom_gesture_key_capture(index)
                 return
             if pyautogui is None:
                 self.custom_gesture_message = "Keyboard shortcut unavailable: pyautogui is not installed."
@@ -5925,6 +5938,13 @@ class SpatialDesktop(QWidget):
             self.custom_gesture_recording = None
             self.custom_gesture_message = "Recording cancelled."
             return
+        if self.custom_gesture_key_capture is not None:
+            active_index = self.custom_gesture_key_capture
+            active_key_rect = (layout["rows"][active_index]["capture"]
+                               if 0 <= active_index < len(layout["rows"]) else None)
+            if active_key_rect is None or not active_key_rect.contains(point):
+                self._cancel_custom_gesture_key_capture("Shortcut capture cancelled. Click KEY to try again.")
+                return
         if layout["record_left"].contains(point):
             self._start_custom_gesture_recording("left", now); return
         if layout["record_right"].contains(point):
@@ -5933,7 +5953,12 @@ class SpatialDesktop(QWidget):
             if not row["row"].contains(point):
                 continue
             gesture = self.custom_gestures[index]
+            if row["capture"].contains(point):
+                self._start_custom_gesture_key_capture(index)
+                return
             if row["delete"].contains(point):
+                if self.custom_gesture_key_capture is not None:
+                    self._cancel_custom_gesture_key_capture()
                 self.custom_gestures.pop(index)
                 self._reset_custom_gesture_triggers()
                 self.custom_gesture_message = f"Deleted {gesture['label']}."
@@ -5947,19 +5972,9 @@ class SpatialDesktop(QWidget):
                 gesture["side"] = order[(order.index(gesture.get("side", "either"))+1) % 3]
                 self._reset_custom_gesture_triggers()
             elif row["action"].contains(point):
-                # Once CUSTOM KEY is selected, tapping its action field again is a
-                # direct, visible way to assign or replace the shortcut.
-                if gesture.get("action") == "custom_key":
-                    self.custom_gesture_key_capture = index
-                    self.custom_gesture_message = (
-                        f"Set shortcut for {gesture.get('label', 'gesture')}: "
-                        "press the key combination now (Ctrl/Alt/Shift + key). Esc cancels."
-                    )
-                    self.setFocus(Qt.OtherFocusReason)
-                    self.activateWindow()
-                    self.update()
-                else:
-                    self.custom_gesture_dropdown = index
+                # The action selector always opens the action list. Shortcut capture is
+                # assigned explicitly using the adjacent KEY button.
+                self.custom_gesture_dropdown = index
                 return
             else:
                 return
@@ -6001,14 +6016,13 @@ class SpatialDesktop(QWidget):
                 gesture = self.custom_gestures[index]
                 gesture["action"] = action_id
                 if action_id == "custom_key":
-                    self.custom_gesture_key_capture = index
-                    self.custom_gesture_message = ("CUSTOM KEY selected. Press any keyboard shortcut "
-                                                   "(Ctrl, Alt, Shift and/or a key). Esc cancels capture. "
-                                                   "Tap this action field again to change it later.")
-                    self.setFocus(Qt.OtherFocusReason)
-                    self.activateWindow()
-                else:
                     self.custom_gesture_key_capture = None
+                    self.custom_gesture_message = (
+                        "CUSTOM KEY selected. Click KEY on this row to capture a shortcut; "
+                        "Windows Win+Tab is supported. Esc cancels capture.")
+                else:
+                    if self.custom_gesture_key_capture is not None:
+                        self._cancel_custom_gesture_key_capture()
                     self.custom_gesture_message = (f"{gesture['label']} → "
                                                    f"{CUSTOM_GESTURE_ACTION_LABELS.get(action_id, action_id)}")
                 self._save_custom_gestures_now()
@@ -6076,7 +6090,7 @@ class SpatialDesktop(QWidget):
 
         painter.setPen(QColor(195, 235, 242))
         self._draw_fitted_button_label(painter, layout["intro"],
-                                       "Record a hand pose, then pick its action from the ▾ list.\n"
+                                       "Use ▾ to choose an action; click KEY to capture a shortcut.\n"
                                        "Hold the pose for the hold time to trigger it.",
                                        base_size=max(6, int(8*scale)), min_size=6,
                                        weight=QFont.Normal, inset=2)
@@ -6174,6 +6188,17 @@ class SpatialDesktop(QWidget):
             painter.setFont(font(9))
             painter.drawText(QRectF(row["action"].right()-24*scale, row["action"].top(), 20*scale,
                                     row["action"].height()), Qt.AlignCenter, "▴" if is_open else "▾")
+
+            capturing = self.custom_gesture_key_capture == index
+            painter.setBrush(QBrush(QColor(145, 92, 24, 245) if capturing else
+                                    QColor(24, 89, 92, 235) if action == "custom_key" else
+                                    QColor(10, 47, 67, 225)))
+            painter.setPen(QPen(QColor(255, 224, 145, 245) if capturing else
+                                QColor(175, 250, 255, 190), 1.0*scale))
+            painter.drawRoundedRect(row["capture"], 7*scale, 7*scale)
+            painter.setPen(QColor(255, 248, 222) if capturing else QColor(225, 250, 255))
+            self._draw_fitted_button_label(painter, row["capture"], "PRESS" if capturing else "KEY",
+                                           base_size=8, min_size=6, inset=2*scale)
 
             painter.setBrush(QBrush(QColor(120, 30, 38, 230)))
             painter.setPen(QPen(QColor(255, 150, 150, 200), 1.0*scale))
@@ -9023,6 +9048,8 @@ class SpatialDesktop(QWidget):
         self._request_scene_repaint(now)
 
     def closeEvent(self, event):
+        self._stop_native_custom_key_capture()
+        self.custom_gesture_key_capture = None
         if getattr(self, "hand_calibration_window", None) is not None:
             self._cancel_hand_onboarding(announce=False)
         if getattr(self, "tli_calibration_window", None) is not None:
@@ -9062,6 +9089,105 @@ class SpatialDesktop(QWidget):
     def mouseMoveEvent(self, event):
         # This overlay is gesture-controlled; physical mouse movement has no action.
         event.accept()
+
+    def _stop_native_custom_key_capture(self):
+        timer = getattr(self, "custom_key_capture_poll_timer", None)
+        if timer is not None:
+            timer.stop()
+        capture = getattr(self, "_native_shortcut_capture", None)
+        self._native_shortcut_capture = None
+        if capture is not None:
+            try:
+                capture.stop()
+            except Exception:
+                pass
+
+    def _cancel_custom_gesture_key_capture(self, message=None):
+        self._stop_native_custom_key_capture()
+        self.custom_gesture_key_capture = None
+        if message:
+            self.custom_gesture_message = message
+        self.update()
+
+    def _start_custom_gesture_key_capture(self, index):
+        if not (0 <= index < len(self.custom_gestures)):
+            return
+        self._stop_native_custom_key_capture()
+        gesture = self.custom_gestures[index]
+        gesture["action"] = "custom_key"
+        self.custom_gesture_key_capture = index
+        self.custom_gesture_dropdown = None
+        self._save_custom_gestures_now()
+        self.custom_gesture_message = (
+            f"Capturing shortcut for {gesture.get('label', 'gesture')}: press the key combo now. "
+            "On Windows, Win+Tab is captured without opening the app switcher. Esc cancels.")
+        self.setFocus(Qt.OtherFocusReason)
+        self.activateWindow()
+        if sys.platform.startswith("win"):
+            capture = WindowsShortcutCapture()
+            if capture.start():
+                self._native_shortcut_capture = capture
+                timer = getattr(self, "custom_key_capture_poll_timer", None)
+                if timer is not None:
+                    timer.start()
+            else:
+                self.custom_gesture_message = (
+                    "Native keyboard capture could not start. Use Ctrl/Alt/Shift shortcuts; "
+                    "Windows may intercept Win+Tab.")
+        self.update()
+
+    def _save_captured_custom_key_combo(self, index, combo):
+        if not (0 <= index < len(self.custom_gestures)):
+            self._cancel_custom_gesture_key_capture("Shortcut capture cancelled: gesture no longer exists.")
+            return
+        parts = []
+        for raw in str(combo or "").split("+"):
+            token = raw.strip()
+            if not token:
+                continue
+            if token.lower() in ("meta", "win", "windows", "super", "super_l", "super_r",
+                                 "command", "cmd", "command_l", "command_r"):
+                parts.append("META")
+            else:
+                parts.append(token.upper())
+        if not parts:
+            self._cancel_custom_gesture_key_capture("No shortcut captured. Click KEY to try again.")
+            return
+        gesture = self.custom_gestures[index]
+        gesture["action"] = "custom_key"
+        gesture["key_combo"] = "+".join(parts)
+        self._stop_native_custom_key_capture()
+        self.custom_gesture_key_capture = None
+        self._save_custom_gestures_now()
+        self.custom_gesture_message = (f"Saved shortcut {display_key_combo(gesture['key_combo'])} "
+                                       f"for {gesture.get('label', 'gesture')}.")
+        self.status = self.custom_gesture_message
+        self.update()
+
+    def _poll_custom_key_capture(self):
+        capture = getattr(self, "_native_shortcut_capture", None)
+        if capture is None:
+            self.custom_key_capture_poll_timer.stop()
+            return
+        result, value = capture.poll_result()
+        if result == "pending":
+            return
+        index = self.custom_gesture_key_capture
+        self._stop_native_custom_key_capture()
+        if result == "combo":
+            self._save_captured_custom_key_combo(index, value)
+        elif result == "cancel":
+            self.custom_gesture_key_capture = None
+            self.custom_gesture_message = "Custom key capture cancelled. Click KEY to try again."
+            self.update()
+        else:
+            # Keep the ordinary Qt event-based capture available if the native hook
+            # cannot be installed. A warning makes the Win+Tab limitation explicit.
+            self.custom_gesture_key_capture = index
+            self.custom_gesture_message = (
+                f"Native key capture unavailable ({value}). Ordinary shortcuts can still be captured; "
+                "Windows may intercept Win+Tab. Press Esc to cancel.")
+            self.update()
 
     def _custom_key_name_from_event(self, event):
         """Convert a Qt key event to a pyautogui-compatible shortcut token."""
@@ -9125,31 +9251,23 @@ class SpatialDesktop(QWidget):
     def keyPressEvent(self, event):
         capture_index = self.custom_gesture_key_capture
         if capture_index is not None:
-            if event.key() == Qt.Key_Escape and not event.modifiers():
-                self.custom_gesture_key_capture = None
-                self.custom_gesture_message = "Custom key capture cancelled."
+            native_capture = getattr(self, "_native_shortcut_capture", None)
+            if native_capture is not None and native_capture.is_active():
+                # The native Windows hook suppresses and records keyboard events
+                # globally, including system chords such as Win+Tab.
                 event.accept()
-                self.update()
+                return
+            if event.key() == Qt.Key_Escape and not event.modifiers():
+                self._cancel_custom_gesture_key_capture("Custom key capture cancelled. Click KEY to try again.")
+                event.accept()
                 return
             if event.isAutoRepeat():
                 event.accept()
                 return
             combo = self._custom_key_name_from_event(event)
             if combo:
-                if 0 <= capture_index < len(self.custom_gestures):
-                    gesture = self.custom_gestures[capture_index]
-                    gesture["action"] = "custom_key"
-                    gesture["key_combo"] = "+".join(
-                        "META" if part.lower() in ("meta", "win", "super", "command", "cmd")
-                        else part.upper() for part in combo.split("+")
-                    )
-                    self._save_custom_gestures_now()
-                    shown_combo = display_key_combo(gesture["key_combo"])
-                    self.custom_gesture_message = (f"Saved shortcut {shown_combo} for "
-                                                   f"{gesture.get('label', 'gesture')}.")
-                self.custom_gesture_key_capture = None
+                self._save_captured_custom_key_combo(capture_index, combo)
                 event.accept()
-                self.update()
                 return
             event.accept()
             return
@@ -10388,7 +10506,8 @@ class SpatialDesktop(QWidget):
                     layout = self._custom_gesture_layout(pcx, pcy, pscale)
                     press_rects.extend([layout["record_left"], layout["record_right"]])
                     for row in layout["rows"]:
-                        press_rects.extend([row["row"], row["side"], row["timer"], row["label"], row["action"], row["delete"]])
+                        press_rects.extend([row["row"], row["side"], row["timer"], row["label"],
+                                            row["action"], row["capture"], row["delete"]])
             pressed_rect = next((r for r in press_rects if r.contains(pressed_point)), None)
             if pressed_rect is not None:
                 fade_alpha = int(235 * (1.0 - pressed_age/0.30))

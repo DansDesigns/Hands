@@ -18,6 +18,7 @@ from __future__ import annotations
 import json
 import math
 import os
+import threading
 from pathlib import Path
 
 # Camera frames are 640x360; MediaPipe x/y are normalised per axis and z uses the
@@ -93,6 +94,253 @@ def pyautogui_key_combo(combo, platform=None):
     meta_key = "command" if platform == "darwin" else "win"
     return [meta_key if part == "meta" else part for part in _key_combo_parts(combo)]
 
+
+
+def _windows_vk_token(vk_code):
+    """Return a pyautogui-compatible token for a Windows virtual-key code."""
+    vk = int(vk_code)
+    if 0x41 <= vk <= 0x5A:
+        return chr(vk).lower()
+    if 0x30 <= vk <= 0x39:
+        return chr(vk)
+    if 0x70 <= vk <= 0x87:
+        return "f" + str(vk - 0x70 + 1)
+    names = {
+        0x08: "backspace", 0x09: "tab", 0x0D: "enter", 0x1B: "esc",
+        0x20: "space", 0x21: "pageup", 0x22: "pagedown", 0x23: "end",
+        0x24: "home", 0x25: "left", 0x26: "up", 0x27: "right", 0x28: "down",
+        0x2D: "insert", 0x2E: "delete", 0x2C: "printscreen", 0x13: "pause",
+        0x14: "capslock", 0x90: "numlock", 0x91: "scrolllock",
+        0x60: "num0", 0x61: "num1", 0x62: "num2", 0x63: "num3",
+        0x64: "num4", 0x65: "num5", 0x66: "num6", 0x67: "num7",
+        0x68: "num8", 0x69: "num9", 0x6A: "multiply", 0x6B: "add",
+        0x6D: "subtract", 0x6E: "decimal", 0x6F: "divide",
+        0xBA: "semicolon", 0xBB: "=", 0xBC: "comma", 0xBD: "-",
+        0xBE: "period", 0xBF: "slash", 0xC0: "`", 0xDB: "[",
+        0xDC: "backslash", 0xDD: "]", 0xDE: "quote", 0x6C: "separator",
+    }
+    return names.get(vk)
+
+
+def windows_shortcut_from_vk(vk_code, pressed_keys):
+    """Build a portable shortcut token from a Windows VK and the currently held keys.
+
+    Useful independently of the native hook, so shortcut translation is testable
+    without requiring Windows. The return value is lowercase (e.g. ``meta+tab``).
+    """
+    pressed = {int(key) for key in pressed_keys}
+    modifiers = []
+    if pressed.intersection({0x11, 0xA2, 0xA3}):
+        modifiers.append("ctrl")
+    if pressed.intersection({0x12, 0xA4, 0xA5}):
+        modifiers.append("alt")
+    if pressed.intersection({0x10, 0xA0, 0xA1}):
+        modifiers.append("shift")
+    if pressed.intersection({0x5B, 0x5C}):
+        modifiers.append("meta")
+    token = _windows_vk_token(vk_code)
+    if token is None:
+        return None
+    modifiers.append(token)
+    return "+".join(modifiers)
+
+
+class WindowsShortcutCapture:
+    """Temporarily capture and suppress a system-wide Windows shortcut.
+
+    A low-level keyboard hook is necessary for system-reserved combinations such as
+    Win+Tab: Windows normally handles that chord before a Qt keyPressEvent reaches the
+    application. Capture completes only after every held key is released, preventing a
+    partially captured system shortcut from leaking through to the desktop.
+    """
+
+    _UNSET = object()
+    _MODIFIER_VKS = {0x10, 0x11, 0x12, 0x5B, 0x5C, 0xA0, 0xA1, 0xA2, 0xA3, 0xA4, 0xA5}
+
+    def __init__(self):
+        self._lock = threading.RLock()
+        self._active = False
+        self._stop_requested = False
+        self._pressed = set()
+        self._pending_result = None
+        self._result = self._UNSET
+        self._error = None
+        self._thread_id = 0
+        self._hook_handle = None
+        self._thread = None
+        self._hook_ready = threading.Event()
+
+    def start(self):
+        if os.name != "nt":
+            return False
+        with self._lock:
+            self._active = True
+            self._stop_requested = False
+            self._pressed.clear()
+            self._pending_result = None
+            self._result = self._UNSET
+            self._error = None
+            self._thread_id = 0
+            self._hook_handle = None
+            self._hook_ready.clear()
+        self._thread = threading.Thread(target=self._run_hook, name="SpatialDesktopKeyCapture", daemon=True)
+        self._thread.start()
+        return True
+
+    def is_active(self):
+        with self._lock:
+            return self._active and self._error is None
+
+    def poll_result(self):
+        """Return (pending|combo|cancel|error, value) without blocking the UI thread."""
+        with self._lock:
+            if self._error is not None:
+                error = self._error
+                self._error = None
+                return "error", error
+            if self._result is not self._UNSET:
+                result = self._result
+                self._result = self._UNSET
+                return result
+        return "pending", None
+
+    def stop(self):
+        import sys
+        with self._lock:
+            self._active = False
+            self._stop_requested = True
+            thread_id = self._thread_id
+        if thread_id:
+            try:
+                import ctypes
+                ctypes.windll.user32.PostThreadMessageW(thread_id, 0x0012, 0, 0)  # WM_QUIT
+            except Exception:
+                pass
+        thread = self._thread
+        if thread is not None and thread is not threading.current_thread():
+            thread.join(timeout=0.25)
+        self._thread = None
+
+    def _run_hook(self):
+        import ctypes
+        from ctypes import wintypes
+
+        class KBDLLHOOKSTRUCT(ctypes.Structure):
+            _fields_ = [("vkCode", wintypes.DWORD), ("scanCode", wintypes.DWORD),
+                        ("flags", wintypes.DWORD), ("time", wintypes.DWORD),
+                        ("dwExtraInfo", ctypes.c_size_t)]
+
+        hook_proc_type = ctypes.WINFUNCTYPE(ctypes.c_ssize_t, ctypes.c_int,
+                                             wintypes.WPARAM, wintypes.LPARAM)
+        user32 = ctypes.windll.user32
+        kernel32 = ctypes.windll.kernel32
+        hook_handle = None
+        # Declare pointer-sized signatures explicitly; ctypes' default c_int return
+        # would truncate HMODULE/HHOOK values in a 64-bit Windows process.
+        kernel32.GetModuleHandleW.argtypes = (wintypes.LPCWSTR,)
+        kernel32.GetModuleHandleW.restype = wintypes.HMODULE
+        kernel32.GetCurrentThreadId.restype = wintypes.DWORD
+        user32.PeekMessageW.argtypes = (ctypes.POINTER(wintypes.MSG), wintypes.HWND,
+                                        wintypes.UINT, wintypes.UINT, wintypes.UINT)
+        user32.PeekMessageW.restype = wintypes.BOOL
+        user32.PostThreadMessageW.argtypes = (wintypes.DWORD, wintypes.UINT,
+                                              wintypes.WPARAM, wintypes.LPARAM)
+        user32.PostThreadMessageW.restype = wintypes.BOOL
+        user32.CallNextHookEx.argtypes = (ctypes.c_void_p, ctypes.c_int,
+                                          wintypes.WPARAM, wintypes.LPARAM)
+        user32.CallNextHookEx.restype = ctypes.c_ssize_t
+        user32.UnhookWindowsHookEx.argtypes = (ctypes.c_void_p,)
+        user32.UnhookWindowsHookEx.restype = wintypes.BOOL
+        user32.TranslateMessage.argtypes = (ctypes.POINTER(wintypes.MSG),)
+        user32.TranslateMessage.restype = wintypes.BOOL
+        user32.DispatchMessageW.argtypes = (ctypes.POINTER(wintypes.MSG),)
+        user32.DispatchMessageW.restype = ctypes.c_ssize_t
+
+        try:
+            # Force creation of the worker's Win32 message queue before publishing its ID.
+            msg = wintypes.MSG()
+            user32.PeekMessageW(ctypes.byref(msg), None, 0, 0, 0)
+            thread_id = int(kernel32.GetCurrentThreadId())
+            with self._lock:
+                self._thread_id = thread_id
+                stop_requested = self._stop_requested
+            if stop_requested:
+                return
+
+            def callback(n_code, w_param, l_param):
+                if n_code >= 0 and int(w_param) in (0x0100, 0x0101, 0x0104, 0x0105):
+                    data = ctypes.cast(l_param, ctypes.POINTER(KBDLLHOOKSTRUCT)).contents
+                    vk = int(data.vkCode)
+                    is_down = int(w_param) in (0x0100, 0x0104)
+                    should_swallow = False
+                    post_quit = False
+                    with self._lock:
+                        if self._active:
+                            should_swallow = True
+                            if is_down:
+                                self._pressed.add(vk)
+                                if self._pending_result is None and vk not in self._MODIFIER_VKS:
+                                    held_modifiers = windows_shortcut_from_vk(vk, self._pressed)
+                                    modifier_only_escape = (vk == 0x1B and
+                                        not self._pressed.intersection(self._MODIFIER_VKS))
+                                    if modifier_only_escape:
+                                        self._pending_result = ("cancel", None)
+                                    elif held_modifiers:
+                                        self._pending_result = ("combo", held_modifiers)
+                            else:
+                                self._pressed.discard(vk)
+                            if self._pending_result is not None and not self._pressed:
+                                self._result = self._pending_result
+                                self._pending_result = None
+                                self._active = False
+                                post_quit = True
+                        else:
+                            should_swallow = False
+                    if post_quit:
+                        try:
+                            user32.PostThreadMessageW(thread_id, 0x0012, 0, 0)
+                        except Exception:
+                            pass
+                    if should_swallow:
+                        return 1
+                return user32.CallNextHookEx(hook_handle, n_code, w_param, l_param)
+
+            callback_ref = hook_proc_type(callback)
+            hmodule = kernel32.GetModuleHandleW(None)
+            user32.SetWindowsHookExW.argtypes = (ctypes.c_int, hook_proc_type, wintypes.HINSTANCE, wintypes.DWORD)
+            user32.SetWindowsHookExW.restype = ctypes.c_void_p
+            hook_handle = user32.SetWindowsHookExW(13, callback_ref, hmodule, 0)  # WH_KEYBOARD_LL
+            if not hook_handle:
+                raise ctypes.WinError()
+            with self._lock:
+                self._hook_handle = hook_handle
+            self._hook_ready.set()
+
+            user32.GetMessageW.argtypes = (ctypes.POINTER(wintypes.MSG), wintypes.HWND, wintypes.UINT, wintypes.UINT)
+            user32.GetMessageW.restype = ctypes.c_int
+            while True:
+                result = user32.GetMessageW(ctypes.byref(msg), None, 0, 0)
+                if result <= 0:
+                    break
+                user32.TranslateMessage(ctypes.byref(msg))
+                user32.DispatchMessageW(ctypes.byref(msg))
+        except Exception as exc:
+            with self._lock:
+                if self._active:
+                    self._active = False
+                    self._error = str(exc)
+            self._hook_ready.set()
+        finally:
+            if hook_handle:
+                try:
+                    user32.UnhookWindowsHookEx(hook_handle)
+                except Exception:
+                    pass
+            with self._lock:
+                self._hook_handle = None
+                self._thread_id = 0
+                self._active = False
+            self._hook_ready.set()
 
 def display_key_combo(combo, platform=None):
     """Show META using the conventional name for the current operating system."""
