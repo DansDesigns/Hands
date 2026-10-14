@@ -2690,13 +2690,57 @@ class SpatialDesktop(QWidget):
         return None
 
     def _find_native_window_at(self, point, prefer_smallest=False):
-        """Find a native window under a point, ignoring our transparent overlay.
+        """Find a native window under a point, ignoring the Spatial Desktop overlay.
 
-        `prefer_smallest` is used by the two-fist drag clutch to avoid selecting a
-        screen-sized host/desktop surface when a real application window is also
-        under the TLI. Normal hit tests preserve the existing topmost-window behavior.
+        Windows uses Win32 enumeration. Linux/X11 uses wmctrl geometry and excludes
+        windows owned by this process so the transparent tracking overlay is not chosen.
         """
-        if not sys.platform.startswith("win") or point is None:
+        if point is None:
+            return None
+        if sys.platform.startswith("linux"):
+            try:
+                global_point = self.mapToGlobal(QPoint(round(point.x()), round(point.y())))
+                px, py = int(global_point.x()), int(global_point.y())
+                own_pid = os.getpid()
+                try:
+                    listing = subprocess.check_output(
+                        ["wmctrl", "-lG"], text=True, stderr=subprocess.DEVNULL, timeout=0.4)
+                except Exception:
+                    return None
+                matches = []
+                for line in listing.splitlines():
+                    fields = line.split(None, 7)
+                    if len(fields) < 6:
+                        continue
+                    try:
+                        wid = int(fields[0], 16)
+                        x, y, width, height = map(int, fields[2:6])
+                    except (ValueError, IndexError):
+                        continue
+                    try:
+                        if wid == int(self.winId()):
+                            continue
+                    except Exception:
+                        pass
+                    if width <= 1 or height <= 1 or not (x <= px < x + width and y <= py < y + height):
+                        continue
+                    try:
+                        pid_text = subprocess.check_output(
+                            ["xdotool", "getwindowpid", hex(wid)], text=True,
+                            stderr=subprocess.DEVNULL, timeout=0.25).strip()
+                        if pid_text and int(pid_text) == own_pid:
+                            continue
+                    except Exception:
+                        pass
+                    matches.append((wid, width * height))
+                if not matches:
+                    return None
+                # wmctrl does not consistently expose stacking order across WMs;
+                # choosing the smallest containing client avoids desktop-sized surfaces.
+                return min(matches, key=lambda item: item[1])[0]
+            except Exception:
+                return None
+        if not sys.platform.startswith("win"):
             return None
         try:
             user32 = ctypes.windll.user32
@@ -2748,7 +2792,22 @@ class SpatialDesktop(QWidget):
             return None
 
     def _native_window_rect(self, hwnd):
-        if not sys.platform.startswith("win") or not hwnd:
+        if not hwnd:
+            return None
+        if sys.platform.startswith("linux"):
+            try:
+                wid = hex(int(hwnd))
+                output = subprocess.check_output(
+                    ["wmctrl", "-lG"], text=True, stderr=subprocess.DEVNULL, timeout=0.4)
+                for line in output.splitlines():
+                    fields = line.split(None, 7)
+                    if len(fields) >= 6 and int(fields[0], 16) == int(hwnd):
+                        x, y, width, height = map(int, fields[2:6])
+                        return (x, y, x + width, y + height)
+            except Exception:
+                return None
+            return None
+        if not sys.platform.startswith("win"):
             return None
         try:
             rect = wintypes.RECT()
@@ -2758,9 +2817,43 @@ class SpatialDesktop(QWidget):
             pass
         return None
 
+    def _prepare_native_window_drag(self, hwnd):
+        """Prepare Linux/X11 clients for direct manipulation in tiling WMs such as Qtile."""
+        if not hwnd or not sys.platform.startswith("linux"):
+            return
+        try:
+            wid = hex(int(hwnd))
+            subprocess.run(["wmctrl", "-ia", wid], check=False, timeout=0.3,
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        except Exception:
+            pass
+        # A tiled client cannot be freely positioned with EWMH moveresize requests.
+        # Qtile's enable_floating is idempotent, unlike toggle_floating, so existing
+        # floating windows remain floating. Other window managers simply skip this.
+        try:
+            subprocess.run(["qtile", "cmd-obj", "-o", "window", "-f", "enable_floating"],
+                           check=False, timeout=0.45, stdout=subprocess.DEVNULL,
+                           stderr=subprocess.DEVNULL)
+        except Exception:
+            pass
+
     def _move_native_window(self, hwnd, left, top):
         """Move a native window by its outer rect; no title-bar mouse-down is needed."""
-        if not sys.platform.startswith("win") or not hwnd:
+        if not hwnd:
+            return False
+        if sys.platform.startswith("linux"):
+            # wmctrl uses the EWMH moveresize request, which works with X11 WMs such
+            # as Qtile. -1 keeps the current size; only the top-left position changes.
+            try:
+                subprocess.run(["wmctrl", "-ir", hex(int(hwnd)), "-e",
+                                f"0,{int(round(left))},{int(round(top))},-1,-1"],
+                               check=True, timeout=0.35, stdout=subprocess.DEVNULL,
+                               stderr=subprocess.DEVNULL)
+                return True
+            except Exception as exc:
+                self.status = f"Linux window move failed (install wmctrl / use X11): {exc}"
+                return False
+        if not sys.platform.startswith("win"):
             return False
         try:
             user32 = ctypes.windll.user32
@@ -2911,6 +3004,8 @@ class SpatialDesktop(QWidget):
             self.status = "Scroll action active — keep fist closed; open hand to stop"
             return
 
+        if mode == "drag_window" and sys.platform.startswith("linux"):
+            self._prepare_native_window_drag(hwnd)
         rect = self._native_window_rect(hwnd) if hwnd else None
         if rect is None:
             self.fist_action[side] = None
@@ -7983,9 +8078,9 @@ class SpatialDesktop(QWidget):
                 self.gesture_owner = side
                 mode = active.get("mode")
                 other_side = "left" if side == "right" else "right"
-                if (mode == "drag_window" and other_side in poses and
-                        not poses[other_side].get("fist", False)):
-                    # Two-fist clutch releases as soon as either tracked hand opens.
+                if ((mode == "drag_window" or active.get("two_hand_clutch")) and
+                        other_side in poses and not poses[other_side].get("fist", False)):
+                    # Two-hand actions release as soon as either tracked hand opens.
                     if active.get("modifier_drag"):
                         self._clear_modifier_click(side)
                     self.active_action[side] = None
@@ -8548,18 +8643,31 @@ class SpatialDesktop(QWidget):
                         if (self.menu_open and self.hub_visible and
                                 self._canvas_menu_panel_contains(right_start)):
                             self.fist_target_window["right"] = None
+                            clutch_mode = "scroll_window" if self.scroll_mode_enabled else "drag_window"
                             self._arm_fist_hold_action(
                                 "right", cursor, now, automatic_motion=False,
-                                force_mode="drag_window")
-                            self.status = "Glass menu drag active — move the right fist; open to release"
+                                force_mode=clutch_mode)
+                            active_clutch = self.active_action.get("right")
+                            if active_clutch is not None:
+                                active_clutch["two_hand_clutch"] = True
+                            if clutch_mode == "scroll_window":
+                                self.status = "Two-fist content scroll active — move the right fist; open either hand to stop"
+                            else:
+                                self.status = "Glass menu drag active — move the right fist; open to release"
                         else:
                             self.fist_target_window["right"] = self._find_native_window_at(right_start)
                             # If the topmost hit is a screen-sized host surface, prefer
                             # the smallest visible application window containing the TLI.
                             self.fist_target_window["right"] = self._find_native_window_at(
                                 right_start, prefer_smallest=True) or self.fist_target_window["right"]
+                            clutch_mode = "scroll_window" if self.scroll_mode_enabled else "drag_window"
                             self._arm_fist_hold_action("right", cursor, now, automatic_motion=False,
-                                                       force_mode="drag_window")
+                                                       force_mode=clutch_mode)
+                            active_clutch = self.active_action.get("right")
+                            if active_clutch is not None:
+                                active_clutch["two_hand_clutch"] = True
+                            if clutch_mode == "scroll_window":
+                                self.status = "Two-fist content scroll active — move the right fist; open either hand to stop"
                         self.fist_shake_samples["right"] = []
                 if self.fist_hold_armed[side]:
                     # Direct manipulation freezes only the action choice, not pointer tracking.

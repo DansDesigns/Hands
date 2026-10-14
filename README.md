@@ -71,7 +71,7 @@ Calibration stores the thumb/index midpoint relative to the wrist-to-middle-MCP 
 ## Hand-interaction baseline carried forward from v25
 
 - **Close the Pinch Menu outside:** after releasing the pinch that opened the Pinch Menu, make a fresh fist/grip or pinch while the TLI is outside the popup bounds. The popup closes, and that gesture is consumed so it cannot click or drag through to the desktop. Gestures inside the popup continue to select options.
-- **Movement-driven right-fist scrolling:** a RIGHT-only fist starts smooth vertical scrolling as soon as deliberate movement is detected over page content; there is no fist timer circle or 0.8-second wait. The LEFT fist remains the modifier, and two-fist window drag stays separate.
+- **Movement-driven right-fist scrolling:** a RIGHT-only fist starts smooth vertical scrolling as soon as deliberate movement is detected over page content; there is no fist timer circle or 0.8-second wait. In `SCROLL WINDOW` mode, a two-fist clutch also scrolls the visible window content; opening either hand stops it. Outside that mode, two fists (hold one hand steady and move the other) grab and move the native window. Linux/X11 window moving uses `wmctrl`; install `wmctrl` and `xdotool` for native window targeting and scrolling (for Debian/Ubuntu: `sudo apt install wmctrl xdotool`). Wayland compositors may restrict external window movement.
 - **Fist timer removed:** quick fist/open still clicks, but right-fist movement—not a completed countdown—starts scrolling. Opening the hand remains stable for 0.20 seconds to release active drag/scroll. Timed pinches require a continuous 0.8-second confirmation before the ring fills; a release before confirmation cancels the sequence.
 
 ## v43 UI and rendering fixes

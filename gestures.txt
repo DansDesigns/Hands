@@ -119,3 +119,5 @@ skeleton_line_thickness=1.50
 # Scroll uses native wheel input at the current tracked cursor so the active child control receives wheel events.
 # RIGHT-CLICK: hold the LEFT fist modifier, then quick RIGHT pinch/release to right-click; release modifier by opening LEFT hand.
 palm_attract_acceleration=0.33
+
+# TWO-FIST CLUTCH: in SCROLL WINDOW mode, hold both fists, keep the left hand steady and move the right fist to scroll the visible window content; opening either hand stops. In other modes, the same clutch moves the native window. Linux/X11 native window drag requires wmctrl; xdotool supports window targeting and wheel scrolling.
