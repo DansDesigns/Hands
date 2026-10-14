@@ -6137,13 +6137,18 @@ class SpatialDesktop(QWidget):
             self._report_hand_mesh_problem(renderer.error)
             return False
         # Overlay pixels; depth uses the same pixels-per-unit as x (MediaPipe z ~ x scale).
+        # First-person view: the hands are seen from the user's side, not the camera's,
+        # so depth is reversed (nearest the camera = farthest from the user). With the
+        # palm toward the camera the user sees the back of the virtual hand, as with
+        # their real hand.
         px_per_x = max(1.0, self.width()-1)/0.60*user_scale
         z0 = float(points[0][2]) if len(points[0]) > 2 else 0.0
         target = np.array([[joints[i].x(), joints[i].y(),
-                            ((float(points[i][2]) if len(points[i]) > 2 else 0.0)-z0)*px_per_x]
+                            -((float(points[i][2]) if len(points[i]) > 2 else 0.0)-z0)*px_per_x]
                            for i in range(21)], dtype=np.float64)
-        # The camera image is mirrored, so a physical right hand has left-hand geometry.
-        model_side = "right" if side == "left" else "left"
+        # The mirrored camera image plus the reversed depth restores true handedness:
+        # each physical hand uses its own model.
+        model_side = side if side in ("left", "right") else "right"
         result = renderer.render(model_side, target, (base.red(), base.green(), base.blue()))
         if result is None:
             self._report_hand_mesh_problem(renderer.error or "3D hand rendering failed")
@@ -6254,11 +6259,14 @@ class SpatialDesktop(QWidget):
         is composed in an offscreen layer, then drawn once with the hand opacity so
         overlapping parts do not double up in transparency.
         """
-        # Depth of each landmark relative to the wrist, in palm lengths (+ = farther).
+        # Depth of each landmark relative to the wrist, in palm lengths (+ = farther
+        # from the user). First-person view, as in the 3D style: MediaPipe z grows away
+        # from the camera, i.e. toward the user, so it is negated. With the palm toward
+        # the camera, curled fingers go behind the back of the hand.
         wx, wy, wz = self._landmark_xyz(points, 0)
         mx, my, mz = self._landmark_xyz(points, 9)
         palm_len = max(1e-4, math.sqrt((mx-wx)**2 + (my-wy)**2 + (mz-wz)**2))
-        depth = [(self._landmark_xyz(points, i)[2]-wz)/palm_len for i in range(21)]
+        depth = [-(self._landmark_xyz(points, i)[2]-wz)/palm_len for i in range(21)]
 
         def depth_size(i):  # nearer the camera looks slightly larger
             return min(1.3, max(0.75, 1.0-0.35*depth[i]))
@@ -6322,7 +6330,8 @@ class SpatialDesktop(QWidget):
         # always draw on top; landmark depth noise then can't make knuckles flicker.
         # Fingers only go behind the palm when clearly farther away (curled while the
         # back of the hand faces the camera).
-        parts = [("palm", None, sum(depth[i] for i in (0, 5, 9, 13, 17))/5.0 + 0.08)]
+        palm_z = sum(depth[i] for i in (0, 5, 9, 13, 17))/5.0 + 0.08
+        parts = [("palm", None, palm_z)]
         for name, chain, _r in self.HAND_FINGER_CHAINS:
             proximal = [(chain[0], chain[1])]
             distal = [(chain[1], chain[2]), (chain[2], chain[3])]
@@ -6389,6 +6398,28 @@ class SpatialDesktop(QWidget):
                     lp.setPen(Qt.NoPen)
                     lp.setBrush(QBrush(shade))
                     lp.drawPath(palm_shape)
+                    # Fingers curled away behind the hand (the back of a fist) still show
+                    # their knuckles as soft bumps along the top of the hand.
+                    for finger_name, chain, _r in self.HAND_FINGER_CHAINS:
+                        if finger_name == "thumb" or (depth[chain[0]]+depth[chain[1]])*0.5 <= palm_z:
+                            continue
+                        knuckle = joints[chain[0]]
+                        kr = radii[chain[0]]*0.95
+                        tone_k = depth_tone(chain[0])
+                        # Soft shadow on the side away from the light, then the lit bump.
+                        under = QPointF(knuckle.x()-light_x*kr*0.45, knuckle.y()-light_y*kr*0.45)
+                        dark = QRadialGradient(under, kr*1.2)
+                        dark.setColorAt(0.0, self._shade_colour(base, 0.70*tone_k, 150))
+                        dark.setColorAt(1.0, self._shade_colour(base, 0.80*tone_k, 0))
+                        lp.setBrush(QBrush(dark))
+                        lp.drawEllipse(under, kr*1.2, kr*1.2)
+                        lit = QPointF(knuckle.x()+light_x*kr*0.25, knuckle.y()+light_y*kr*0.25)
+                        bump = QRadialGradient(lit, kr*1.05)
+                        bump.setColorAt(0.0, self._shade_colour(base, 1.24*tone_k, 255))
+                        bump.setColorAt(0.55, self._shade_colour(base, 1.08*tone_k, 170))
+                        bump.setColorAt(1.0, self._shade_colour(base, 1.0*tone_k, 0))
+                        lp.setBrush(QBrush(bump))
+                        lp.drawEllipse(lit, kr*1.05, kr*1.05)
                     continue
                 # Finger part: one outline then one fill for the whole part, so joints
                 # inside a part stay seamless while overlaps with other parts keep an edge.
