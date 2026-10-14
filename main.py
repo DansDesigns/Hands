@@ -1481,12 +1481,12 @@ class SpatialDesktop(QWidget):
         self.setWindowTitle("Spatial Desktop")
         # Consistent tactile feedback for native buttons across settings and dialogs.
         self.setStyleSheet(self.styleSheet() + " QPushButton:pressed, QToolButton:pressed { background-color: rgba(75, 205, 235, 210); border: 2px solid #b9f5ff; padding-top: 2px; padding-left: 2px; }")
-        # Let X11/XLibre's window manager own the fullscreen overlay's stacking
-        # level. With override-redirect, an app opened later (notably osm-launcher,
-        # which is also WindowStaysOnTopHint) can stay above the hands indefinitely.
-        # A WM-managed, mouse-transparent, always-on-top Tool remains click-through
-        # while sharing the same topmost layer as native launchers.
         overlay_flags = Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint | Qt.Tool
+        # Keep the main fullscreen tracking overlay unmanaged by Qtile/XLibre.
+        # This stops Qtile from tiling, decorating, grouping, or otherwise handling
+        # Spatial Desktop as a normal client window. Other dialogs remain managed.
+        if sys.platform.startswith("linux"):
+            overlay_flags |= Qt.X11BypassWindowManagerHint
         self.setWindowFlags(overlay_flags)
         self.setAttribute(Qt.WA_TranslucentBackground, True)
         self.setAutoFillBackground(False)

@@ -3,13 +3,14 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 
 
-def test_main_overlay_is_window_manager_managed_and_always_on_top_on_linux():
+def test_main_overlay_bypasses_window_manager_on_linux():
     source = (ROOT / "main.py").read_text(encoding="utf-8")
     start = source.index("class SpatialDesktop(QWidget):")
     end = source.index("    def ", source.index("self.setWindowFlags(overlay_flags)", start))
     init = source[start:end]
     assert "overlay_flags = Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint | Qt.Tool" in init
-    assert "Qt.X11BypassWindowManagerHint" not in init
+    assert 'if sys.platform.startswith("linux"):' in init
+    assert "overlay_flags |= Qt.X11BypassWindowManagerHint" in init
 
 
 def test_native_stacking_reassertion_runs_without_dragging():
