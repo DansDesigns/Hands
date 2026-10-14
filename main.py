@@ -62,7 +62,7 @@ from custom_gestures import (
     ACTION_GROUPS as CUSTOM_GESTURE_ACTION_GROUPS,
     MAX_GESTURES as CUSTOM_GESTURE_MAX, INSTANT_HOLD_SECONDS as CUSTOM_GESTURE_INSTANT_HOLD, HoldTrigger, hand_features, mean_features, describe as describe_pose,
     builtin_conflict, pinch_ratio as custom_pinch_ratio, best_pose_match, tli_overlap,
-    load_custom_gestures, save_custom_gestures,
+    load_custom_gestures, save_custom_gestures, pyautogui_key_combo, display_key_combo,
 )
 from voice_pc_commands import match_pc_command, aliases_for_help
 from voice_assistant_commands import live_answer, file_query
@@ -5787,7 +5787,9 @@ class SpatialDesktop(QWidget):
             if pyautogui is None:
                 self.custom_gesture_message = "Keyboard shortcut unavailable: pyautogui is not installed."
                 return
-            keys = [part.strip().lower() for part in combo.split("+") if part.strip()]
+            # Saved META is portable across Windows (Win), Linux (Super/Win), and
+            # macOS (Command). Legacy WIN/SUPER/COMMAND names are translated too.
+            keys = pyautogui_key_combo(combo)
             try:
                 pyautogui.hotkey(*keys, _pause=False)
             except Exception as exc:
@@ -6160,7 +6162,7 @@ class SpatialDesktop(QWidget):
             action = gesture.get("action", "none")
             action_label = CUSTOM_GESTURE_ACTION_LABELS.get(action, action)
             if action == "custom_key":
-                action_label = str(gesture.get("key_combo") or "SET KEY COMBO…")
+                action_label = display_key_combo(gesture.get("key_combo")) or "SET KEY COMBO…"
             is_open = self.custom_gesture_dropdown == index
             painter.setBrush(QBrush(QColor(24, 89, 92, 240) if is_open else QColor(10, 47, 67, 235)))
             painter.setPen(QPen(QColor(175, 250, 255, 230) if is_open else QColor(125, 235, 245, 160), 1.0*scale))
@@ -9065,8 +9067,12 @@ class SpatialDesktop(QWidget):
         """Convert a Qt key event to a pyautogui-compatible shortcut token."""
         key = int(event.key())
         modifiers = event.modifiers()
-        modifier_only = {int(Qt.Key_Control), int(Qt.Key_Shift), int(Qt.Key_Alt), int(Qt.Key_Meta),
-                         int(Qt.Key_AltGr)}
+        modifier_only = {
+            int(getattr(Qt, name)) for name in (
+                "Key_Control", "Key_Shift", "Key_Alt", "Key_Meta", "Key_AltGr",
+                "Key_Super_L", "Key_Super_R", "Key_Command", "Key_Hyper_L", "Key_Hyper_R",
+            ) if getattr(Qt, name, None) is not None
+        }
         if key in modifier_only:
             return None
         parts = []
@@ -9077,7 +9083,9 @@ class SpatialDesktop(QWidget):
         if modifiers & Qt.ShiftModifier:
             parts.append("shift")
         if modifiers & Qt.MetaModifier:
-            parts.append("win")
+            # META represents Windows/Super/Command independent of OS; translated
+            # to pyautogui's platform-specific name only when the action is fired.
+            parts.append("meta")
         if int(Qt.Key_A) <= key <= int(Qt.Key_Z):
             name = chr(key).lower()
         elif int(Qt.Key_0) <= key <= int(Qt.Key_9):
@@ -9132,10 +9140,12 @@ class SpatialDesktop(QWidget):
                     gesture = self.custom_gestures[capture_index]
                     gesture["action"] = "custom_key"
                     gesture["key_combo"] = "+".join(
-                        part.upper() for part in combo.split("+")
+                        "META" if part.lower() in ("meta", "win", "super", "command", "cmd")
+                        else part.upper() for part in combo.split("+")
                     )
                     self._save_custom_gestures_now()
-                    self.custom_gesture_message = (f"Saved shortcut {gesture['key_combo']} for "
+                    shown_combo = display_key_combo(gesture["key_combo"])
+                    self.custom_gesture_message = (f"Saved shortcut {shown_combo} for "
                                                    f"{gesture.get('label', 'gesture')}.")
                 self.custom_gesture_key_capture = None
                 event.accept()

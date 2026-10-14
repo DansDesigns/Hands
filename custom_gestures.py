@@ -53,6 +53,55 @@ SIDES = ("left", "right", "either")
 # noisy tracking frame passing through a pose can't fire it.
 INSTANT_HOLD_SECONDS = 0.12
 
+# Meta-style modifiers have different names across desktop platforms. Store them as
+# the portable token META, then translate only when sending or displaying a shortcut.
+_META_KEY_ALIASES = {
+    "meta", "win", "windows", "winleft", "winright", "super", "super_l", "super_r",
+    "command", "cmd", "commandleft", "commandright", "command_l", "command_r",
+}
+_MODIFIER_ALIASES = {
+    "control": "ctrl", "ctrl": "ctrl", "option": "alt", "alt": "alt",
+    "shift": "shift",
+}
+
+
+def _key_combo_parts(combo):
+    """Split a saved shortcut into canonical, lowercase tokens."""
+    if not combo:
+        return []
+    parts = []
+    for raw in str(combo).split("+"):
+        token = raw.strip().lower()
+        if not token:
+            continue
+        if token in _META_KEY_ALIASES:
+            token = "meta"
+        else:
+            token = _MODIFIER_ALIASES.get(token, token)
+        parts.append(token)
+    return parts
+
+
+def pyautogui_key_combo(combo, platform=None):
+    """Translate a portable saved shortcut to pyautogui key names.
+
+    Windows calls the modifier Win, X11 calls it Win/Super, and macOS calls it
+    Command. Legacy WIN/SUPER/COMMAND values are accepted and made portable too.
+    """
+    import sys as _sys
+    platform = _sys.platform if platform is None else str(platform)
+    meta_key = "command" if platform == "darwin" else "win"
+    return [meta_key if part == "meta" else part for part in _key_combo_parts(combo)]
+
+
+def display_key_combo(combo, platform=None):
+    """Show META using the conventional name for the current operating system."""
+    import sys as _sys
+    platform = _sys.platform if platform is None else str(platform)
+    meta_label = "COMMAND" if platform == "darwin" else ("WIN" if platform.startswith("win") else "SUPER")
+    parts = _key_combo_parts(combo)
+    return "+".join(meta_label if part == "meta" else part.upper() for part in parts)
+
 # Curated actions, cycled with the arrow buttons on each gesture row. Anything not
 # handled internally is passed to SpatialDesktop.execute_pc_voice_command.
 ACTIONS = (

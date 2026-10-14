@@ -6,6 +6,7 @@ from pathlib import Path
 from custom_gestures import (
     FINGERS, HoldTrigger, best_pose_match, builtin_conflict, describe, feature_distance,
     hand_features, load_custom_gestures, mean_features, save_custom_gestures, tli_overlap,
+    pyautogui_key_combo, display_key_combo,
 )
 
 KN = {"index": (-30, 90), "middle": (-10, 95), "ring": (10, 90), "pinky": (28, 80)}
@@ -89,6 +90,24 @@ class CustomGestureTests(unittest.TestCase):
             self.assertEqual(len(loaded), 1)
             self.assertEqual(loaded[0]["action"], "custom_key")
             self.assertEqual(loaded[0]["key_combo"], "CTRL+ALT+SHIFT+K")
+
+    def test_meta_shortcuts_translate_to_windows_super_or_command_per_platform(self):
+        self.assertEqual(pyautogui_key_combo("CTRL+ALT+SHIFT+META+K", "win32"),
+                         ["ctrl", "alt", "shift", "win", "k"])
+        self.assertEqual(pyautogui_key_combo("SUPER+K", "linux"), ["win", "k"])
+        self.assertEqual(pyautogui_key_combo("COMMAND+K", "darwin"), ["command", "k"])
+        self.assertEqual(display_key_combo("CTRL+META+K", "linux"), "CTRL+SUPER+K")
+        self.assertEqual(display_key_combo("WIN+K", "win32"), "WIN+K")
+        self.assertEqual(display_key_combo("SUPER+K", "darwin"), "COMMAND+K")
+
+    def test_key_capture_uses_portable_meta_token(self):
+        main = (Path(__file__).resolve().parents[1] / "main.py").read_text(encoding="utf-8")
+        start = main.index("    def _custom_key_name_from_event(self):") if "    def _custom_key_name_from_event(self):" in main else main.index("    def _custom_key_name_from_event(self, event):")
+        end = main.index("    def keyPressEvent(self, event):", start)
+        capture = main[start:end]
+        self.assertIn("modifiers & Qt.MetaModifier", capture)
+        self.assertIn('parts.append("meta")', capture)
+        self.assertIn('"Key_Super_L", "Key_Super_R", "Key_Command"', capture)
 
     def test_save_and_load_round_trip_drops_invalid_entries(self):
         with tempfile.TemporaryDirectory() as tmp:
