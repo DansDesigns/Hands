@@ -39,7 +39,7 @@ STREAMTTS_VOICES = (
 
 
 def load_tts_settings() -> dict:
-    defaults = {"enabled": True, "voice": DEFAULT_STREAMTTS_VOICE, "speed": 1.0, "language": "en-gb"}
+    defaults = {"enabled": True, "voice": DEFAULT_STREAMTTS_VOICE, "speed": 1.0, "pitch": 0.0, "mode": "balanced", "language": "en-gb"}
     try:
         supplied = json.loads(TTS_SETTINGS.read_text(encoding="utf-8"))
     except (OSError, ValueError, TypeError):
@@ -48,17 +48,29 @@ def load_tts_settings() -> dict:
         defaults["enabled"] = bool(supplied.get("enabled", defaults["enabled"]))
         voice = supplied.get("voice")
         # Migrate the former Kokoro voice setting to the new British English default.
-        if isinstance(voice, str):
-            if voice in STREAMTTS_VOICES:
+        if isinstance(voice, str) and voice:
+            if voice in STREAMTTS_VOICES or voice.startswith("vits-piper-") or voice.startswith("system:"):
                 defaults["voice"] = voice
-            elif voice.startswith("vits-piper-"):
-                defaults["voice"] = voice
+            else:
+                # Permit locally imported model folders created by StreamTTS Config.
+                candidate = TTS_MODELS_DIR / voice
+                if candidate.is_dir() and (candidate / "tokens.txt").is_file() and list(candidate.glob("*.onnx")):
+                    defaults["voice"] = voice
         try:
             speed = float(supplied.get("speed", defaults["speed"]))
             if speed == speed and 0.5 <= speed <= 2.0:
                 defaults["speed"] = speed
         except (TypeError, ValueError):
             pass
+        try:
+            pitch = float(supplied.get("pitch", defaults["pitch"]))
+            if pitch == pitch and -6.0 <= pitch <= 6.0:
+                defaults["pitch"] = pitch
+        except (TypeError, ValueError):
+            pass
+        mode = supplied.get("mode", defaults["mode"])
+        if mode in ("immediate", "balanced", "natural"):
+            defaults["mode"] = mode
         lang = supplied.get("language", defaults["language"])
         if lang in ("en-gb", "en-us"):
             defaults["language"] = lang
@@ -254,7 +266,10 @@ class KokoroTTS:
 
     @property
     def model_files_present(self):
-        folder = TTS_MODELS_DIR / self.settings["voice"]
+        voice = str(self.settings["voice"])
+        if voice.startswith("system:"):
+            return True
+        folder = TTS_MODELS_DIR / voice
         return folder.is_dir() and any(folder.glob("*.onnx")) and (folder / "tokens.txt").is_file()
 
     def _set_status(self, message):
@@ -270,13 +285,13 @@ class KokoroTTS:
         except OSError:
             pass
 
-    def update_settings(self, *, enabled=None, voice=None, speed=None, language=None, persist=True):
+    def update_settings(self, *, enabled=None, voice=None, speed=None, pitch=None, mode=None, language=None, persist=True):
         changed_voice = False
         with self._lock:
             if enabled is not None:
                 self.enabled = bool(enabled)
                 self.settings["enabled"] = self.enabled
-            if isinstance(voice, str) and voice.startswith("vits-piper-") and voice != self.settings["voice"]:
+            if isinstance(voice, str) and voice and voice != self.settings["voice"]:
                 self.settings["voice"] = voice
                 changed_voice = True
             if speed is not None:
@@ -288,6 +303,19 @@ class KokoroTTS:
                             self._engine.set_speed(value)
                 except (TypeError, ValueError, RuntimeError):
                     pass
+            if pitch is not None:
+                try:
+                    value = float(pitch)
+                    if -6.0 <= value <= 6.0:
+                        self.settings["pitch"] = value
+                        if self._engine is not None and hasattr(self._engine, "set_pitch"):
+                            self._engine.set_pitch(value)
+                except (TypeError, ValueError, RuntimeError):
+                    pass
+            if mode in ("immediate", "balanced", "natural"):
+                self.settings["mode"] = mode
+                if self._engine is not None and hasattr(self._engine, "set_mode"):
+                    self._engine.set_mode(mode)
             if language in ("en-gb", "en-us"):
                 self.settings["language"] = language
             if changed_voice:
@@ -307,6 +335,12 @@ class KokoroTTS:
 
     def set_speed(self, speed):
         self.update_settings(speed=speed)
+
+    def set_pitch(self, pitch):
+        self.update_settings(pitch=pitch)
+
+    def set_mode(self, mode):
+        self.update_settings(mode=mode)
 
     def _close_engine(self, engine):
         try:
@@ -353,18 +387,30 @@ class KokoroTTS:
         with self._lock:
             if self._engine is not None and self._engine_voice == voice:
                 return self._engine
+        is_system_voice = str(voice).startswith("system:")
         folder = TTS_MODELS_DIR / voice
-        if not (folder.is_dir() and list(folder.glob("*.onnx")) and (folder / "tokens.txt").is_file()):
+        if not is_system_voice and not (folder.is_dir() and list(folder.glob("*.onnx")) and (folder / "tokens.txt").is_file()):
             folder = self._download_model(voice)
         import sys
         python_dir = str(STREAMTTS_DIR / "python")
         if python_dir not in sys.path:
             sys.path.insert(0, python_dir)
-        from streamtts_python import StreamingTTS
-        engine = StreamingTTS(
-            folder, mode="balanced", num_threads=2,
-            speed=float(self.settings["speed"]), pitch_semitones=0.0,
-        )
+        voice = str(voice)
+        if voice.startswith("system:"):
+            from system_voice import SystemVoiceTTS
+            engine = SystemVoiceTTS(
+                voice[len("system:"):],
+                mode=self.settings.get("mode", "balanced"),
+                speed=float(self.settings["speed"]),
+                pitch_semitones=float(self.settings.get("pitch", 0.0)),
+            )
+        else:
+            from streamtts_python import StreamingTTS
+            engine = StreamingTTS(
+                folder, mode=self.settings.get("mode", "balanced"), num_threads=2,
+                speed=float(self.settings["speed"]),
+                pitch_semitones=float(self.settings.get("pitch", 0.0)),
+            )
         with self._lock:
             old = self._engine
             self._engine = engine

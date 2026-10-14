@@ -3,3 +3,4 @@ sherpa-onnx
 sherpa-onnx-bin
 numpy
 sounddevice
+pyttsx3

@@ -65,6 +65,7 @@ from custom_gestures import (
     load_custom_gestures, save_custom_gestures,
 )
 from voice_pc_commands import match_pc_command, aliases_for_help
+from voice_assistant_commands import live_answer, file_query
 from d1_decision import (classify_voice_command, start_loading as start_d1_loading,
                          selected_model as selected_d1_model, select_model as select_d1_model,
                          status as d1_status, MODELS as D1_MODELS, stop_server as stop_d1_server,
@@ -1447,9 +1448,15 @@ class HandCalibrationWizard(QWidget):
         super().keyPressEvent(event)
 
 
+class VoiceReplySignals(QObject):
+    finished = Signal(str, str)
+
+
 class SpatialDesktop(QWidget):
     def __init__(self):
         super().__init__()
+        self.voice_reply_signals = VoiceReplySignals(self)
+        self.voice_reply_signals.finished.connect(self._on_general_voice_answer)
         self.setWindowTitle("Spatial Desktop")
         # Consistent tactile feedback for native buttons across settings and dialogs.
         self.setStyleSheet(self.styleSheet() + " QPushButton:pressed, QToolButton:pressed { background-color: rgba(75, 205, 235, 210); border: 2px solid #b9f5ff; padding-top: 2px; padding-left: 2px; }")
@@ -2083,6 +2090,8 @@ class SpatialDesktop(QWidget):
             y += group
             stack("test_voice")
             stack("face_welcome")
+            y += group
+            stack("streamtts_config", h=42.0)
             texts["status"] = (L, y, W, 48.0)
             y += 48.0 + gap
         elif page == "update":
@@ -3429,6 +3438,16 @@ class SpatialDesktop(QWidget):
                         self.status = f"TTS is not ready: {self.tts.status}"
                 elif pressed("face_welcome"):
                     self.manage_face_welcome()
+                elif pressed("streamtts_config"):
+                    config_gui = Path(__file__).resolve().parent / "streamtts_config.py"
+                    if config_gui.is_file():
+                        try:
+                            subprocess.Popen([sys.executable, str(config_gui)], cwd=str(config_gui.parent))
+                            self.status = "Opened StreamTTS configuration."
+                        except Exception as exc:
+                            self.status = f"Could not open StreamTTS configuration: {exc}"
+                    else:
+                        self.status = "StreamTTS configuration tool is missing."
                 return
 
             if self.settings_page == "update":
@@ -4713,6 +4732,23 @@ class SpatialDesktop(QWidget):
 
         QTimer.singleShot(2000, show_label)
 
+    def _on_general_voice_answer(self, question, answer):
+        if not answer:
+            answer = "I couldn't get an answer from the local D1 model. Check that the model is loaded and try again."
+        self.status = answer
+        self.tts.speak(answer)
+
+    def _ask_d1_general_question(self, question):
+        # Keep model inference off the Qt UI thread; the signal returns the result safely.
+        def worker():
+            try:
+                from d1_decision import answer_general_question
+                answer = answer_general_question(question)
+            except Exception:
+                answer = None
+            self.voice_reply_signals.finished.emit(question, answer or "")
+        threading.Thread(target=worker, name="D1-general-answer", daemon=True).start()
+
     def on_speech(self, text):
         # A completed phrase has been consumed; don't keep it as the idle pill's
         # fallback transcript. The next phrase is shown from speech_partial.
@@ -4725,6 +4761,27 @@ class SpatialDesktop(QWidget):
         low = text.lower().strip()
         low = re.sub(r"\s+", " ", low)
         dialog = self.search_dialog
+
+        # Live local facts must be answered from the OS, never guessed by a model.
+        if not self.focus_dictation_enabled and not (dialog is not None and dialog.isVisible()):
+            live = live_answer(text)
+            if live:
+                kind, answer = live
+                self.status = answer
+                self.tts.speak(answer)
+                return
+
+            # Spoken file queries reuse the existing indexed local-search UI.
+            query = file_query(text)
+            if query:
+                self.open_search_bar(from_voice=False)
+                if self.search_dialog is not None:
+                    self.search_dialog.set_dictation_enabled(False)
+                    self.search_dialog.query.setText(query)
+                    self.search_dialog.query.setFocus()
+                self.status = "Searching local files for: " + query
+                self.tts.speak("Searching your local files for " + query + ".")
+                return
         if low in ("fullscreen", "full screen", "toggle fullscreen", "toggle full screen", "make fullscreen", "make full screen"):
             if sys.platform.startswith("win"):
                 try:
@@ -4890,8 +4947,15 @@ class SpatialDesktop(QWidget):
             self.status = "Voice commands: pause/resume tracking, search bar, copy this/copy text, paste here/paste this, show running apps, start text selection, copy image, media playback/volume, window management, file navigation, close window, open folders, stop listening"
             self.tts.speak("You can say pause tracking, resume tracking, begin dictation, end dictation, show menu, show context, search bar, start text selection, copy this, copy text, copy image, paste here, paste this, show running apps, switch window, play pause, next track, previous track, volume up, volume down, mute, unmute, minimize window, maximize window, show desktop, open downloads, new folder, select all, undo, redo, close window, or open user folder.")
         else:
-            self.status = f"Heard: {text}"
-            self._show_unrecognised_command(text)
+            # General conversational questions are answered by the local D1 model.
+            # Do not steal ordinary dictation, search terms, or unrecognised commands.
+            question_start = re.match(r"^(what|why|how|who|when|where|which|can you|could you|do you|is it|are you|tell me|explain|define)\b", low)
+            if question_start and not self.focus_dictation_enabled and not (dialog is not None and dialog.isVisible()):
+                self.status = "Thinking…"
+                self._ask_d1_general_question(text)
+            else:
+                self.status = f"Heard: {text}"
+                self._show_unrecognised_command(text)
 
     def apply_desktop_mode(self):
         """Configure a fullscreen overlay; OS mode passes physical mouse input through."""
@@ -9215,7 +9279,8 @@ class SpatialDesktop(QWidget):
 
                         test_button = controls["test_voice"]
                         face_button = controls["face_welcome"]
-                        for rect in (test_button, face_button):
+                        streamtts_config_button = controls["streamtts_config"]
+                        for rect in (test_button, face_button, streamtts_config_button):
                             painter.setBrush(QBrush(QColor(10, 47, 67, 225)))
                             painter.setPen(QPen(QColor(140, 230, 240, 210), 1.5*scale))
                             painter.drawRoundedRect(rect, 10*scale, 10*scale)
@@ -9224,6 +9289,7 @@ class SpatialDesktop(QWidget):
                         face_label = ("FACE WELCOME  ·  " + self.face_welcome.profile_name() + "  ·  MANAGE" if self.face_welcome.has_profile()
                                       else "ENROL FACE FOR WELCOME-BACK")
                         self._draw_fitted_button_label(painter, face_button, face_label, base_size=label_size, min_size=6, inset=12*scale)
+                        self._draw_fitted_button_label(painter, streamtts_config_button, "OPEN STREAMTTS CONFIG", base_size=label_size, min_size=6, inset=12*scale)
                         painter.setPen(QColor(170, 215, 225, 230))
                         voice_status = f"{self.tts.status}  ·  {self.face_enrollment_status}"
                         self._draw_wrapped_fitted_text(painter, text_rects["status"], voice_status[:150],

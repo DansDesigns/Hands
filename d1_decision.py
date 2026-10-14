@@ -460,3 +460,54 @@ def rerank_search_results(query: str, results: list) -> list | None:
     if idx < 0 or idx >= len(candidates): return None
     chosen = candidates[idx]
     return [chosen] + [item for item in results if item is not chosen]
+
+
+
+def answer_general_question(question: str, timeout: float = 20.0) -> str | None:
+    """Generate a concise local answer through the running llama.cpp OpenAI-compatible API.
+
+    This is deliberately separate from classify_voice_command(): command routing remains
+    structured and allow-listed, while this endpoint is only for conversational replies.
+    """
+    clean = " ".join((question or "").split())
+    if len(clean) < 2:
+        return None
+    if not start_loading():
+        return None
+    payload = {
+        "model": "local-d1",
+        "messages": [
+            {"role": "system", "content": (
+                "You are the concise voice assistant for Spatial Desktop. Answer naturally "
+                "in one to four short sentences suitable for text-to-speech. Do not claim "
+                "to have performed actions, accessed files, or checked live system state. "
+                "For requests requiring a desktop action or live data, say that the relevant "
+                "command handler must provide it."
+            )},
+            {"role": "user", "content": clean},
+        ],
+        "temperature": 0.3,
+        "max_tokens": 180,
+        "stream": False,
+    }
+    try:
+        req = urllib.request.Request(
+            BASE_URL + "/v1/chat/completions",
+            data=json.dumps(payload).encode("utf-8"),
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        with urllib.request.urlopen(req, timeout=timeout) as response:
+            result = json.loads(response.read().decode("utf-8"))
+        choices = result.get("choices", []) if isinstance(result, dict) else []
+        if choices:
+            message = choices[0].get("message", {})
+            content = message.get("content", "") if isinstance(message, dict) else ""
+            if isinstance(content, str):
+                content = " ".join(content.strip().split())
+                return content[:1600] or None
+    except Exception as exc:
+        global _error
+        with _lock:
+            _error = f"General answer request failed: {type(exc).__name__}: {exc}"
+    return None

@@ -128,3 +128,11 @@ The Interaction page's **Scroll · Normal/Inverted** button reverses vertical sc
 - The Pinch Menu hold defaults to a **1.0-second fill after a 0.8-second confirmation delay** (about 1.8 seconds total). Pinch recognition now allows natural index bending and tolerates brief landmark dropouts so the timer is less likely to restart.
 - With Search open, the skeleton, TLI, hold progress and Pinch Menu are drawn on a transparent, click-through layer above the launcher.
 - Grab-scroll is progressive: short travel remains precise, and gain increases as accumulated vertical movement grows. `invert_scroll` still reverses direction.
+
+## StreamTTS Config GUI
+
+Open **Settings → Engine → Open StreamTTS Config** to launch the standalone `streamtts_config.py` window. It lets you enable/disable speech output, choose an installed StreamTTS/Piper voice model, and adjust speech speed. **Save settings** writes to `voice_settings.json`, the same settings file used by Spatial Desktop. The GUI uses Python's built-in Tkinter, so no extra GUI package is required; on some Linux distributions Tkinter may need to be installed separately (for example, the `python3-tk` package).
+
+## StreamTTS voice configuration
+
+Open Settings → Voice → **OPEN STREAMTTS CONFIG** to access the full StreamTTS voice controls: the complete bundled Piper/VITS voice catalog, installed operating-system voices (when `pyttsx3` is available), downloading another model by ID, importing a local model folder, speech rate, pitch shift, streaming mode, voice test, and saving settings. Changes to voice, pitch, and streaming mode are read by Spatial Desktop at startup; restart Spatial Desktop after saving. Missing neural voice models can be downloaded with **Apply selected voice** or on first speech use.
