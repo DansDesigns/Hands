@@ -19,14 +19,31 @@ def test_linux_overlay_is_synchronized_to_full_screen_geometry():
     assert "window._sync_linux_fullscreen_geometry()" in source
 
 
-def test_linux_drag_reasserts_overlay_above_dragged_window():
+def test_linux_overlay_reasserts_native_topmost_even_without_dragging():
     source = (ROOT / "main.py").read_text(encoding="utf-8")
     start = source.index("    def _maintain_native_topmost(self, now=None):")
     end = source.index("    def _sync_linux_fullscreen_geometry(self):", start)
     method = source[start:end]
     assert 'sys.platform.startswith("linux")' in method
-    assert 'active.get("mode") == "drag_window"' in method
     assert "XRaiseWindow" in method
+    assert "if not target.isVisible():" in method
+    assert 'active.get("mode") == "drag_window"' not in method
+    assert "target = search_overlay" in method
+    assert "ctypes.c_ulong(int(target.winId()))" in method
+
+
+def test_linux_desktop_launcher_uses_freehand_icon():
+    installer = (ROOT / "install_linux.sh").read_text(encoding="utf-8")
+    assert "https://raw.githubusercontent.com/DansDesigns/Hands/main/Freehand_logo_small.png" in installer
+    assert "Icon=$ICON_PATH" in installer
+    assert "curl -fL" in installer
+
+
+def test_windows_start_menu_shortcut_uses_freehand_icon():
+    installer = (ROOT / "install_windows.bat").read_text(encoding="utf-8")
+    assert "https://raw.githubusercontent.com/DansDesigns/Hands/main/Freehand_logo_small.png" in installer
+    assert "Freehand_logo_small.ico" in installer
+    assert "$s.IconLocation=$env:ICON_ICO + ',0'" in installer
 
 
 def test_linux_installer_creates_launcher_without_a_second_installer():

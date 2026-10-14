@@ -26,7 +26,7 @@ except Exception:
 DEFAULTS = {
     "enabled": True,
     "voice": "vits-piper-en_GB-alan-medium",
-    "speed": 1.0,
+    "speed": 1.2,
     "pitch": 0.0,
     "mode": "balanced",
     "language": "en-gb",
@@ -70,7 +70,7 @@ def read_settings():
     try:
         data["speed"] = max(0.5, min(2.0, float(data["speed"])))
     except (TypeError, ValueError):
-        data["speed"] = 1.0
+        data["speed"] = 1.2
     try:
         data["pitch"] = max(-6.0, min(6.0, float(data["pitch"])))
     except (TypeError, ValueError):

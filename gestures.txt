@@ -121,3 +121,4 @@ skeleton_line_thickness=1.50
 palm_attract_acceleration=0.33
 
 # TWO-FIST CLUTCH: in SCROLL WINDOW mode, hold both fists, keep the left hand steady and move the right fist to scroll the visible window content; opening either hand stops. In other modes, the same clutch moves the native window. Linux/X11 native window drag requires wmctrl; xdotool supports window targeting and wheel scrolling.
+hand_render_style=3d

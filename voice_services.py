@@ -55,7 +55,7 @@ STREAMTTS_VOICES = (
 
 
 def load_tts_settings() -> dict:
-    defaults = {"enabled": True, "voice": DEFAULT_STREAMTTS_VOICE, "speed": 1.0, "pitch": 0.0, "mode": "balanced", "language": "en-gb"}
+    defaults = {"enabled": True, "voice": DEFAULT_STREAMTTS_VOICE, "speed": 1.2, "pitch": 0.0, "mode": "balanced", "language": "en-gb"}
     try:
         supplied = json.loads(TTS_SETTINGS.read_text(encoding="utf-8"))
     except (OSError, ValueError, TypeError):

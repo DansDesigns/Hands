@@ -81,10 +81,40 @@ if ! "$VPY" -u "$APP_DIR/install_d1_model.py" 600m; then
     echo "Retry later with: $VPY $APP_DIR/install_d1_model.py 600m" >&2
 fi
 
-echo '[9/9] Creating desktop application launcher...'
-# Install and repair the launcher as part of this installer; users should not
-# have to run a second setup script. ZIP extraction can lose Unix executable
-# bits, so restore them before creating a desktop entry which invokes the files.
+echo '[9/9] Preparing the Freehand launcher icon and creating the desktop entry...'
+# Keep the official logo beside the app so the installed .desktop file always
+# references a stable local file. Download from the upstream repository only if
+# it is not already present in the extracted project.
+ICON_URL='https://raw.githubusercontent.com/DansDesigns/Hands/main/Freehand_logo_small.png'
+ICON_PATH="$APP_DIR/Freehand_logo_small.png"
+if [ ! -s "$ICON_PATH" ]; then
+    ICON_TMP="$ICON_PATH.tmp"
+    rm -f "$ICON_TMP"
+    if command -v curl >/dev/null 2>&1; then
+        if curl -fL --retry 2 --connect-timeout 10 --silent --show-error "$ICON_URL" -o "$ICON_TMP"; then
+            mv "$ICON_TMP" "$ICON_PATH"
+        else
+            echo 'WARNING: Could not download Freehand_logo_small.png; the launcher will use the desktop default icon.' >&2
+            rm -f "$ICON_TMP"
+        fi
+    elif command -v wget >/dev/null 2>&1; then
+        if wget -q "$ICON_URL" -O "$ICON_TMP"; then
+            mv "$ICON_TMP" "$ICON_PATH"
+        else
+            echo 'WARNING: Could not download Freehand_logo_small.png; the launcher will use the desktop default icon.' >&2
+            rm -f "$ICON_TMP"
+        fi
+    else
+        echo 'WARNING: curl/wget is unavailable; the launcher will use the desktop default icon.' >&2
+    fi
+fi
+ICON_DESKTOP_ENTRY=""
+if [ -s "$ICON_PATH" ]; then
+    ICON_DESKTOP_ENTRY="Icon=$ICON_PATH"
+fi
+
+# ZIP extraction can lose Unix executable bits, so restore them before creating
+# a desktop entry which invokes the files.
 chmod +x "$APP_DIR/run_linux.sh" "$APP_DIR/spatial_desktop_launcher.sh"
 
 APPS_DIR="${XDG_DATA_HOME:-$HOME/.local/share}/applications"
@@ -96,6 +126,7 @@ Name=Spatial Desktop Prototype
 Comment=Camera-controlled spatial desktop and local search
 Exec="$APP_DIR/spatial_desktop_launcher.sh"
 TryExec="$APP_DIR/spatial_desktop_launcher.sh"
+$ICON_DESKTOP_ENTRY
 Terminal=true
 Categories=Utility;
 DESKTOP

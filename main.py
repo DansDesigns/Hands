@@ -379,6 +379,9 @@ def load_gesture_settings() -> dict:
         "finger_thickness": 4.24,
         "palm_width_scale": 1.26,
         "hand_skin_effect": True,
+        # New installations default to the rigged 3D mesh. Legacy files that
+        # only specify hand_skin_effect continue to use their previous style.
+        "hand_render_style": "3d",
         "skin_use_skeleton_color": False,
         "hand_transparency": 75.0,
         "tli_glow_enabled": False,
@@ -438,6 +441,8 @@ def load_gesture_settings() -> dict:
         content = GESTURES_FILE.read_text(encoding="utf-8").splitlines()
     except OSError:
         return values
+    explicit_hand_render_style = False
+    legacy_hand_skin_effect = False
     for raw in content:
         line = raw.strip()
         if not line or line.startswith("#") or "=" not in line:
@@ -457,12 +462,18 @@ def load_gesture_settings() -> dict:
             values[key] = value.lower() in ("true", "1", "yes", "on")
         elif key == "hand_skin_effect":
             values[key] = value.lower() in ("true", "1", "yes", "on")
+            legacy_hand_skin_effect = True
         elif key == "hand_render_style" and value.lower() in HAND_RENDER_STYLES:
             values[key] = value.lower()
+            explicit_hand_render_style = True
         elif key == "cursor_lock_priority" and value.lower() in ("left", "right"):
             values[key] = value.lower()
         elif key in ("left_click_color", "right_click_color") and re.fullmatch(r"#[0-9a-fA-F]{6}", value):
             values[key] = value.lower()
+    # A legacy config explicitly using hand_skin_effect but lacking the newer
+    # three-way option keeps its old flat/skeleton interpretation.
+    if legacy_hand_skin_effect and not explicit_hand_render_style:
+        values.pop("hand_render_style", None)
     return values
 
 
@@ -7517,11 +7528,13 @@ class SpatialDesktop(QWidget):
         return True
 
     def _maintain_native_topmost(self, now=None):
-        """Keep the active visual overlay above other windows without taking focus.
+        """Keep the visual hands above fullscreen launchers without taking focus.
 
-        Windows reasserts HWND_TOPMOST as before. On Linux/X11, Qtile can raise a
-        dragged client above an override-redirect overlay, so briefly restack the
-        fullscreen overlay natively while a native window drag is underway.
+        The AlternixOS osm-launcher is a fullscreen Qt window marked
+        WindowStaysOnTopHint. On XLibre/X11 its layer can cover the hand overlay,
+        even when the main overlay bypasses the window manager. Reassert the native
+        overlay's stacking order periodically, without activating it or stealing
+        focus from the launcher or the application under the pointer.
         """
         if getattr(self, "_capturing_glass_backdrop", False):
             return
@@ -7537,13 +7550,31 @@ class SpatialDesktop(QWidget):
                     return
             except Exception:
                 return
-            dragging = any(isinstance(active, dict) and active.get("mode") == "drag_window"
-                           for active in getattr(self, "active_action", {}).values())
-            if not dragging or not self.isVisible():
+            # Keep this active even when no window drag is in progress: full-screen
+            # launchers such as AlternixOS osm-launcher can cover the hands as soon
+            # as they open, and Qtile may not notify us about that stacking change.
+            # Preserve the app's normal layer ownership when one of its own dialogs is
+            # visible: raise the dedicated hand overlay or calibration surface instead
+            # of putting the full-screen owner over its own launcher/dialog.
+            search_dialog = getattr(self, "search_dialog", None)
+            search_overlay = getattr(self, "search_hand_overlay", None)
+            if search_dialog is not None and search_dialog.isVisible():
+                if search_overlay is None or not search_overlay.isVisible():
+                    return
+                target = search_overlay
+            elif (getattr(self, "tli_calibration_window", None) is not None and
+                  self.tli_calibration_window.isVisible()):
+                target = self.tli_calibration_window
+            elif (getattr(self, "hand_calibration_window", None) is not None and
+                  self.hand_calibration_window.isVisible()):
+                target = self.hand_calibration_window
+            else:
+                target = self
+            if not target.isVisible():
                 return
             try:
-                # XRaiseWindow works with the override-redirect fullscreen window and
-                # avoids activating it or stealing focus from the window being dragged.
+                # XRaiseWindow changes only stacking order; it doesn't activate the
+                # target or steal keyboard focus from osm-launcher or the dragged app.
                 if getattr(self, "_linux_x11_display", None) is None:
                     x11 = ctypes.CDLL("libX11.so.6")
                     x11.XOpenDisplay.argtypes = [ctypes.c_char_p]
@@ -7558,7 +7589,7 @@ class SpatialDesktop(QWidget):
                     self._linux_x11_lib = x11
                     self._linux_x11_display = display
                 self._linux_x11_lib.XRaiseWindow(self._linux_x11_display,
-                                                  ctypes.c_ulong(int(self.winId())))
+                                                  ctypes.c_ulong(int(target.winId())))
                 self._linux_x11_lib.XFlush(self._linux_x11_display)
                 self._last_native_topmost_reassert = now
             except Exception:

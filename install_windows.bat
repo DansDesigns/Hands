@@ -99,11 +99,16 @@ if errorlevel 1 (
 
 
 echo.
-echo [9/9] Creating the Start Menu shortcut...
+echo [9/9] Preparing the Freehand launcher icon and creating the Start Menu shortcut...
+set "ICON_PNG=%CD%\Freehand_logo_small.png"
+set "ICON_ICO=%CD%\Freehand_logo_small.ico"
+set "ICON_URL=https://raw.githubusercontent.com/DansDesigns/Hands/main/Freehand_logo_small.png"
+powershell -NoProfile -ExecutionPolicy Bypass -Command "$ErrorActionPreference='Stop'; try { if (!(Test-Path $env:ICON_PNG)) { Invoke-WebRequest -UseBasicParsing -Uri $env:ICON_URL -OutFile $env:ICON_PNG }; if ((Test-Path $env:ICON_PNG) -and (!(Test-Path $env:ICON_ICO))) { Add-Type -AssemblyName System.Drawing; $src=[System.Drawing.Image]::FromFile($env:ICON_PNG); try { $bmp=[System.Drawing.Bitmap]::new(256,256,[System.Drawing.Imaging.PixelFormat]::Format32bppArgb); try { $g=[System.Drawing.Graphics]::FromImage($bmp); try { $g.Clear([System.Drawing.Color]::Transparent); $scale=[Math]::Min(256.0/$src.Width,256.0/$src.Height); $w=[int]($src.Width*$scale); $h=[int]($src.Height*$scale); $g.DrawImage($src,[int]((256-$w)/2),[int]((256-$h)/2),$w,$h) } finally { $g.Dispose() }; $hicon=$bmp.GetHicon(); $icon=[System.Drawing.Icon]::FromHandle($hicon); $fs=[System.IO.File]::Create($env:ICON_ICO); try { $icon.Save($fs) } finally { $fs.Dispose() } } finally { $bmp.Dispose() } } finally { $src.Dispose() } } } catch { Write-Warning ('Could not prepare Freehand launcher icon: ' + $_.Exception.Message) }"
+if not exist "%ICON_ICO%" echo WARNING: Could not download/convert the Freehand icon; the shortcut will use the Windows default icon.
 set "STARTMENU=%APPDATA%\Microsoft\Windows\Start Menu\Programs"
 if not exist "%STARTMENU%" mkdir "%STARTMENU%"
 set "SHORTCUT=%STARTMENU%\Spatial Desktop Prototype.lnk"
-powershell -NoProfile -ExecutionPolicy Bypass -Command "$s=(New-Object -ComObject WScript.Shell).CreateShortcut('%SHORTCUT%'); $s.TargetPath='%VPY%'; $s.Arguments='""%CD%\main.py""'; $s.WorkingDirectory='%CD%'; $s.Description='Spatial Desktop Prototype'; $s.Save()"
+powershell -NoProfile -ExecutionPolicy Bypass -Command "$s=(New-Object -ComObject WScript.Shell).CreateShortcut('%SHORTCUT%'); $s.TargetPath='%VPY%'; $s.Arguments='""%CD%\main.py""'; $s.WorkingDirectory='%CD%'; $s.Description='Spatial Desktop Prototype'; if (Test-Path $env:ICON_ICO) { $s.IconLocation=$env:ICON_ICO + ',0' }; $s.Save()"
 if errorlevel 1 goto :shortcut_error
 
 echo.
