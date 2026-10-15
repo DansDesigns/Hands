@@ -3022,6 +3022,24 @@ class SpatialDesktop(QWidget):
         if overlay is not None:
             overlay.update()
 
+    def _position_floating_clipboard_over_rect(self, anchor_rect):
+        """Place the clipboard centred over a just-used Pinch Menu rectangle."""
+        if anchor_rect is None or not self.floating_clipboard_visible:
+            return
+        layout = self._floating_clipboard_layout()
+        if layout is None:
+            return
+        panel = layout["panel"]
+        x = anchor_rect.center().x() - panel.width() * 0.5
+        y = anchor_rect.center().y() - panel.height() * 0.5
+        x = max(4.0, min(x, max(4.0, self.width() - panel.width() - 4.0)))
+        y = max(4.0, min(y, max(4.0, self.height() - panel.height() - 4.0)))
+        self.floating_clipboard_position = QPointF(x, y)
+        self.update()
+        overlay = getattr(self, "search_hand_overlay", None)
+        if overlay is not None:
+            overlay.update()
+
     def _floating_clipboard_layout(self):
         """Return the floating PowerPoint-style thumbnail strip in screen-local coords."""
         if not self.floating_clipboard_visible or self.width() <= 0 or self.height() <= 0:
@@ -4148,6 +4166,11 @@ class SpatialDesktop(QWidget):
 
     def _begin_action_from_popup(self, side, action, cursor, now):
         """Activate a selected input mode; a timed pinch returns to normal mode."""
+        # Preserve the menu's actual position before closing it. The clipboard has a
+        # different aspect ratio, so its centre is aligned to the menu's old centre.
+        clipboard_menu_anchor = None
+        if action == "clipboard_toggle" and not self.floating_clipboard_visible:
+            clipboard_menu_anchor, _ = self._action_menu_geometry(side)
         self._set_pinch_menu_open(side, False, now)
         if action == "right_click":
             # The menu selection gesture can overlap the native context-menu opening.
@@ -4179,6 +4202,8 @@ class SpatialDesktop(QWidget):
             self._toggle_stt_from_menu()
         elif action == "clipboard_toggle":
             self._set_floating_clipboard_visible(not self.floating_clipboard_visible)
+            if self.floating_clipboard_visible and clipboard_menu_anchor is not None:
+                self._position_floating_clipboard_over_rect(clipboard_menu_anchor)
         else:
             self.status = "Unknown Pinch Menu option"
 
