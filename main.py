@@ -2930,6 +2930,8 @@ class SpatialDesktop(QWidget):
             "html": payload.get("html", ""),
             "image": payload["image"],
             "urls": payload["urls"],
+            # A multi-file copy stays one history card and one transferable URL group.
+            "group_count": len(payload["urls"]) if payload["kind"] == "files" else 1,
             "signature": signature,
             "created": datetime.now(),
             "image_path": None,
@@ -3167,9 +3169,12 @@ class SpatialDesktop(QWidget):
                 kind_label = "IMAGE"
                 detail = f"{entry.get('image_width', entry['image'].width())} × {entry.get('image_height', entry['image'].height())} px" if image is not None else "Image"
             elif entry.get("kind") == "files":
-                kind_label = "FILES"
                 names = [Path(url.toLocalFile()).name for url in entry.get("urls", []) if url.isLocalFile()]
-                detail = ", ".join(names) or "Copied file(s)"
+                file_count = len(entry.get("urls", []))
+                kind_label = f"FILES · {file_count}" if file_count > 1 else "FILES"
+                # Keep grouped copies as one card, but make every member discoverable
+                # in the card's preview text rather than creating one entry per file.
+                detail = " · ".join(names) or (f"{file_count} copied files" if file_count else "Copied file(s)")
             elif entry.get("kind") == "links":
                 kind_label = "LINK / URL"
                 detail = entry.get("text") or ", ".join(url.toString() for url in entry.get("urls", []))
@@ -3325,10 +3330,16 @@ class SpatialDesktop(QWidget):
         if image is not None and not image.isNull():
             thumb = image.scaled(70, 70, Qt.KeepAspectRatio, Qt.SmoothTransformation)
             painter.drawImage(QPointF(7+(70-thumb.width())/2, 9+(70-thumb.height())/2), thumb)
+        if entry.get("kind") == "files":
+            urls = list(entry.get("urls") or [])
+            names = [Path(url.toLocalFile()).name for url in urls if url.isLocalFile()]
+            count = len(urls)
+            label = (f"{count} files · " + ", ".join(names[:3])) if count > 1 else (names[0] if names else "Copied file")
+        elif entry.get("kind") == "image" and image is not None and not image.isNull():
             label = f"Image · {entry.get('image_width', image.width())} × {entry.get('image_height', image.height())}"
         else:
             label = str(entry.get("text") or "Copied item") or "Copied item"
-            label = QFontMetricsF(QFont("Sans", 9)).elidedText(label.replace("\n", " "), Qt.ElideRight, 155)
+        label = QFontMetricsF(QFont("Sans", 9)).elidedText(label.replace("\n", " "), Qt.ElideRight, 155)
         painter.setPen(QColor(234, 251, 255, 250))
         painter.setFont(QFont("Sans", 9, QFont.DemiBold))
         painter.drawText(QRectF(84, 8, 155, 72), Qt.AlignVCenter | Qt.AlignLeft | Qt.TextWordWrap, label)
@@ -9498,7 +9509,7 @@ class SpatialDesktop(QWidget):
                 # The preview follows the hand and the destination receives clipboard paste
                 # without entering Qt's blocking native drag loop.
                 if (clipboard_state.get("running") and
-                        clipboard_state.get("mode") in ("text_paste", "image_paste") and
+                        clipboard_state.get("mode") in ("text_paste", "image_paste", "files_paste") and
                         clipboard_state.get("moved")):
                     entry_id = clipboard_state.get("entry_id")
                     entry_obj = next((item for item in self.floating_clipboard_entries
@@ -9637,7 +9648,7 @@ class SpatialDesktop(QWidget):
                     # + click/paste path. QDrag.exec enters a platform-native nested drag
                     # loop, which can starve camera/gesture updates on some Windows/Qt
                     # combinations and can prevent the preview from following the hand.
-                    if clipboard_state.get("mode") in ("text_paste", "image_paste"):
+                    if clipboard_state.get("mode") in ("text_paste", "image_paste", "files_paste"):
                         self._set_os_pointer(cursor)
                         release_since = clipboard_state.get("release_candidate_since")
                         should_finish = (not held_for_clipboard and (
@@ -9690,18 +9701,24 @@ class SpatialDesktop(QWidget):
                     entry_id = clipboard_state.get("entry_id")
                     entry_obj = next((item for item in self.floating_clipboard_entries
                                       if item.get("id") == entry_id), None)
-                    if entry_obj is not None and entry_obj.get("kind") in ("text", "image"):
-                        # Track text and copied bitmaps without starting Qt's blocking
-                        # native drag loop. The image remains available as image data and
-                        # as its cached PNG file URL in the system clipboard, so Ctrl+V can
-                        # paste it into image-aware targets or copy the PNG into folders.
+                    if entry_obj is not None and entry_obj.get("kind") in ("text", "image", "files"):
+                        # Use the non-modal cursor-follow/paste path for text, image and
+                        # grouped file entries. QDrag.exec() can crash or stall while
+                        # transferring a multi-URL Windows Explorer selection; publishing
+                        # the entire URL list to the system clipboard and pasting at the
+                        # drop point preserves the group as one card and avoids that path.
                         clipboard_state["running"] = True
-                        clipboard_state["mode"] = (
-                            "text_paste" if entry_obj.get("kind") == "text" else "image_paste")
+                        clipboard_state["mode"] = {
+                            "text": "text_paste", "image": "image_paste", "files": "files_paste"
+                        }[entry_obj.get("kind")]
                         self.floating_clipboard_drag_running = True
-                        self.status = ("Dragging clipboard text — release over a text field to paste"
-                                       if entry_obj.get("kind") == "text" else
-                                       "Dragging clipboard image — release over an image target or folder to paste")
+                        if entry_obj.get("kind") == "text":
+                            self.status = "Dragging clipboard text — release over a text field to paste"
+                        elif entry_obj.get("kind") == "image":
+                            self.status = "Dragging clipboard image — release over an image target or folder to paste"
+                        else:
+                            self.status = (f"Dragging {len(entry_obj.get('urls') or [])} copied file(s) "
+                                           "as one group — release over a folder or compatible target to paste")
                         continue
                     clipboard_state["running"] = True
                     clipboard_state["mode"] = "native"
