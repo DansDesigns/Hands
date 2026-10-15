@@ -143,6 +143,122 @@ TLI_CALIBRATION_FILE = ROOT / "tli_calibration.json"  # Legacy palm-local TLI an
 TPI_SCREEN_CALIBRATION_FILE = ROOT / "tpi_screen_calibration.json"
 HAND_CALIBRATION_FILE = ROOT / "hand_calibration.json"
 CUSTOM_GESTURES_FILE = ROOT / "custom_gestures.json"
+VIRTUAL_DESKTOP_DATA_FILE = ROOT / "virtual_desktop.json"
+VIRTUAL_BACKGROUND_STYLES = (
+    {"name": "MIDNIGHT BLUE", "background": "#080c16", "grid": "#4b9be8"},
+    {"name": "NEON PURPLE", "background": "#10091b", "grid": "#a26bff"},
+    {"name": "DEEP TEAL", "background": "#061719", "grid": "#37d9cd"},
+    {"name": "AMBER GRID", "background": "#171108", "grid": "#f4b95f"},
+)
+VIRTUAL_PEN_PALETTE = (
+    ("WHITE", "#f7fbff"), ("CYAN", "#43ddff"), ("RED", "#ff555d"),
+    ("ORANGE", "#ffad45"), ("GREEN", "#65e58d"), ("PURPLE", "#c58bff"),
+    ("YELLOW", "#ffe66b"),
+)
+VIRTUAL_DESKTOP_DEFAULTS = {
+    "background": {
+        "grid_enabled": True, "style": 0, "brightness": 78.0,
+        "glow": 55.0, "spacing": 64.0, "thickness": 1.25,
+    },
+    "strokes": [],
+}
+
+
+def _finite_clamped(value, low, high, default):
+    try:
+        number = float(value)
+        if not math.isfinite(number):
+            number = float(default)
+    except (TypeError, ValueError):
+        number = float(default)
+    return min(float(high), max(float(low), number))
+
+
+def normalise_virtual_desktop_data(value):
+    """Validate persistent grid settings and normalized pen strokes."""
+    source = value if isinstance(value, dict) else {}
+    background_source = source.get("background", {})
+    if not isinstance(background_source, dict):
+        background_source = {}
+    defaults = VIRTUAL_DESKTOP_DEFAULTS["background"]
+    try:
+        style = int(background_source.get("style", defaults["style"]))
+    except (TypeError, ValueError):
+        style = defaults["style"]
+    background = {
+        "grid_enabled": (background_source.get("grid_enabled")
+                         if isinstance(background_source.get("grid_enabled"), bool)
+                         else defaults["grid_enabled"]),
+        "style": max(0, min(len(VIRTUAL_BACKGROUND_STYLES)-1, style)),
+        "brightness": _finite_clamped(background_source.get("brightness"), 10, 100, defaults["brightness"]),
+        "glow": _finite_clamped(background_source.get("glow"), 0, 100, defaults["glow"]),
+        "spacing": _finite_clamped(background_source.get("spacing"), 24, 160, defaults["spacing"]),
+        "thickness": _finite_clamped(background_source.get("thickness"), 0.5, 3.0, defaults["thickness"]),
+    }
+    strokes = []
+    raw_strokes = source.get("strokes", [])
+    total_points = 0
+    if isinstance(raw_strokes, list):
+        for raw in raw_strokes[-2000:]:
+            if not isinstance(raw, dict):
+                continue
+            erase = bool(raw.get("erase", False))
+            color = str(raw.get("color", "#43ddff"))
+            if not re.fullmatch(r"#[0-9a-fA-F]{6}", color):
+                color = "#43ddff"
+            raw_points = raw.get("points", [])
+            if not isinstance(raw_points, list):
+                continue
+            points = []
+            for point in raw_points[:5000]:
+                if not isinstance(point, (list, tuple)) or len(point) != 2:
+                    continue
+                try:
+                    x, y = float(point[0]), float(point[1])
+                except (TypeError, ValueError):
+                    continue
+                if not (math.isfinite(x) and math.isfinite(y)):
+                    continue
+                points.append([min(1.0, max(0.0, x)), min(1.0, max(0.0, y))])
+            if not points:
+                continue
+            if total_points + len(points) > 150000:
+                break
+            total_points += len(points)
+            strokes.append({
+                "color": color.lower(), "erase": erase,
+                "width": _finite_clamped(raw.get("width"), 0.0005, 0.06,
+                                          0.018 if erase else 0.0038),
+                "points": points,
+            })
+    return {"background": background, "strokes": strokes}
+
+
+def load_virtual_desktop_data(path=VIRTUAL_DESKTOP_DATA_FILE):
+    try:
+        raw = json.loads(Path(path).read_text(encoding="utf-8"))
+    except (OSError, ValueError, TypeError):
+        raw = {}
+    return normalise_virtual_desktop_data(raw)
+
+
+def save_virtual_desktop_data(value, path=VIRTUAL_DESKTOP_DATA_FILE):
+    clean = normalise_virtual_desktop_data(value)
+    destination = Path(path)
+    temporary = destination.with_suffix(destination.suffix + ".tmp")
+    try:
+        temporary.write_text(json.dumps(clean, indent=2) + "\n", encoding="utf-8")
+        os.replace(temporary, destination)
+        return True
+    except OSError as exc:
+        try:
+            temporary.unlink(missing_ok=True)
+        except OSError:
+            pass
+        print("Could not save virtual desktop:", exc)
+        return False
+
+
 NOTIFICATION_POSITIONS = ("top-left", "top-center", "top-right", "bottom-left", "bottom-center", "bottom-right")
 # Hand render styles, in the order shown by the Settings -> Hands switch.
 HAND_RENDER_STYLES = ("skeleton", "flat", "3d")
@@ -1761,6 +1877,25 @@ class SpatialDesktop(QWidget):
         self.ui_font_scale = float(self.ui_preferences.get("ui_font_scale", 1.2))
         self.show_gesture_disabled_indicator = bool(
             self.ui_preferences.get("show_gesture_disabled_indicator", True))
+        self.virtual_desktop_data = load_virtual_desktop_data()
+        virtual_bg = self.virtual_desktop_data["background"]
+        self.virtual_grid_enabled = bool(virtual_bg["grid_enabled"])
+        self.virtual_background_style = int(virtual_bg["style"])
+        self.virtual_grid_brightness = float(virtual_bg["brightness"])
+        self.virtual_grid_glow = float(virtual_bg["glow"])
+        self.virtual_grid_spacing = float(virtual_bg["spacing"])
+        self.virtual_grid_thickness = float(virtual_bg["thickness"])
+        self.virtual_canvas_strokes = self.virtual_desktop_data["strokes"]
+        self.virtual_canvas_layer = None
+        self.virtual_canvas_layer_size = None
+        self.virtual_canvas_layer_dirty = True
+        self.virtual_dock_open = True
+        self.virtual_pen_popup_open = False
+        self.virtual_pen_active = False
+        self.virtual_pen_color = VIRTUAL_PEN_PALETTE[1][1]
+        self.virtual_pen_erase = False
+        self.virtual_pen_active_stroke = None
+        self.virtual_pen_last_status_at = 0.0
         self.d1_ui_log = ["Engine panel ready."]
         self._last_d1_log_signature = None
         # Slider interaction intentionally moves at less than half the cursor speed for finer control.
@@ -2083,6 +2218,9 @@ class SpatialDesktop(QWidget):
         self.tts_settings_save_timer = QTimer(self)
         self.tts_settings_save_timer.setSingleShot(True)
         self.tts_settings_save_timer.timeout.connect(self.tts.save_settings)
+        self.virtual_desktop_save_timer = QTimer(self)
+        self.virtual_desktop_save_timer.setSingleShot(True)
+        self.virtual_desktop_save_timer.timeout.connect(self._save_virtual_desktop_data)
         # A mouse-transparent topmost visual layer keeps the skeleton, TLI and gesture
         # progress visible over the search launcher without blocking its controls.
         self.search_hand_overlay = SearchHandOverlay(self)
@@ -2201,19 +2339,389 @@ class SpatialDesktop(QWidget):
             return self._glass_virtual_backdrop
         width, height = size
         image = QImage(width, height, QImage.Format.Format_RGB32)
-        image.fill(QColor(8, 12, 22))
         grid = QPainter(image)
-        grid.setRenderHint(QPainter.Antialiasing, True)
-        for x in range(0, width, 64):
-            grid.setPen(QPen(QColor(60, 105, 155, 28), 1))
-            grid.drawLine(x, 0, x, height)
-        for y in range(0, height, 64):
-            grid.setPen(QPen(QColor(60, 105, 155, 28), 1))
-            grid.drawLine(0, y, width, y)
+        self._paint_virtual_background(grid, width, height)
         grid.end()
         self._glass_virtual_backdrop = self._blur_glass_image(image, sigma=36.0)
         self._glass_virtual_backdrop_size = size
         return self._glass_virtual_backdrop
+
+    def _virtual_background_style_data(self):
+        index = max(0, min(len(VIRTUAL_BACKGROUND_STYLES)-1, int(self.virtual_background_style)))
+        return VIRTUAL_BACKGROUND_STYLES[index]
+
+    def _paint_virtual_background(self, painter, width, height):
+        """Paint the Virtual desktop base and customizable glowing grid."""
+        style = self._virtual_background_style_data()
+        painter.fillRect(QRectF(0, 0, width, height), QColor(style["background"]))
+        if not self.virtual_grid_enabled:
+            return
+        base = QColor(style["grid"])
+        brightness = min(1.0, max(0.0, float(self.virtual_grid_brightness)/100.0))
+        glow = min(1.0, max(0.0, float(self.virtual_grid_glow)/100.0))
+        spacing = int(min(160, max(24, round(self.virtual_grid_spacing))))
+        thickness = min(3.0, max(0.5, float(self.virtual_grid_thickness)))
+        core_alpha = int(45 + 185*brightness)
+        lines = [("x", x) for x in range(0, int(width)+1, spacing)]
+        lines.extend(("y", y) for y in range(0, int(height)+1, spacing))
+        painter.save()
+        painter.setRenderHint(QPainter.Antialiasing, True)
+        # Layered translucent passes create a neon-like bloom without an expensive blur.
+        if glow > 0.01:
+            outer = QColor(base.red(), base.green(), base.blue(), int(6 + glow*58*brightness))
+            middle = QColor(base.red(), base.green(), base.blue(), int(10 + glow*88*brightness))
+            for axis, pos in lines:
+                painter.setPen(QPen(outer, thickness + 7.0*glow, Qt.SolidLine, Qt.RoundCap))
+                if axis == "x":
+                    painter.drawLine(QPointF(pos, 0), QPointF(pos, height))
+                else:
+                    painter.drawLine(QPointF(0, pos), QPointF(width, pos))
+                painter.setPen(QPen(middle, thickness + 3.0*glow, Qt.SolidLine, Qt.RoundCap))
+                if axis == "x":
+                    painter.drawLine(QPointF(pos, 0), QPointF(pos, height))
+                else:
+                    painter.drawLine(QPointF(0, pos), QPointF(width, pos))
+        core = QColor(base.red(), base.green(), base.blue(), core_alpha)
+        for axis, pos in lines:
+            painter.setPen(QPen(core, thickness, Qt.SolidLine, Qt.RoundCap))
+            if axis == "x":
+                painter.drawLine(QPointF(pos, 0), QPointF(pos, height))
+            else:
+                painter.drawLine(QPointF(0, pos), QPointF(width, pos))
+        painter.restore()
+
+    def _save_virtual_desktop_data(self):
+        self.virtual_desktop_data = {
+            "background": {
+                "grid_enabled": bool(self.virtual_grid_enabled),
+                "style": int(self.virtual_background_style),
+                "brightness": float(self.virtual_grid_brightness),
+                "glow": float(self.virtual_grid_glow),
+                "spacing": float(self.virtual_grid_spacing),
+                "thickness": float(self.virtual_grid_thickness),
+            },
+            "strokes": self.virtual_canvas_strokes,
+        }
+        saved = save_virtual_desktop_data(self.virtual_desktop_data)
+        if saved:
+            self.virtual_desktop_data = normalise_virtual_desktop_data(self.virtual_desktop_data)
+
+    def _schedule_virtual_desktop_save(self):
+        timer = getattr(self, "virtual_desktop_save_timer", None)
+        if timer is not None:
+            timer.start(300)
+        else:
+            self._save_virtual_desktop_data()
+
+    def _virtual_dock_geometry(self):
+        """Dock and Pen app geometry, anchored above the bottom screen edge."""
+        width, height = float(self.width()), float(self.height())
+        dock = QRectF((width-292.0)*0.5, height-86.0, 292.0, 66.0)
+        pen = QRectF(dock.left()+112.0, dock.top()+8.0, 48.0, 48.0)
+        return {"dock": dock, "pen": pen}
+
+    def _virtual_pen_popup_geometry(self):
+        """Colour/eraser palette positioned directly above the Pen dock item."""
+        pen = self._virtual_dock_geometry()["pen"]
+        cell, gap, margin = 29.0, 7.0, 12.0
+        count = len(VIRTUAL_PEN_PALETTE)+2
+        width = margin*2 + count*cell + (count-1)*gap
+        height = 54.0
+        left = min(max(8.0, pen.center().x()-width*0.5), max(8.0, self.width()-width-8.0))
+        top = max(8.0, pen.top()-height-12.0)
+        panel = QRectF(left, top, width, height)
+        items = {}
+        for index, (name, color) in enumerate(VIRTUAL_PEN_PALETTE):
+            x = left+margin+index*(cell+gap)
+            items[name.lower()] = QRectF(x, top+12.0, cell, cell)
+        eraser_x = left+margin+len(VIRTUAL_PEN_PALETTE)*(cell+gap)
+        items["eraser"] = QRectF(eraser_x, top+12.0, cell, cell)
+        pointer_x = eraser_x+(cell+gap)
+        items["pointer"] = QRectF(pointer_x, top+12.0, cell, cell)
+        return {"panel": panel, "items": items}
+
+    def _virtual_pen_ui_contains(self, point):
+        if point is None:
+            return False
+        dock = self._virtual_dock_geometry()["dock"]
+        if dock.contains(point):
+            return True
+        if self.virtual_pen_popup_open:
+            return self._virtual_pen_popup_geometry()["panel"].contains(point)
+        return False
+
+    def _handle_virtual_dock_click(self, point):
+        """Handle hand clicks on the Virtual apps dock and Pen palette."""
+        if point is None or self.desktop_mode != "virtual":
+            return False
+        # The glass menu is modal, but this handler runs only after its own hit tests.
+        if self.menu_open and self.hub_visible:
+            return False
+        if self.virtual_pen_popup_open:
+            popup = self._virtual_pen_popup_geometry()
+            if popup["panel"].contains(point):
+                for name, rect in popup["items"].items():
+                    if not rect.contains(point):
+                        continue
+                    if name == "eraser":
+                        self.virtual_pen_active = True
+                        self.virtual_pen_erase = True
+                        self.status = "Virtual pen eraser selected — pinch and move to erase"
+                    elif name == "pointer":
+                        self.virtual_pen_active = False
+                        self.virtual_pen_erase = False
+                        self.status = "Virtual pen disabled — normal gestures restored"
+                    else:
+                        color = next(color for label, color in VIRTUAL_PEN_PALETTE
+                                     if label.lower() == name)
+                        self.virtual_pen_active = True
+                        self.virtual_pen_erase = False
+                        self.virtual_pen_color = color
+                        self.status = f"Virtual pen colour: {name}"
+                    self.virtual_pen_popup_open = False
+                    self.update()
+                    return True
+        geometry = self._virtual_dock_geometry()
+        if geometry["pen"].contains(point):
+            self.virtual_pen_popup_open = not self.virtual_pen_popup_open
+            self.status = "Choose a pen colour or eraser" if self.virtual_pen_popup_open else "Pen palette closed"
+            self.update()
+            return True
+        if self.virtual_pen_popup_open:
+            self.virtual_pen_popup_open = False
+            self.update()
+            if geometry["dock"].contains(point):
+                return True
+        return geometry["dock"].contains(point)
+
+    def _virtual_normalized_point(self, point):
+        return [min(1.0, max(0.0, float(point.x())/max(1.0, float(self.width())))),
+                min(1.0, max(0.0, float(point.y())/max(1.0, float(self.height()))))]
+
+    def _virtual_pixel_point(self, point):
+        return QPointF(float(point[0])*self.width(), float(point[1])*self.height())
+
+    def _draw_virtual_stroke(self, painter, stroke, points=None):
+        values = stroke.get("points", []) if points is None else points
+        if not values:
+            return
+        pixel_points = [self._virtual_pixel_point(point) for point in values]
+        width = max(1.0, float(stroke.get("width", 0.0038))*min(self.width(), self.height()))
+        color = QColor(str(stroke.get("color", "#43ddff")))
+        if not color.isValid():
+            color = QColor("#43ddff")
+        painter.save()
+        painter.setRenderHint(QPainter.Antialiasing, True)
+        painter.setPen(QPen(color, width, Qt.SolidLine, Qt.RoundCap, Qt.RoundJoin))
+        if stroke.get("erase", False):
+            painter.setCompositionMode(QPainter.CompositionMode_Clear)
+        if len(pixel_points) == 1:
+            painter.drawPoint(pixel_points[0])
+        else:
+            painter.drawPolyline(QPolygonF(pixel_points))
+        painter.restore()
+
+    def _ensure_virtual_canvas_layer(self):
+        size = (max(1, self.width()), max(1, self.height()))
+        if (self.virtual_canvas_layer is not None and not self.virtual_canvas_layer_dirty
+                and self.virtual_canvas_layer_size == size):
+            return self.virtual_canvas_layer
+        layer = QImage(size[0], size[1], QImage.Format.Format_ARGB32_Premultiplied)
+        layer.fill(Qt.transparent)
+        canvas_painter = QPainter(layer)
+        canvas_painter.setRenderHint(QPainter.Antialiasing, True)
+        for stroke in self.virtual_canvas_strokes:
+            self._draw_virtual_stroke(canvas_painter, stroke)
+        active = self.virtual_pen_active_stroke
+        if active is not None:
+            self._draw_virtual_stroke(canvas_painter, active)
+        canvas_painter.end()
+        self.virtual_canvas_layer = layer
+        self.virtual_canvas_layer_size = size
+        self.virtual_canvas_layer_dirty = False
+        return layer
+
+    def _append_virtual_pen_point(self, point):
+        active = self.virtual_pen_active_stroke
+        if active is None or point is None:
+            return
+        normalized = self._virtual_normalized_point(point)
+        points = active["points"]
+        if points:
+            previous = self._virtual_pixel_point(points[-1])
+            if math.hypot(point.x()-previous.x(), point.y()-previous.y()) < 1.5:
+                return
+        layer = self._ensure_virtual_canvas_layer()
+        before_count = len(points)
+        points.append(normalized)
+        # If the layer was freshly rebuilt, it already contains the stroke as it
+        # existed before this point. Add only the newly reached segment.
+        if before_count == 0:
+            self._draw_virtual_stroke_segment(layer, active, None, normalized)
+        else:
+            self._draw_virtual_stroke_segment(layer, active, points[-2], normalized)
+        self.update()
+
+    def _draw_virtual_stroke_segment(self, layer, stroke, start, end):
+        if layer is None or end is None:
+            return
+        painter = QPainter(layer)
+        painter.setRenderHint(QPainter.Antialiasing, True)
+        width = max(1.0, float(stroke.get("width", 0.0038))*min(self.width(), self.height()))
+        color = QColor(str(stroke.get("color", "#43ddff")))
+        if not color.isValid():
+            color = QColor("#43ddff")
+        painter.setPen(QPen(color, width, Qt.SolidLine, Qt.RoundCap, Qt.RoundJoin))
+        if stroke.get("erase", False):
+            painter.setCompositionMode(QPainter.CompositionMode_Clear)
+        end_point = self._virtual_pixel_point(end)
+        if start is None:
+            painter.drawPoint(end_point)
+        else:
+            painter.drawLine(self._virtual_pixel_point(start), end_point)
+        painter.end()
+
+    def _finish_virtual_pen_stroke(self):
+        stroke = self.virtual_pen_active_stroke
+        if stroke is None:
+            return
+        self.virtual_pen_active_stroke = None
+        if len(stroke.get("points", [])) >= 1:
+            stored = {key: stroke[key] for key in ("color", "erase", "width", "points") if key in stroke}
+            self.virtual_canvas_strokes.append(stored)
+            if len(self.virtual_canvas_strokes) > 2000:
+                self.virtual_canvas_strokes = self.virtual_canvas_strokes[-2000:]
+            self.virtual_canvas_layer_dirty = True
+            self._save_virtual_desktop_data()
+        self.gesture_owner = None
+        self.active_push_sides.discard(stroke.get("side"))
+        self.update()
+
+    def _handle_virtual_pen_frame(self, side, cursor, is_pinch, now):
+        """Consume one hand's pinch frames while the Virtual Pen is selected."""
+        active = self.virtual_pen_active_stroke
+        if active is not None and active.get("side") == side:
+            if is_pinch and self.desktop_mode == "virtual":
+                active["last_point_at"] = now
+                self._append_virtual_pen_point(cursor)
+            else:
+                self._finish_virtual_pen_stroke()
+            self._clear_menu_pinch_sequence(side)
+            self.fist_started_at[side] = None
+            self.fist_hold_armed[side] = False
+            self.fist_action[side] = None
+            self.active_action[side] = None
+            if self.gesture_owner == side:
+                self.gesture_owner = None
+            self.action_stop_wait_open[side] = True
+            self.action_stop_open_since[side] = None
+            return True
+        if (self.desktop_mode != "virtual" or not self.virtual_pen_active or
+                (self.menu_open and self.hub_visible) or self.settings_open or
+                self.floating_clipboard_visible or not is_pinch or
+                self._virtual_pen_ui_contains(cursor)):
+            return False
+        self._clear_menu_pinch_sequence(side)
+        stroke = {
+            "side": side, "color": "#ffffff" if self.virtual_pen_erase else self.virtual_pen_color,
+            "erase": bool(self.virtual_pen_erase),
+            "width": 0.018 if self.virtual_pen_erase else 0.0038,
+            "points": [], "last_point_at": now,
+        }
+        self.virtual_pen_active_stroke = stroke
+        self.gesture_owner = side
+        self.canvas_active_side = side
+        self.active_push_sides.add(side)
+        self.action_stop_wait_open[side] = False
+        self._append_virtual_pen_point(cursor)
+        return True
+
+    def _paint_virtual_app_dock(self, painter):
+        """Draw the bottom Virtual Apps dock and its Pen colour/eraser popup."""
+        if self.desktop_mode != "virtual" or (self.menu_open and self.hub_visible) or self.settings_open:
+            return
+        geometry = self._virtual_dock_geometry()
+        dock, pen = geometry["dock"], geometry["pen"]
+        painter.save()
+        # Dock shadow + glass-like ribbon.
+        painter.setPen(Qt.NoPen)
+        painter.setBrush(QBrush(QColor(0, 0, 0, 105)))
+        painter.drawRoundedRect(dock.translated(0, 4), 18, 18)
+        dock_gradient = QLinearGradient(dock.topLeft(), dock.bottomRight())
+        dock_gradient.setColorAt(0.0, QColor(25, 63, 82, 238))
+        dock_gradient.setColorAt(1.0, QColor(4, 16, 30, 242))
+        painter.setBrush(QBrush(dock_gradient))
+        painter.setPen(QPen(QColor(103, 214, 236, 210), 1.4))
+        painter.drawRoundedRect(dock, 18, 18)
+        painter.setPen(QColor(180, 224, 235, 210))
+        painter.setFont(self._ui_font(7, QFont.DemiBold))
+        painter.drawText(QRectF(dock.left()+12, dock.top()+7, 86, 16), Qt.AlignLeft | Qt.AlignVCenter, "VIRTUAL APPS")
+        painter.setPen(QPen(QColor(120, 205, 222, 100), 1.0))
+        painter.drawLine(QPointF(dock.left()+101, dock.top()+11), QPointF(dock.left()+101, dock.bottom()-11))
+        active_fill = QColor(49, 139, 158, 235) if self.virtual_pen_active else QColor(14, 42, 59, 235)
+        painter.setBrush(QBrush(active_fill))
+        painter.setPen(QPen(QColor(103, 226, 245, 235), 1.4))
+        painter.drawRoundedRect(pen, 12, 12)
+        if self.virtual_pen_active:
+            painter.setPen(QPen(QColor(115, 255, 245, 70), 5.0))
+            painter.setBrush(Qt.NoBrush)
+            painter.drawRoundedRect(pen.adjusted(-2, -2, 2, 2), 13, 13)
+        # A minimal pen nib/stylus icon, drawn locally (no external image required).
+        icon_center = QPointF(pen.center().x(), pen.center().y())
+        painter.save()
+        painter.translate(icon_center)
+        painter.rotate(-42)
+        painter.setPen(QPen(QColor(235, 251, 255), 3.8, Qt.SolidLine, Qt.RoundCap, Qt.RoundJoin))
+        painter.drawLine(QPointF(0, -12), QPointF(0, 8))
+        painter.setPen(QPen(QColor(67, 221, 255), 3.8, Qt.SolidLine, Qt.RoundCap, Qt.RoundJoin))
+        painter.drawLine(QPointF(0, -12), QPointF(0, -2))
+        painter.setPen(QPen(QColor(235, 251, 255), 1.6))
+        painter.drawLine(QPointF(-3, 8), QPointF(3, 8))
+        painter.restore()
+        painter.setPen(QColor(235, 250, 255))
+        painter.setFont(self._ui_font(9, QFont.DemiBold))
+        painter.drawText(QRectF(pen.right()+9, pen.top()+3, 90, pen.height()-6), Qt.AlignLeft | Qt.AlignVCenter,
+                         "PEN" if not self.virtual_pen_active else ("ERASER" if self.virtual_pen_erase else "PEN ACTIVE"))
+
+        if self.virtual_pen_popup_open:
+            popup = self._virtual_pen_popup_geometry()
+            panel = popup["panel"]
+            painter.setPen(Qt.NoPen)
+            painter.setBrush(QBrush(QColor(0, 0, 0, 95)))
+            painter.drawRoundedRect(panel.translated(0, 3), 15, 15)
+            gradient = QLinearGradient(panel.topLeft(), panel.bottomRight())
+            gradient.setColorAt(0, QColor(22, 57, 76, 248))
+            gradient.setColorAt(1, QColor(5, 17, 30, 250))
+            painter.setBrush(QBrush(gradient))
+            painter.setPen(QPen(QColor(101, 220, 242, 220), 1.3))
+            painter.drawRoundedRect(panel, 15, 15)
+            for name, rect in popup["items"].items():
+                if name == "eraser":
+                    selected = self.virtual_pen_erase and self.virtual_pen_active
+                    painter.setBrush(QBrush(QColor(185, 83, 91, 235) if selected else QColor(46, 57, 70, 235)))
+                    painter.setPen(QPen(QColor(255, 143, 148, 235), 1.1))
+                    painter.drawRoundedRect(rect, 7, 7)
+                    painter.setPen(QPen(QColor(255, 240, 240), 2.2, Qt.SolidLine, Qt.RoundCap))
+                    painter.drawLine(QPointF(rect.left()+7, rect.bottom()-8), QPointF(rect.right()-7, rect.top()+8))
+                elif name == "pointer":
+                    selected = not self.virtual_pen_active
+                    painter.setBrush(QBrush(QColor(45, 115, 139, 235) if selected else QColor(46, 57, 70, 235)))
+                    painter.setPen(QPen(QColor(145, 224, 239, 235), 1.1))
+                    painter.drawRoundedRect(rect, 7, 7)
+                    painter.setPen(QPen(QColor(242, 252, 255), 2.2, Qt.SolidLine, Qt.RoundCap, Qt.RoundJoin))
+                    painter.drawLine(QPointF(rect.left()+8, rect.top()+6), QPointF(rect.left()+8, rect.bottom()-7))
+                    painter.drawLine(QPointF(rect.left()+8, rect.top()+6), QPointF(rect.right()-7, rect.top()+15))
+                    painter.drawLine(QPointF(rect.left()+8, rect.bottom()-7), QPointF(rect.left()+17, rect.bottom()-12))
+                else:
+                    color = next(color for label, color in VIRTUAL_PEN_PALETTE if label.lower() == name)
+                    painter.setBrush(QBrush(QColor(color)))
+                    is_selected = self.virtual_pen_active and not self.virtual_pen_erase and self.virtual_pen_color.lower() == color.lower()
+                    painter.setPen(QPen(QColor(235, 255, 255, 245) if is_selected else QColor(90, 145, 163, 190), 2 if is_selected else 1))
+                    painter.drawEllipse(rect.adjusted(3, 3, -3, -3))
+                    if is_selected:
+                        painter.setPen(QPen(QColor(235, 255, 255, 230), 1.2))
+                        painter.drawEllipse(rect.adjusted(0, 0, 0, 0))
+        painter.restore()
 
     def _capture_glass_backdrop(self):
         """Capture the desktop without our overlay, then cache its blurred pixels for glass panels."""
@@ -2390,6 +2898,11 @@ class SpatialDesktop(QWidget):
             y += 80.0
             texts["about"] = (L, y, 2*W+(R-(L+W)), 44.0)
             y += 44.0 + gap
+        elif page == "virtual":
+            stack("virtual_grid_toggle")
+            stack("virtual_background_style")
+            texts["help"] = (L, y, W, 58.0)
+            y += 58.0 + gap
         elif page == "d1":
             stack("d1_model", h=44.0)
             half = (W-gap)*0.5
@@ -2468,12 +2981,12 @@ class SpatialDesktop(QWidget):
         # same rectangles, so the visible and clickable areas stay aligned.
         tab_gap = 4.5*scale
         tab_height = 40.0*scale
-        widths = [94.0, 70.0, 70.0, 70.0, 94.0, 70.0, 70.0, 70.0]
-        total = sum(widths)*scale + tab_gap*7.0
+        widths = [88.0, 64.0, 60.0, 66.0, 88.0, 60.0, 54.0, 56.0, 66.0]
+        total = sum(widths)*scale + tab_gap*8.0
         left = cx-total*0.5
         _panel_width, panel_height = self._menu_panel_dimensions()
         y = cy-(panel_height*0.5-25.0)*scale
-        names = ("interaction", "hands", "tli", "notifications", "gestures", "voice", "d1", "update")
+        names = ("interaction", "hands", "tli", "notifications", "gestures", "voice", "d1", "update", "virtual")
         rects = {}
         x = left
         for name, width in zip(names, widths):
@@ -2811,6 +3324,13 @@ class SpatialDesktop(QWidget):
             return [
                 ("custom_gesture_hold_seconds", self.custom_gesture_hold_seconds, 0.2, 1.5, "HOLD TIME"),
                 ("custom_gesture_tolerance", self.custom_gesture_tolerance, 0.08, 0.40, "MATCH TOLERANCE"),
+            ]
+        if page == "virtual":
+            return [
+                ("virtual_grid_brightness", self.virtual_grid_brightness, 10.0, 100.0, "GRID BRIGHTNESS"),
+                ("virtual_grid_glow", self.virtual_grid_glow, 0.0, 100.0, "GRID GLOW"),
+                ("virtual_grid_spacing", self.virtual_grid_spacing, 24.0, 160.0, "GRID SPACING"),
+                ("virtual_grid_thickness", self.virtual_grid_thickness, 0.5, 3.0, "GRID LINE THICKNESS"),
             ]
         if page == "hands":
             return [
@@ -4328,6 +4848,10 @@ class SpatialDesktop(QWidget):
             "skeleton_line_thickness": ("skeleton_line_thickness", 0.02),
             "hand_contact_band_ratio": ("hand_contact_band_ratio", 0.005),
             "palm_attract_acceleration": ("palm_attract_acceleration", 0.02),
+            "virtual_grid_brightness": ("virtual_grid_brightness", 0.5),
+            "virtual_grid_glow": ("virtual_grid_glow", 0.5),
+            "virtual_grid_spacing": ("virtual_grid_spacing", 1.0),
+            "virtual_grid_thickness": ("virtual_grid_thickness", 0.05),
         }
         if name == "tts_speed":
             if abs(value-float(self.tts.settings["speed"])) > 0.015:
@@ -4345,6 +4869,11 @@ class SpatialDesktop(QWidget):
                 if name == "ui_font_scale":
                     self.ui_preferences["ui_font_scale"] = value
                     save_ui_preferences(self.ui_preferences)
+                    self.update()
+                elif name.startswith("virtual_grid_"):
+                    self._schedule_virtual_desktop_save()
+                    self._glass_virtual_backdrop = None
+                    self._glass_virtual_backdrop_size = None
                     self.update()
                 else:
                     self.schedule_gesture_settings_save()
@@ -4508,6 +5037,23 @@ class SpatialDesktop(QWidget):
                 self._click_custom_gestures_page(point, cx, cy, scale, now)
                 return
 
+            if self.settings_page == "virtual":
+                if pressed("virtual_grid_toggle"):
+                    self.virtual_grid_enabled = not self.virtual_grid_enabled
+                    self._glass_virtual_backdrop = None
+                    self._glass_virtual_backdrop_size = None
+                    self._schedule_virtual_desktop_save()
+                    self.status = "Virtual grid enabled" if self.virtual_grid_enabled else "Virtual grid hidden"
+                    self.update()
+                elif pressed("virtual_background_style"):
+                    self.virtual_background_style = (self.virtual_background_style + 1) % len(VIRTUAL_BACKGROUND_STYLES)
+                    self._glass_virtual_backdrop = None
+                    self._glass_virtual_backdrop_size = None
+                    self._schedule_virtual_desktop_save()
+                    self.status = "Virtual background: " + self._virtual_background_style_data()["name"].title()
+                    self.update()
+                return
+
             if self.settings_page == "hands":
                 if pressed("render_style"):
                     # Three-way switch: the third of the control that was pressed.
@@ -4616,6 +5162,10 @@ class SpatialDesktop(QWidget):
                     self.status = "Checking d1 model and runtime; download/start requested."
                     self._log_d1_ui("Download / retry / start requested")
                 return
+            return
+
+        # Virtual desktop app controls remain interactive without forwarding clicks to OS apps.
+        if self.desktop_mode == "virtual" and self._handle_virtual_dock_click(point):
             return
 
         # Detached hands can still operate Spatial Desktop's own glass controls, but
@@ -7944,6 +8494,12 @@ try {
         if name == "scroll_notch_hue":
             notch = QColor.fromHsv(int(value) % 360, 190, 255)
             return f"RGB {notch.red()}, {notch.green()}, {notch.blue()}"
+        if name in ("virtual_grid_brightness", "virtual_grid_glow"):
+            return f"{value:.0f}%"
+        if name == "virtual_grid_spacing":
+            return f"{value:.0f}px"
+        if name == "virtual_grid_thickness":
+            return f"{value:.2f}px"
         return f"{value:.2f}x"
 
     def _paint_settings_sliders(self, painter, cx, cy, scale):
@@ -9544,6 +10100,12 @@ try {
         gesture, drag, transition or press feedback restores the full frame rate.
         """
         try:
+            if getattr(self, "virtual_pen_active_stroke", None) is not None:
+                stroke = self.virtual_pen_active_stroke
+                if now-float(stroke.get("last_point_at", now)) > 1.2:
+                    self._finish_virtual_pen_stroke()
+                else:
+                    return False
             if any(now-float(seen or 0.0) < 0.6 for seen in self.hand_last_seen.values()):
                 return False
             if any(self.active_action.values()) or any(self.pinch_drag_active.values()):
@@ -10593,6 +11155,18 @@ try {
                     self.active_push_sides.add(side)
                     continue
 
+            # When the Virtual Pen is selected, thumb/index pinch is drawing input on
+            # the virtual canvas, not a native click or Pinch Menu hold. Dock/palette
+            # regions are excluded so they remain clickable with a short pinch.
+            if self.virtual_pen_active_stroke is not None and self.virtual_pen_active_stroke.get("side") == side:
+                if self._handle_virtual_pen_frame(side, cursor, is_pinch, now):
+                    continue
+            elif (self.desktop_mode == "virtual" and self.virtual_pen_active and is_pinch
+                  and not (self.menu_open and self.hub_visible) and not self.settings_open
+                  and not self.floating_clipboard_visible and not self._virtual_pen_ui_contains(cursor)):
+                if self._handle_virtual_pen_frame(side, cursor, is_pinch, now):
+                    continue
+
             # A moving held pinch is a native click-and-hold drag. Consume every frame
             # until release, so the same gesture cannot also fire a quick click or menu.
             if self.pinch_drag_active.get(side, False):
@@ -11382,6 +11956,12 @@ try {
         self._request_scene_repaint(now)
 
     def closeEvent(self, event):
+        if getattr(self, "virtual_pen_active_stroke", None) is not None:
+            self._finish_virtual_pen_stroke()
+        pending_virtual_save = getattr(self, "virtual_desktop_save_timer", None)
+        if pending_virtual_save is not None and pending_virtual_save.isActive():
+            pending_virtual_save.stop()
+            self._save_virtual_desktop_data()
         self._stop_native_custom_key_capture()
         self.custom_gesture_key_capture = None
         if getattr(self, "hand_calibration_window", None) is not None:
@@ -11685,13 +12265,16 @@ try {
         # bottom-centre, but their rectangles are allocated cumulatively with a clear gap.
         notification_stack_offsets = {}
         if self.desktop_mode == "virtual":
-            painter.fillRect(self.rect(), QColor(8, 12, 22))
-            spacing = 64
-            for x in range(0, width, spacing):
-                painter.setPen(QPen(QColor(60, 105, 155, 28), 1))
-                painter.drawLine(x, 0, x, height)
-            for y in range(0, height, spacing):
-                painter.drawLine(0, y, width, y)
+            self._paint_virtual_background(painter, width, height)
+            canvas_layer = self._ensure_virtual_canvas_layer()
+            if canvas_layer is not None and not canvas_layer.isNull():
+                painter.drawImage(QPointF(0, 0), canvas_layer)
+            self._paint_virtual_app_dock(painter)
+            active_stroke = self.virtual_pen_active_stroke
+            if active_stroke is not None and active_stroke.get("points"):
+                # The layer is incremental, but replay the active stroke after a resize
+                # only when the layer is rebuilt; normally the cached layer already has it.
+                pass
 
         # Paint scroll-circle backdrops before hand geometry so the virtual hand always
         # renders in front of the translucent background.
@@ -11916,7 +12499,7 @@ try {
 
                 tab_labels = {"interaction": "INTERACTION", "hands": "HANDS", "tli": "TPI",
                               "notifications": "NOTIFY", "gestures": "GESTURES", "voice": "VOICE",
-                              "d1": "ENGINE", "update": "UPDATE"}
+                              "d1": "ENGINE", "update": "UPDATE", "virtual": "VIRTUAL"}
                 info_pages = ("gesture_map", "speech_commands")
                 if self.settings_page not in info_pages:
                     for page_name, tab in self._settings_tab_rects(cx, cy, scale).items():
@@ -12040,7 +12623,7 @@ try {
                     self._paint_reference_columns(painter, columns, cx, cy, scale)
 
                 elif self.settings_page in ("interaction", "hands", "tli", "gestures",
-                                            "notifications", "voice", "update", "d1"):
+                                            "notifications", "voice", "update", "d1", "virtual"):
                     # Every control below is placed by _settings_layout(), the same
                     # geometry used for click hit-testing and hover/press feedback.
                     controls = self._settings_control_rects(cx, cy, scale)
@@ -12087,6 +12670,34 @@ try {
                             self._draw_fitted_button_label(
                                 painter, QRectF(swatch.left(), swatch.top()+42*scale, swatch.width(), 20*scale),
                                 label, base_size=label_size, min_size=6, inset=2)
+
+                    elif self.settings_page == "virtual":
+                        grid_button = controls["virtual_grid_toggle"]
+                        grid_fill = QColor(55, 145, 82, 225) if self.virtual_grid_enabled else QColor(75, 80, 89, 205)
+                        grid_edge = QColor(155, 245, 180, 220) if self.virtual_grid_enabled else QColor(155, 162, 172, 200)
+                        painter.setBrush(QBrush(grid_fill))
+                        painter.setPen(QPen(grid_edge, 1.5*scale))
+                        painter.drawRoundedRect(grid_button, 10*scale, 10*scale)
+                        painter.setPen(QColor(235, 255, 255))
+                        self._draw_fitted_button_label(
+                            painter, grid_button, "GRID  ·  "+("ON" if self.virtual_grid_enabled else "OFF"),
+                            base_size=label_size, min_size=6, inset=12*scale)
+
+                        style_button = controls["virtual_background_style"]
+                        style_data = self._virtual_background_style_data()
+                        painter.setBrush(QBrush(QColor(style_data["background"])))
+                        painter.setPen(QPen(QColor(style_data["grid"]), 2.0*scale))
+                        painter.drawRoundedRect(style_button, 10*scale, 10*scale)
+                        painter.setPen(QColor(245, 255, 255))
+                        self._draw_fitted_button_label(
+                            painter, style_button, "BACKGROUND  ·  "+style_data["name"],
+                            base_size=label_size, min_size=6, inset=12*scale)
+                        painter.setPen(QColor(185, 225, 235))
+                        self._draw_wrapped_fitted_text(
+                            painter, text_rects["help"],
+                            "Adjust the glowing grid with the sliders. Drawings made with the Virtual Pen are saved between sessions.",
+                            base_size=max(7, int(8*scale)), min_size=6,
+                            align=Qt.AlignLeft | Qt.AlignTop)
 
                     elif self.settings_page == "hands":
                         # Three-way RENDER STYLE switch: SKELETON | FLAT | 3D.
