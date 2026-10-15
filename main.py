@@ -164,6 +164,7 @@ def load_ui_preferences() -> dict:
         "dictation_indicator_position": "top-left",
         "stt_indicator_position": "top-right",
         "ui_font_scale": 1.2,
+        "show_gesture_disabled_indicator": True,
     }
     try:
         supplied = json.loads(UI_SETTINGS_FILE.read_text(encoding="utf-8"))
@@ -178,6 +179,9 @@ def load_ui_preferences() -> dict:
                     result[key] = min(1.4, max(0.7, float(value)))
                 except (TypeError, ValueError):
                     pass
+            elif key == "show_gesture_disabled_indicator":
+                if isinstance(value, bool):
+                    result[key] = value
             elif value in NOTIFICATION_POSITIONS:
                 result[key] = value
     return result
@@ -191,6 +195,9 @@ def save_ui_preferences(values: dict) -> None:
                 current[key] = min(1.4, max(0.7, float(value)))
             except (TypeError, ValueError):
                 pass
+        elif key == "show_gesture_disabled_indicator":
+            if isinstance(value, bool):
+                current[key] = value
         elif value in NOTIFICATION_POSITIONS:
             current[key] = value
     try:
@@ -1106,6 +1113,7 @@ class SearchHandOverlay(QWidget):
                 continue
             color = QColor(owner.left_click_color if side == "left" else owner.right_click_color)
             owner._paint_hand_skeleton(painter, points, side)
+            owner._paint_gesture_disabled_indicator(painter, points, side)
             cursor = owner.side_cursor_positions.get(side)
             if cursor is None:
                 # The current frame has landmarks but no eligible cursor (for example,
@@ -1714,6 +1722,8 @@ class SpatialDesktop(QWidget):
         self.cursor_lock_priority = settings.get("cursor_lock_priority", "right")
         self.ui_preferences = load_ui_preferences()
         self.ui_font_scale = float(self.ui_preferences.get("ui_font_scale", 1.2))
+        self.show_gesture_disabled_indicator = bool(
+            self.ui_preferences.get("show_gesture_disabled_indicator", True))
         self.d1_ui_log = ["Engine panel ready."]
         self._last_d1_log_signature = None
         # Slider interaction intentionally moves at less than half the cursor speed for finer control.
@@ -2304,6 +2314,7 @@ class SpatialDesktop(QWidget):
         elif page == "hands":
             stack("render_style")
             stack("skin_tint")
+            stack("disabled_indicator_toggle")
             y += group
             stack("calibrate_left")
             stack("calibrate_right")
@@ -4479,6 +4490,14 @@ class SpatialDesktop(QWidget):
                     self.skin_use_skeleton_color = not self.skin_use_skeleton_color
                     self.schedule_gesture_settings_save()
                     self.status = "Skin uses skeleton colour" if self.skin_use_skeleton_color else "Skin uses natural colour"
+                    return
+                if pressed("disabled_indicator_toggle"):
+                    self.show_gesture_disabled_indicator = not self.show_gesture_disabled_indicator
+                    self.ui_preferences["show_gesture_disabled_indicator"] = self.show_gesture_disabled_indicator
+                    save_ui_preferences(self.ui_preferences)
+                    self.status = ("Disabled-gesture indicator shown" if self.show_gesture_disabled_indicator
+                                   else "Disabled-gesture indicator hidden")
+                    self.update()
                     return
                 for calibration_side, calibration_rect in self._tli_calibration_button_rects(cx, cy, scale).items():
                     if calibration_rect.contains(point):
@@ -7951,6 +7970,56 @@ try {
         if not math.isfinite(full) or full <= 1e-6:
             return 1.0
         return min(limit, max(1.0, full/max(flat, full/limit)))
+
+    def _paint_gesture_disabled_indicator(self, painter, points, side):
+        """Draw a red prohibition badge over a hand whose gesture input is disabled."""
+        if (not getattr(self, "show_gesture_disabled_indicator", True) or
+                side not in ("left", "right") or
+                getattr(self, "gesture_tracking_enabled", {}).get(side, True) or
+                not points or len(points) < 18):
+            return
+
+        source_points = points
+        display = getattr(self, "hand_display_positions", {}).get(side)
+        if (getattr(self, "hand_render_style", "flat") != "skeleton" and
+                display is not None and display[0] is source_points):
+            points = display[1]
+
+        origin, visual_scale = self._hand_visual_transform(source_points, side)
+
+        def mapped(index):
+            q = self.interactive_visual_point(points[index][0], points[index][1])
+            x, y = scale_hand_point((q.x(), q.y()),
+                                    (origin.x(), origin.y()), visual_scale)
+            return QPointF(x, y)
+
+        # Centre the mark on the palm rather than on the TLI, which is deliberately
+        # hidden while disabled. Use the same transformed landmarks as the hand mesh.
+        palm_indices = (0, 5, 9, 13, 17)
+        palm = [mapped(i) for i in palm_indices]
+        center = QPointF(sum(pt.x() for pt in palm)/len(palm),
+                         sum(pt.y() for pt in palm)/len(palm))
+        palm_width = math.hypot(mapped(5).x()-mapped(17).x(),
+                                mapped(5).y()-mapped(17).y())
+        diameter = max(40.0, min(76.0, palm_width*1.55))
+        radius = diameter*0.43
+
+        painter.save()
+        painter.setRenderHint(QPainter.Antialiasing, True)
+        painter.setBrush(Qt.NoBrush)
+        # Dark red edge keeps the symbol legible over every skin tone and background;
+        # the brighter inner stroke gives it the same bold appearance as the reference.
+        painter.setPen(QPen(QColor(95, 0, 8, 235), diameter*0.13,
+                            Qt.SolidLine, Qt.RoundCap, Qt.RoundJoin))
+        painter.drawEllipse(center, radius, radius)
+        painter.drawLine(QPointF(center.x()-radius*0.70, center.y()-radius*0.70),
+                         QPointF(center.x()+radius*0.70, center.y()+radius*0.70))
+        painter.setPen(QPen(QColor(255, 20, 34, 245), diameter*0.085,
+                            Qt.SolidLine, Qt.RoundCap, Qt.RoundJoin))
+        painter.drawEllipse(center, radius, radius)
+        painter.drawLine(QPointF(center.x()-radius*0.70, center.y()-radius*0.70),
+                         QPointF(center.x()+radius*0.70, center.y()+radius*0.70))
+        painter.restore()
 
     def _paint_hand_skeleton(self, painter, points, side=None):
         """Render the virtual hand (shaded 3D skin, or the alternate skeleton style).
@@ -11816,6 +11885,17 @@ try {
                         painter.setPen(QColor(235, 255, 255))
                         self._draw_fitted_button_label(painter, tint_toggle, "SKIN COLOUR  ·  "+("SKELETON COLOUR" if self.skin_use_skeleton_color else "NATURAL"), base_size=label_size, min_size=6, inset=12*scale)
 
+                        indicator_toggle = controls["disabled_indicator_toggle"]
+                        indicator_enabled = self.show_gesture_disabled_indicator
+                        painter.setBrush(QBrush(QColor(55, 145, 82, 225) if indicator_enabled else QColor(75, 80, 89, 205)))
+                        painter.setPen(QPen(QColor(155, 245, 180, 220) if indicator_enabled else QColor(155, 162, 172, 200), 1.5*scale))
+                        painter.drawRoundedRect(indicator_toggle, 10*scale, 10*scale)
+                        painter.setPen(QColor(235, 255, 255))
+                        self._draw_fitted_button_label(
+                            painter, indicator_toggle,
+                            "DISABLED GESTURE INDICATOR  ·  "+("ON" if indicator_enabled else "OFF"),
+                            base_size=label_size, min_size=6, inset=12*scale)
+
                         # Each hand's independent calibration opens a temporary target window.
                         for calibration_side, rect in self._tli_calibration_button_rects(cx, cy, scale).items():
                             pending = self.tli_calibration_pending.get(calibration_side, False)
@@ -12089,6 +12169,7 @@ try {
                 # Clamping every joint individually made the skeleton squash against an
                 # artificial wall near the top and bottom of the screen.
                 self._paint_hand_skeleton(painter, points, side)
+                self._paint_gesture_disabled_indicator(painter, points, side)
                 # Keep the virtual skeleton visible when a hand is disabled, but remove
                 # its moving TLI/cursor until thumbs-up re-enables tracking.
                 if self.gesture_tracking_enabled.get(side, True):
