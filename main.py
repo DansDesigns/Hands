@@ -7927,8 +7927,15 @@ try {
         thickness = min(10.0, max(0.8, float(getattr(self, "finger_thickness", 4.24))))/4.24
         offsets = hand_contact_offsets(screen["left"], screen["right"], palms["left"], palms["right"],
                                        style, thickness)
-        px_x = max(1.0, self.width()-1)/0.60
-        px_y = max(1.0, self.height()-1)/0.68
+        # These landmarks are already in primary-screen coordinates. Use the same
+        # physical screen dimensions for the contact correction; QWidget.height()
+        # can reflect Qtile's reserved work area and truncate the lower screen band.
+        contact_screen = QApplication.primaryScreen()
+        contact_geometry = contact_screen.geometry() if contact_screen is not None else None
+        contact_width = contact_geometry.width() if contact_geometry is not None else self.width()
+        contact_height = contact_geometry.height() if contact_geometry is not None else self.height()
+        px_x = max(1.0, contact_width-1)/0.60
+        px_y = max(1.0, contact_height-1)/0.68
         for side in ("left", "right"):
             moves = offsets.get(side)
             if not moves:
@@ -8799,7 +8806,12 @@ try {
         """Smooth the already hand-scaled screen point used by the TPI and OS pointer."""
         previous = self.smoothed_side_cursor_positions.get(side)
         last_time = self.cursor_updated_at.get(side, 0.0)
-        h = max(1.0, float(self.height()))
+        # Use the same full-screen coordinate system as interactive_visual_point().
+        # Under Qtile the widget may temporarily report the work-area height (ending
+        # above the bottom bar), which would clamp the cursor and hand-follow offset.
+        screen = QApplication.primaryScreen()
+        screen_geometry = screen.geometry() if screen is not None else None
+        h = max(1.0, float(screen_geometry.height() if screen_geometry is not None else self.height()))
         edge_band = h * 0.055
         target_y = min(h-1.0, max(0.0, target.y()))
         # Near the very top/bottom, snap into a tiny edge band to avoid close/minimise drift.
@@ -9388,10 +9400,41 @@ try {
         size_matches = self.size() == screen_rect.size()
         geometry_matches = self.geometry() == screen_rect
         if not (origin_matches and size_matches and geometry_matches):
-            # Qtile/XLibre can reapply the work-area offset after startup. Reassert
-            # the physical screen bounds so local drawing and full-screen map coords
-            # remain aligned; cursor injection itself uses _virtual_point_to_global().
+            # Qtile/XLibre can reapply the work-area bounds after startup. Restore the
+            # QWidget geometry first, then also resize the unmanaged X11 window itself
+            # to the full physical screen. This ensures its paint surface extends over
+            # a bottom bar even if the WM leaves the native window at work-area height.
             self.setGeometry(screen_rect)
+            try:
+                if QApplication.platformName().lower() in ("xcb", "x11"):
+                    x11 = getattr(self, "_linux_x11_lib", None)
+                    display = getattr(self, "_linux_x11_display", None)
+                    if x11 is None:
+                        x11 = ctypes.CDLL("libX11.so.6")
+                    if display is None:
+                        x11.XOpenDisplay.argtypes = [ctypes.c_char_p]
+                        x11.XOpenDisplay.restype = ctypes.c_void_p
+                        display = x11.XOpenDisplay(None)
+                    if display:
+                        x11.XMoveResizeWindow.argtypes = [
+                            ctypes.c_void_p, ctypes.c_ulong, ctypes.c_int, ctypes.c_int,
+                            ctypes.c_uint, ctypes.c_uint,
+                        ]
+                        x11.XMoveResizeWindow.restype = ctypes.c_int
+                        x11.XFlush.argtypes = [ctypes.c_void_p]
+                        x11.XFlush.restype = ctypes.c_int
+                        x11.XMoveResizeWindow(
+                            display, ctypes.c_ulong(int(self.winId())),
+                            ctypes.c_int(screen_rect.x()), ctypes.c_int(screen_rect.y()),
+                            ctypes.c_uint(screen_rect.width()), ctypes.c_uint(screen_rect.height()),
+                        )
+                        x11.XFlush(display)
+                        self._linux_x11_lib = x11
+                        self._linux_x11_display = display
+            except Exception:
+                # QWidget geometry remains the portable fallback if native X11 resize
+                # is unavailable (for example, when running under Wayland/XWayland).
+                pass
             self.update()
 
     # Repaint interval used while nothing on screen is moving (see _scene_is_idle).
@@ -9868,10 +9911,14 @@ try {
                     self.fist_last_points[side] = QPointF(cursor)
                 self.hand_missing_since[side] = None
 
-            edge_tolerant = (cursor.x() <= self.width()*0.045 or
-                             cursor.x() >= self.width()*0.955 or
-                             cursor.y() <= self.height()*0.055 or
-                             cursor.y() >= self.height()*0.945)
+            screen = QApplication.primaryScreen()
+            edge_geometry = screen.geometry() if screen is not None else None
+            edge_width = edge_geometry.width() if edge_geometry is not None else self.width()
+            edge_height = edge_geometry.height() if edge_geometry is not None else self.height()
+            edge_tolerant = (cursor.x() <= edge_width*0.045 or
+                             cursor.x() >= edge_width*0.955 or
+                             cursor.y() <= edge_height*0.055 or
+                             cursor.y() >= edge_height*0.945)
             # This toggle remains active even while all ordinary gestures are locked.
             thumbs_up = False if calibration_modal_frame else self._is_thumbs_up(landmarks)
             if thumbs_up:

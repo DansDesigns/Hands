@@ -86,3 +86,37 @@ def test_linux_installer_creates_launcher_without_a_second_installer():
     assert 'chmod +x "$APP_DIR/run_linux.sh"' in installer
     assert 'sh "$APP_DIR/install_desktop_launcher.sh"' not in installer
     assert not (ROOT / "install_desktop_launcher.sh").exists()
+
+
+def test_cursor_smoothing_uses_full_screen_height_not_qtile_work_area():
+    source = (ROOT / "main.py").read_text(encoding="utf-8")
+    start = source.index("    def _smooth_cursor(self, side, target, now):")
+    end = source.index("    def _notification_stack_opacity", start)
+    method = source[start:end]
+    assert "screen.geometry()" in method
+    assert "screen_geometry.height()" in method
+    assert "else self.height()" in method  # fallback only when screen data is unavailable
+
+
+def test_bottom_edge_detection_and_two_hand_contact_use_full_screen_dimensions():
+    source = (ROOT / "main.py").read_text(encoding="utf-8")
+    edge_start = source.index("            edge_geometry = screen.geometry()")
+    edge_end = source.index("            # This toggle remains active", edge_start)
+    edge_block = source[edge_start:edge_end]
+    assert "edge_geometry.height()" in edge_block
+    assert "cursor.y() >= edge_height*0.945" in edge_block
+    contact_start = source.index("    def _update_hand_contact_display(self):")
+    contact_end = source.index("    def _hand_visual_transform", contact_start)
+    contact_block = source[contact_start:contact_end]
+    assert "contact_geometry.height()" in contact_block
+    assert "px_y = max(1.0, contact_height-1)/0.68" in contact_block
+
+
+def test_linux_overlay_has_native_x11_full_screen_geometry_fallback():
+    source = (ROOT / "main.py").read_text(encoding="utf-8")
+    start = source.index("    def _sync_linux_fullscreen_geometry(self):")
+    end = source.index("    # Repaint interval", start)
+    method = source[start:end]
+    assert "screen_rect = screen.geometry()" in method
+    assert "XMoveResizeWindow" in method
+    assert "screen_rect.height()" in method
