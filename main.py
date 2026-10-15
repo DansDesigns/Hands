@@ -56,7 +56,9 @@ from gesture_rules import (
     thumb_axis_is_vertical_up,
     thumb_middle_pinch_pose,
     opposite_diagonal_corner_assignment,
+    classify_middle_pinch_window_action,
     resize_rect_from_corner_deltas,
+    resize_rect_from_distance_scale,
 )
 from voice_services import Speech, KokoroTTS
 from hand_occlusion import TuckSmoother
@@ -1905,7 +1907,8 @@ class SpatialDesktop(QWidget):
         self.middle_pinch_zoom = {
             "started_at": None, "last_both_seen_at": None, "active": False,
             "mode": None, "hwnd": None, "rect": None, "corners": None,
-            "start_points": None, "last_distance": None, "zoom_remainder": 0.0,
+            "start_points": None, "start_distance": None, "last_distance": None,
+            "zoom_remainder": 0.0,
             "last_resize_rect": None, "last_resize_at": 0.0,
         }
         self.fist_quick_click_max_seconds = 0.65
@@ -2946,10 +2949,14 @@ class SpatialDesktop(QWidget):
             global_point = self._virtual_point_to_global(point)
             px, py = int(global_point.x()), int(global_point.y())
             overlay_hwnd = int(self.winId())
+            own_pid = os.getpid()
             rect = wintypes.RECT()
             class_buffer = ctypes.create_unicode_buffer(256)
             found = {"hwnd": None, "matches": []}
             enum_type = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
+            get_window_pid = user32.GetWindowThreadProcessId
+            get_window_pid.argtypes = [wintypes.HWND, ctypes.POINTER(wintypes.DWORD)]
+            get_window_pid.restype = wintypes.DWORD
 
             @enum_type
             def enum_window(hwnd, _lparam):
@@ -2957,7 +2964,18 @@ class SpatialDesktop(QWidget):
                     handle = int(hwnd)
                 except (TypeError, ValueError):
                     handle = int(ctypes.cast(hwnd, ctypes.c_void_p).value or 0)
-                if handle == overlay_hwnd or not user32.IsWindowVisible(hwnd) or user32.IsIconic(hwnd):
+                # Windows has a separate always-on-top SearchHandOverlay HWND. If the
+                # hit-test picks that transparent, full-screen window, two-hand drag
+                # moves the hand layer instead of the application, making the hands
+                # appear duplicated/ghosted as the overlay snaps back to owner.geometry.
+                # Exclude every window owned by this process, not just the main HWND.
+                if handle == overlay_hwnd:
+                    return True
+                process_id = wintypes.DWORD(0)
+                thread_id = get_window_pid(hwnd, ctypes.byref(process_id))
+                if not thread_id or int(process_id.value) == own_pid:
+                    return True
+                if not user32.IsWindowVisible(hwnd) or user32.IsIconic(hwnd):
                     return True
                 if not user32.GetWindowRect(hwnd, ctypes.byref(rect)):
                     return True
@@ -3015,6 +3033,22 @@ class SpatialDesktop(QWidget):
         except Exception:
             pass
         return None
+
+    def _focus_native_window_for_zoom(self, hwnd):
+        """Focus the chosen browser once so keyboard zoom reaches that window."""
+        if not hwnd:
+            return
+        if sys.platform.startswith("linux"):
+            try:
+                subprocess.run(["wmctrl", "-ia", hex(int(hwnd))], check=False, timeout=0.3,
+                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            except Exception:
+                pass
+        elif sys.platform.startswith("win"):
+            try:
+                ctypes.windll.user32.SetForegroundWindow(wintypes.HWND(int(hwnd)))
+            except Exception:
+                pass
 
     def _prepare_native_window_drag(self, hwnd):
         """Prepare Linux/X11 clients for direct manipulation in tiling WMs such as Qtile."""
@@ -8050,12 +8084,13 @@ class SpatialDesktop(QWidget):
         state.update({
             "started_at": None, "last_both_seen_at": None, "active": False,
             "mode": None, "hwnd": None, "rect": None, "corners": None,
-            "start_points": None, "last_distance": None, "zoom_remainder": 0.0,
+            "start_points": None, "start_distance": None, "last_distance": None,
+            "zoom_remainder": 0.0,
             "last_resize_rect": None, "last_resize_at": 0.0,
         })
 
     def _begin_middle_pinch_zoom(self, cursor_points, now):
-        """Arm resize on opposite window corners, otherwise use Ctrl+wheel content zoom."""
+        """Choose window resize from opposite corner zones; otherwise zoom content."""
         state = self.middle_pinch_zoom
         points = {side: self._virtual_point_to_global(cursor_points[side])
                   for side in ("left", "right")}
@@ -8064,80 +8099,104 @@ class SpatialDesktop(QWidget):
         point_tuples = {side: (float(point.x()), float(point.y())) for side, point in points.items()}
         midpoint = QPointF((cursor_points["left"].x()+cursor_points["right"].x())*0.5,
                            (cursor_points["left"].y()+cursor_points["right"].y())*0.5)
+        initial_distance = math.hypot(
+            point_tuples["right"][0]-point_tuples["left"][0],
+            point_tuples["right"][1]-point_tuples["left"][1])
         left_hwnd = self._find_native_window_at(cursor_points["left"], prefer_smallest=True)
         right_hwnd = self._find_native_window_at(cursor_points["right"], prefer_smallest=True)
         centre_hwnd = self._find_native_window_at(midpoint, prefer_smallest=True)
-        resize_target = None
-        # Near a window border the OS may report a different child/edge window under one
-        # TLI. Prefer the shared handle, but also test a window under the midpoint against
-        # its full outer rectangle before falling back to content zoom.
+
+        # Find the smallest native app window containing BOTH pinch starts. This lets
+        # mode selection use where the pinches begin in that window, not whether the
+        # app happens to be a browser, file manager, image viewer, or presentation app.
         candidates = []
         for candidate in (left_hwnd, right_hwnd, centre_hwnd):
             if candidate and all(int(candidate) != int(existing) for existing in candidates):
                 candidates.append(candidate)
+        shared_windows = []
         for candidate in candidates:
             rect = self._native_window_rect(candidate)
-            corners = opposite_diagonal_corner_assignment(
-                rect, point_tuples["left"], point_tuples["right"]) if rect else None
-            if corners is None:
+            if rect is None:
                 continue
-            # Qtile must float tiled clients before they can be interactively resized.
-            self._prepare_native_window_drag(candidate)
-            rect = self._native_window_rect(candidate) or rect
-            corners = opposite_diagonal_corner_assignment(
-                rect, point_tuples["left"], point_tuples["right"]) if rect else None
-            if corners is not None:
-                resize_target = (candidate, rect, corners)
-                break
+            left, top, right, bottom = rect
+            if all(left <= x < right and top <= y < bottom
+                   for x, y in point_tuples.values()):
+                shared_windows.append(((right-left)*(bottom-top), candidate, rect))
+        if shared_windows:
+            _area, target, target_rect = min(shared_windows, key=lambda row: row[0])
+            action, corners = classify_middle_pinch_window_action(
+                target_rect, point_tuples["left"], point_tuples["right"],
+                corner_zone_ratio=0.25)
+        else:
+            # If the hands straddle application windows, never resize either by
+            # accident. Content zoom is the safe fallback for the active target.
+            target = centre_hwnd or left_hwnd or right_hwnd
+            target_rect = self._native_window_rect(target) if target else None
+            action, corners = "zoom", None
+
         state["active"] = True
         state["start_points"] = point_tuples
+        state["start_distance"] = max(1.0, initial_distance)
+        state["last_distance"] = initial_distance
         state["zoom_remainder"] = 0.0
         state["last_resize_at"] = 0.0
-        if resize_target is not None:
-            hwnd, rect, corners = resize_target
-            state["mode"] = "resize"
-            state["hwnd"] = hwnd
-            state["rect"] = rect
-            state["corners"] = corners
-            state["last_resize_rect"] = rect
-            state["last_distance"] = math.hypot(
-                point_tuples["right"][0]-point_tuples["left"][0],
-                point_tuples["right"][1]-point_tuples["left"][1])
-            self.status = "Pinch resize active — move both pinched hands at opposite corners"
+        if action == "resize" and target and target_rect and corners:
+            # On tiled Linux WMs, float/activate the app before resizing. Re-test the
+            # same 25%-inset corner zones after the WM has finished preparing it.
+            self._prepare_native_window_drag(target)
+            target_rect = self._native_window_rect(target) or target_rect
+            action, corners = classify_middle_pinch_window_action(
+                target_rect, point_tuples["left"], point_tuples["right"],
+                corner_zone_ratio=0.25)
+            if action == "resize" and corners:
+                state["mode"] = "resize"
+                state["hwnd"] = target
+                state["rect"] = target_rect
+                state["corners"] = corners
+                state["last_resize_rect"] = target_rect
+                self.status = "Window resize active — move hands from opposite corner zones"
+            else:
+                # Window geometry changed during preparation; do not resize the wrong
+                # edges. Continue in generic content zoom mode instead.
+                state["mode"] = "zoom"
+                state["hwnd"] = target
+                state["rect"] = target_rect
+                state["corners"] = None
+                state["last_resize_rect"] = None
+                self._focus_native_window_for_zoom(target)
+                self.status = "Content zoom active — move hands apart to zoom in, together to zoom out"
         else:
-            target = self._find_native_window_at(midpoint, prefer_smallest=True)
-            if target is None:
-                target = left_hwnd or right_hwnd
             state["mode"] = "zoom"
             state["hwnd"] = target
-            state["rect"] = self._native_window_rect(target) if target else None
+            state["rect"] = target_rect
             state["corners"] = None
             state["last_resize_rect"] = None
-            state["last_distance"] = math.hypot(
-                point_tuples["right"][0]-point_tuples["left"][0],
-                point_tuples["right"][1]-point_tuples["left"][1])
-            self.status = "Pinch zoom active — move hands apart to zoom in, together to zoom out"
+            # Generic Ctrl/Command+wheel handles browser pages, Explorer icon sizing,
+            # presentation canvases, and image viewers without relying on app names.
+            self._focus_native_window_for_zoom(target)
+            self.status = "Content zoom active — move hands apart to zoom in, together to zoom out"
         self.update()
         return True
 
-    def _apply_middle_pinch_zoom_step(self, midpoint, direction):
-        """Send one Ctrl/Command+wheel zoom notch at the live midpoint."""
-        if pyautogui is None or midpoint is None:
-            self.status = "Pinch zoom unavailable: pyautogui is not installed"
-            return False
-        screen_point = self._virtual_point_to_global(midpoint)
-        if screen_point is None:
+    def _apply_middle_pinch_zoom_step(self, direction):
+        """Dispatch a generic Ctrl/Command+wheel step at the live hand cursor.
+
+        Unlike moving the cursor to the midpoint, this operates at the current OS
+        pointer location. Ctrl+wheel is supported by browsers, Explorer, many image
+        viewers, and presentation canvases. No application-name heuristics are used.
+        """
+        if pyautogui is None:
+            self.status = "Content zoom unavailable: pyautogui is not installed"
             return False
         modifier = "command" if sys.platform == "darwin" else "ctrl"
         modifier_down = False
         try:
-            pyautogui.moveTo(int(screen_point.x()), int(screen_point.y()), duration=0, _pause=False)
             pyautogui.keyDown(modifier, _pause=False)
             modifier_down = True
-            pyautogui.scroll(int(direction), _pause=False)
+            pyautogui.scroll(1 if direction > 0 else -1, _pause=False)
             return True
         except Exception as exc:
-            self.status = f"Pinch zoom input failed: {exc}"
+            self.status = f"Content zoom input failed: {exc}"
             return False
         finally:
             if modifier_down:
@@ -8147,7 +8206,7 @@ class SpatialDesktop(QWidget):
                     pass
 
     def _update_middle_pinch_zoom(self, cursor_points, now):
-        """Apply the active pinch delta as a native window resize or Ctrl+wheel zoom."""
+        """Apply distance changes to the chosen window bounds or its content zoom."""
         state = self.middle_pinch_zoom
         points = {side: self._virtual_point_to_global(cursor_points[side])
                   for side in ("left", "right")}
@@ -8173,28 +8232,38 @@ class SpatialDesktop(QWidget):
             return
         distance = math.hypot(current["right"][0]-current["left"][0],
                               current["right"][1]-current["left"][1])
+        if state.get("mode") == "resize_scale":
+            rect = resize_rect_from_distance_scale(
+                state.get("rect"), state.get("start_distance"), distance)
+            if rect is None:
+                return
+            previous = state.get("last_resize_rect")
+            moved_enough = previous is None or any(abs(a-b) >= 2.0 for a, b in zip(rect, previous))
+            # Window-manager operations are intentionally throttled to avoid extra CPU
+            # use while still providing smooth enough resizing by hand.
+            if moved_enough and now-float(state.get("last_resize_at", 0.0)) >= 0.065:
+                left, top, right, bottom = rect
+                resized = self._resize_native_window(state.get("hwnd"), left, top,
+                                                      right-left, bottom-top)
+                state["last_resize_at"] = now
+                if resized:
+                    state["last_resize_rect"] = rect
+            state["last_distance"] = distance
+            return
         previous_distance = state.get("last_distance")
         state["last_distance"] = distance
         if previous_distance is None:
             return
-        midpoint = QPointF((cursor_points["left"].x()+cursor_points["right"].x())*0.5,
-                           (cursor_points["left"].y()+cursor_points["right"].y())*0.5)
-        # Ignore small tremor and emit discrete native zoom wheel notches only after
-        # a meaningful increase/decrease in the separation of the two hand anchors.
+        # Ignore small tremor and emit zoom keyboard steps only after a meaningful
+        # change in hand separation. No OS cursor repositioning is required.
         state["zoom_remainder"] = float(state.get("zoom_remainder", 0.0)) + (distance-previous_distance)
         remainder = state["zoom_remainder"]
         if abs(remainder) < 34.0:
             return
-        # Window enumeration can spawn wmctrl/xdotool on Linux; query only when the
-        # movement accumulator has enough travel to emit an actual zoom wheel notch.
-        target = self._find_native_window_at(midpoint, prefer_smallest=True)
-        if not target:
-            state["zoom_remainder"] = 0.0
-            return
         emitted = 0
         while abs(remainder) >= 34.0 and emitted < 3:
             direction = 1 if remainder > 0 else -1
-            if not self._apply_middle_pinch_zoom_step(midpoint, direction):
+            if not self._apply_middle_pinch_zoom_step(direction):
                 state["zoom_remainder"] = 0.0
                 return
             remainder -= 34.0*direction
@@ -8204,8 +8273,16 @@ class SpatialDesktop(QWidget):
     def _process_middle_pinch_zoom(self, cursor_points, poses, now):
         """Consume the two-hand thumb-middle pinch and its shared Pinch Menu buffer."""
         state = self.middle_pinch_zoom
-        middle = {side: bool(poses.get(side, {}).get("middle_pinch") and side in cursor_points)
-                  for side in ("left", "right")}
+        # A closed grip has the middle fingertip naturally folded near the thumb.
+        # Never allow the raw middle-pinch classifier to steal an ordinary fist/grab.
+        middle = {
+            side: bool(
+                poses.get(side, {}).get("middle_pinch")
+                and not poses.get(side, {}).get("fist", False)
+                and side in cursor_points
+            )
+            for side in ("left", "right")
+        }
         any_middle = middle["left"] or middle["right"]
         both_middle = middle["left"] and middle["right"]
         if not any_middle and state.get("started_at") is None and not state.get("active"):
@@ -8226,6 +8303,12 @@ class SpatialDesktop(QWidget):
             elif was_active and not modal:
                 self.status = "Pinch zoom and native window resize require OS desktop mode"
             return any_middle
+        # The zoom/resize gesture is explicitly two-handed. A single middle pinch
+        # with no session armed must fall through to normal gesture processing (not
+        # consume the frame), preserving one-hand clicks and fist-grab window drag.
+        if state.get("started_at") is None and not state.get("active") and not both_middle:
+            return False
+
         if both_middle:
             state["last_both_seen_at"] = now
             if state.get("started_at") is None:

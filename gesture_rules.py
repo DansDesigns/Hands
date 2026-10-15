@@ -352,6 +352,41 @@ def opposite_diagonal_corner_assignment(rect, left_point, right_point,
     return nearest
 
 
+def classify_middle_pinch_window_action(rect, left_point, right_point,
+                                        corner_zone_ratio=0.25):
+    """Choose window resize near opposite corners, content zoom elsewhere in a window.
+
+    Coordinates are global screen positions; ``rect`` is (left, top, right, bottom).
+    Each corner zone extends inward by 25% of both dimensions by default. Only a pair
+    in opposite diagonal corner zones chooses window resizing. Other pairs inside the
+    same application window choose content zoom/stretch, independent of application
+    name or process type. Returns (action, corner_assignment), where action is
+    ``"resize"`` or ``"zoom"`` and the assignment is None for zoom.
+    """
+    try:
+        left, top, right, bottom = (float(v) for v in rect)
+        points = {"left": (float(left_point[0]), float(left_point[1])),
+                  "right": (float(right_point[0]), float(right_point[1]))}
+        ratio = float(corner_zone_ratio)
+    except (TypeError, ValueError, IndexError):
+        return "zoom", None
+    width, height = right-left, bottom-top
+    if width <= 0.0 or height <= 0.0 or not math.isfinite(ratio):
+        return "zoom", None
+    ratio = min(0.49, max(0.01, ratio))
+    # The mode is selected only when both pinches begin inside the same window.
+    for x, y in points.values():
+        if not (left <= x < right and top <= y < bottom):
+            return "zoom", None
+    corners = opposite_diagonal_corner_assignment(
+        rect, points["left"], points["right"],
+        tolerance_ratio=ratio, min_tolerance=1.0,
+        max_tolerance=max(width, height))
+    if corners is not None:
+        return "resize", corners
+    return "zoom", None
+
+
 def resize_rect_from_corner_deltas(rect, start_points, current_points, corners,
                                    min_width=260.0, min_height=160.0):
     """Calculate a native-window rect by dragging its two pinned diagonal corners."""
@@ -389,6 +424,36 @@ def resize_rect_from_corner_deltas(rect, start_points, current_points, corners,
                 new_edges["b"] = new_edges["t"]+float(min_height)
         return (new_edges["l"], new_edges["t"], new_edges["r"], new_edges["b"])
     except (KeyError, TypeError, ValueError, IndexError):
+        return None
+
+
+def resize_rect_from_distance_scale(rect, start_distance, current_distance,
+                                    min_width=320.0, min_height=200.0,
+                                    min_scale=0.35, max_scale=3.0):
+    """Scale a window around its centre as two hand anchors move apart/together.
+
+    This is the forgiving fallback when a user pinches over an application but does
+    not start precisely on opposite corners. A relative distance scale makes it
+    possible to enlarge ordinary application windows without first finding their
+    exact border pixels.
+    """
+    try:
+        left, top, right, bottom = (float(v) for v in rect)
+        initial = float(start_distance)
+        current = float(current_distance)
+        if not all(math.isfinite(v) for v in (left, top, right, bottom, initial, current)):
+            return None
+        width, height = right-left, bottom-top
+        if width <= 0.0 or height <= 0.0 or initial <= 1.0 or current < 0.0:
+            return None
+        scale = min(float(max_scale), max(float(min_scale), current/initial))
+        new_width = max(float(min_width), width*scale)
+        new_height = max(float(min_height), height*scale)
+        centre_x = (left+right)*0.5
+        centre_y = (top+bottom)*0.5
+        return (centre_x-new_width*0.5, centre_y-new_height*0.5,
+                centre_x+new_width*0.5, centre_y+new_height*0.5)
+    except (TypeError, ValueError, IndexError, OverflowError):
         return None
 
 
