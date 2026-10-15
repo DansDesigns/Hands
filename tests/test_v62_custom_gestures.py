@@ -116,7 +116,7 @@ class CustomGestureTests(unittest.TestCase):
         self.assertIn('"row": r(L, y, list_width, 38)', main)
         self.assertIn('"action": r(action_x, y+3, action_width, 32)', main)
         self.assertIn('"capture": r(capture_x, y+3, 48, 32)', main)
-        self.assertIn('"delete": r(delete_x, y+3, 20, 32)', main)
+        self.assertIn('"delete": r(delete_x, y+3, 32, 32)', main)
         self.assertIn('if row["capture"].contains(point):', main)
         self.assertIn('self._start_custom_gesture_key_capture(index)', main)
         self.assertIn('"PRESS" if capturing else "KEY"', main)

@@ -2251,7 +2251,7 @@ class SpatialDesktop(QWidget):
                       350.0*scale, 36.0*scale)
 
     def _main_menu_exit_rect(self, cx=None, cy=None, scale=None):
-        """Wide EXIT button at the top of the main glass menu, above its tiles."""
+        """Wide Quit Freehand button at the top of the main glass menu."""
         cx = self.hub_pos.x()*self.width() if cx is None else cx
         cy = self.hub_pos.y()*self.height() if cy is None else cy
         scale = self.menu_ui_scale() if scale is None else scale
@@ -5174,6 +5174,10 @@ class SpatialDesktop(QWidget):
             return True
         phrases = [alias for aliases in aliases_for_help().values() for alias in aliases]
         phrases.extend(("begin dictation", "end dictation", "and dictation", "stop dictation", "pause dictation", "resume dictation", "pause tracking", "resume tracking",
+                        "enable freehand", "disable freehand", "enable free hand", "disable free hand",
+                        "enable freehand gestures", "disable freehand gestures", "enable free hand gestures", "disable free hand gestures",
+                        "turn on freehand", "turn off freehand", "turn on free hand", "turn off free hand",
+                        "turn freehand on", "turn freehand off", "turn free hand on", "turn free hand off",
                         "show menu", "show context", "search bar", "close window", "open user folder",
                         "stop listening", "stop dictation", "open top result"))
         normalized_phrases = [" ".join(self._normalised_dictation_words(phrase)) for phrase in phrases]
@@ -5275,6 +5279,68 @@ class SpatialDesktop(QWidget):
             if text.startswith(("Voice input error:", "Microphone unavailable:", "Vosk model not found")):
                 self.stt_enabled = False
             self.status = text
+
+    def set_freehand_gestures_enabled(self, enabled: bool, announce: bool = True):
+        """Enable or disable both hands' gesture input while keeping camera tracking alive.
+
+        This is the voice-command equivalent of the built-in thumbs-up toggle. Keeping
+        inference alive is important: either hand can still make a thumbs-up to re-enable
+        gesture input after it has been disabled.
+        """
+        enabled = bool(enabled)
+        sides = ("left", "right")
+        changed = any(self.gesture_tracking_enabled.get(side, True) != enabled for side in sides)
+        if not changed:
+            state = "enabled" if enabled else "disabled"
+            self.status = f"Freehand gestures are already {state}"
+            if announce:
+                self.tts.speak(f"Freehand gestures are already {state}.")
+            self.update()
+            return
+
+        now = time.monotonic()
+        for side in sides:
+            # Detect whether this command is being spoken during an already-held
+            # thumbs-up. Latch only that live pose; don't force users to make and release
+            # an extra thumbs-up if they start one immediately after the voice command.
+            last_thumb = self.thumbs_up_last_seen.get(side)
+            thumb_pose_recent = last_thumb is not None and now-last_thumb <= 0.18
+            self.gesture_tracking_enabled[side] = enabled
+            # Clear any in-flight drag, click, scroll or menu interaction before changing
+            # state. Requiring an open hand after a change avoids accidentally reusing a
+            # held pose as a fresh action. Latch an already-held thumbs-up until release so
+            # the voice command cannot immediately toggle the same pose back.
+            self._cancel_side_interactions_for_tracking_pause(side)
+            self.action_stop_wait_open[side] = True
+            self.action_stop_open_since[side] = None
+            self.thumbs_up_toggle_latched[side] = bool(thumb_pose_recent)
+            if not thumb_pose_recent:
+                self.thumbs_up_hold_started[side] = None
+                self.thumbs_up_last_seen[side] = None
+            self.side_cursor_positions[side] = None
+            self.smoothed_side_cursor_positions[side] = None
+            self.cursor_updated_at[side] = 0.0
+            self.tli_overrides.pop(side, None)
+
+        if not enabled:
+            if self.voice_selection_mode is not None:
+                self._clear_voice_selection(release_mouse=True)
+            self.active_slider = None
+            self.active_slider_side = None
+            self.tli_overrides = {}
+            self.active_push_sides = set()
+        self.gesture_owner = None
+        self.pointer_side = None
+        self.canvas_active_side = None
+        self._refresh_hand_tracking_notice(now, show_enabled=enabled)
+        if not enabled:
+            self.hand_tracking_notice_text = "Freehand gestures disabled"
+            self.hand_tracking_notice_until = now + 5.0
+        self.status = "Freehand gestures enabled" if enabled else "Freehand gestures disabled"
+        if announce:
+            self.tts.speak("Freehand gestures enabled." if enabled else
+                           "Freehand gestures disabled. Say enable Freehand to turn them back on.")
+        self.update()
 
     def set_hand_tracking_paused(self, paused: bool, announce: bool = True):
         """Pause hand inference and cancel active hand actions without stopping Vosk."""
@@ -6260,6 +6326,27 @@ try {
             else:
                 self.status = "Dictation is not active"
             return
+        # Global Freehand gesture commands run before dictation and keep camera inference
+        # alive, matching the thumbs-up gesture toggle rather than pausing the camera.
+        enable_freehand_phrases = {
+            "enable freehand", "enable free hand", "enable freehand gestures", "enable free hand gestures",
+            "turn on freehand", "turn on free hand", "turn freehand on", "turn free hand on",
+            "turn on freehand gestures", "enable gestures",
+        }
+        disable_freehand_phrases = {
+            "disable freehand", "disable free hand", "disable freehand gestures", "disable free hand gestures",
+            "turn off freehand", "turn off free hand", "turn freehand off", "turn free hand off",
+            "turn off freehand gestures", "disable gestures",
+        }
+        if low in enable_freehand_phrases:
+            self._clear_heard_popup()
+            self.set_freehand_gestures_enabled(True)
+            return
+        if low in disable_freehand_phrases:
+            self._clear_heard_popup()
+            self.set_freehand_gestures_enabled(False)
+            return
+
         # Tracking commands run before search dictation so they always control the
         # hand-input layer, even when the launcher is open and dictation is enabled.
         if low in ("pause tracking", "pause hand tracking", "disable hand tracking", "stop hand tracking"):
@@ -6390,8 +6477,8 @@ try {
             self.status = "Voice input off"
             self.tts.speak("Voice input is off.")
         elif low in ("what can you do", "help", "voice help"):
-            self.status = "Voice commands: pause/resume tracking, search bar, copy this/copy text, paste here/paste this, show running apps, start text selection, copy image, media playback/volume, window management, file navigation, close window, open folders, stop listening"
-            self.tts.speak("You can say pause tracking, resume tracking, begin dictation, end dictation, show menu, show context, search bar, start text selection, copy this, copy text, copy image, paste here, paste this, show running apps, switch window, play pause, next track, previous track, volume up, volume down, mute, unmute, minimize window, maximize window, show desktop, open downloads, create new folder, create new text file, create new powerpoint, select all, undo, redo, close window, or open user folder.")
+            self.status = "Voice commands: enable/disable Freehand, pause/resume tracking, search bar, copy this/copy text, paste here/paste this, show running apps, start text selection, copy image, media playback/volume, window management, file navigation, close window, open folders, stop listening"
+            self.tts.speak("You can say enable Freehand, disable Freehand, pause tracking, resume tracking, begin dictation, end dictation, show menu, show context, search bar, start text selection, copy this, copy text, copy image, paste here, paste this, show running apps, switch window, play pause, next track, previous track, volume up, volume down, mute, unmute, minimize window, maximize window, show desktop, open downloads, create new folder, create new text file, create new powerpoint, select all, undo, redo, close window, or open user folder.")
         else:
             # If speech recognition drops the verb and only hears an unprefixed
             # creation phrase, never infer a destructive/creating action from it.
@@ -6936,7 +7023,7 @@ try {
         L, W = self.SETTINGS_LEFT_X, self.SETTINGS_COLUMN_W
         list_width = self.SETTINGS_RIGHT_X + self.SETTINGS_COLUMN_W - L
         capture_x = L + list_width - 74.0
-        delete_x = L + list_width - 23.0
+        delete_x = L + list_width - 35.0
         action_x = L + 146.0
         action_width = capture_x - action_x - 2.0
 
@@ -6952,7 +7039,7 @@ try {
                 "label": r(L+88, y+3, 56, 32),
                 "action": r(action_x, y+3, action_width, 32),
                 "capture": r(capture_x, y+3, 48, 32),
-                "delete": r(delete_x, y+3, 20, 32),
+                "delete": r(delete_x, y+3, 32, 32),
             })
         half = (W-8)*0.5
         return {
@@ -7303,8 +7390,17 @@ try {
         painter.setFont(font(9))
         painter.drawText(layout["title"], Qt.AlignLeft | Qt.AlignVCenter,
                          f"CHOOSE ACTION FOR {gesture.get('label', 'GESTURE')}")
-        painter.setBrush(QBrush(QColor(120, 30, 38, 230)))
-        painter.setPen(QPen(QColor(255, 150, 150, 200), 1.0*scale))
+        close_hovered = any(point is not None and layout["close"].contains(point)
+                            for point in self.side_cursor_positions.values())
+        if close_hovered:
+            for expansion, alpha, width in ((6*scale, 45, 3*scale), (2.5*scale, 90, 2*scale)):
+                painter.setPen(QPen(QColor(255, 75, 85, alpha), width))
+                painter.setBrush(Qt.NoBrush)
+                painter.drawRoundedRect(layout["close"].adjusted(-expansion, -expansion, expansion, expansion),
+                                        8*scale+expansion, 8*scale+expansion)
+        painter.setBrush(QBrush(QColor(210, 42, 52, 250) if close_hovered else QColor(120, 30, 38, 230)))
+        painter.setPen(QPen(QColor(255, 225, 225, 255) if close_hovered else QColor(255, 150, 150, 200),
+                            1.8*scale if close_hovered else 1.0*scale))
         painter.drawRoundedRect(layout["close"], 7*scale, 7*scale)
         painter.setPen(QColor(255, 235, 235))
         painter.drawText(layout["close"], Qt.AlignCenter, "×")
@@ -7341,6 +7437,18 @@ try {
         layout = self._custom_gesture_layout(cx, cy, scale)
         font = lambda size, weight=QFont.DemiBold: self._ui_font(max(6, int(size*scale)), weight)
         border = QPen(QColor(125, 235, 245, 210), 1.5*scale)
+        hover_points = [point for point in self.side_cursor_positions.values() if point is not None]
+
+        def draw_control_glow(rect, rgb=(100, 255, 255)):
+            """Consistent soft highlight for the smaller custom-gesture controls."""
+            if not any(rect.contains(point) for point in hover_points):
+                return False
+            for expansion, alpha, width in ((6*scale, 35, 3*scale), (2.5*scale, 78, 2*scale)):
+                painter.setPen(QPen(QColor(rgb[0], rgb[1], rgb[2], alpha), width))
+                painter.setBrush(Qt.NoBrush)
+                painter.drawRoundedRect(rect.adjusted(-expansion, -expansion, expansion, expansion),
+                                        8*scale+expansion, 8*scale+expansion)
+            return True
 
         painter.setPen(QColor(195, 235, 242))
         self._draw_fitted_button_label(painter, layout["intro"],
@@ -7396,8 +7504,10 @@ try {
                 painter.fillRect(bar, QColor(110, 255, 170, 230))
 
             side_text = {"left": "LEFT", "right": "RIGHT", "either": "ANY", "both": "BOTH"}.get(gesture.get("side"), "ANY")
-            painter.setBrush(QBrush(QColor(18, 80, 93, 235)))
-            painter.setPen(QPen(QColor(125, 235, 245, 160), 1.0*scale))
+            side_hovered = draw_control_glow(row["side"])
+            painter.setBrush(QBrush(QColor(38, 135, 148, 245) if side_hovered else QColor(18, 80, 93, 235)))
+            painter.setPen(QPen(QColor(205, 255, 255, 250) if side_hovered else QColor(125, 235, 245, 160),
+                                1.8*scale if side_hovered else 1.0*scale))
             painter.drawRoundedRect(row["side"], 7*scale, 7*scale)
             painter.setPen(QColor(235, 255, 255))
             painter.setFont(font(7))
@@ -7406,8 +7516,13 @@ try {
             # Per-gesture circle timer toggle: ON = hold with a filling ring at the TLI,
             # OFF = fire after a brief stability check.
             timer_on = gesture.get("timer", True)
-            painter.setBrush(QBrush(QColor(55, 145, 82, 235) if timer_on else QColor(75, 80, 89, 205)))
-            painter.setPen(QPen(QColor(155, 245, 180, 220) if timer_on else QColor(155, 162, 172, 165), 1.0*scale))
+            timer_hovered = draw_control_glow(row["timer"])
+            if timer_hovered:
+                painter.setBrush(QBrush(QColor(68, 190, 112, 250) if timer_on else QColor(90, 133, 150, 235)))
+                painter.setPen(QPen(QColor(220, 255, 225, 250), 1.8*scale))
+            else:
+                painter.setBrush(QBrush(QColor(55, 145, 82, 235) if timer_on else QColor(75, 80, 89, 205)))
+                painter.setPen(QPen(QColor(155, 245, 180, 220) if timer_on else QColor(155, 162, 172, 165), 1.0*scale))
             painter.drawRoundedRect(row["timer"], 7*scale, 7*scale)
             icon = QRectF(row["timer"].left()+6*scale, row["timer"].center().y()-7*scale, 14*scale, 14*scale)
             painter.setBrush(Qt.NoBrush)
@@ -7444,6 +7559,15 @@ try {
                                     row["action"].height()), Qt.AlignCenter, "▴" if is_open else "▾")
 
             capturing = self.custom_gesture_key_capture == index
+            if capturing:
+                # Active capture gets a persistent amber glow even when not hovered.
+                for expansion, alpha, width in ((6*scale, 45, 3*scale), (2.5*scale, 95, 2*scale)):
+                    painter.setPen(QPen(QColor(255, 210, 95, alpha), width))
+                    painter.setBrush(Qt.NoBrush)
+                    painter.drawRoundedRect(row["capture"].adjusted(-expansion, -expansion, expansion, expansion),
+                                            8*scale+expansion, 8*scale+expansion)
+            else:
+                draw_control_glow(row["capture"])
             painter.setBrush(QBrush(QColor(145, 92, 24, 245) if capturing else
                                     QColor(24, 89, 92, 235) if action == "custom_key" else
                                     QColor(10, 47, 67, 225)))
@@ -7454,8 +7578,10 @@ try {
             self._draw_fitted_button_label(painter, row["capture"], "PRESS" if capturing else "KEY",
                                            base_size=8, min_size=6, inset=2*scale)
 
-            painter.setBrush(QBrush(QColor(120, 30, 38, 230)))
-            painter.setPen(QPen(QColor(255, 150, 150, 200), 1.0*scale))
+            delete_hovered = draw_control_glow(row["delete"], (255, 75, 85))
+            painter.setBrush(QBrush(QColor(210, 42, 52, 250) if delete_hovered else QColor(120, 30, 38, 230)))
+            painter.setPen(QPen(QColor(255, 225, 225, 255) if delete_hovered else QColor(255, 150, 150, 200),
+                                1.8*scale if delete_hovered else 1.0*scale))
             painter.drawRoundedRect(row["delete"], 7*scale, 7*scale)
             painter.setPen(QColor(255, 235, 235))
             painter.setFont(font(9))
@@ -11348,7 +11474,7 @@ try {
                 painter.setFont(self._ui_font(max(8, int(10*scale)), QFont.DemiBold))
                 painter.drawText(close_banner, Qt.AlignCenter, "CLOSE")
 
-                # EXIT sits at the top of the main menu and intentionally mirrors
+                # Quit Freehand sits at the top of the main menu and intentionally mirrors
                 # the Close button's red gradient, border, and responsive red glow.
                 exit_banner = self._main_menu_exit_rect(cx, cy, scale)
                 exit_hovered = any(
@@ -11374,7 +11500,7 @@ try {
                 painter.drawRoundedRect(exit_banner, 12*scale, 12*scale)
                 painter.setPen(QColor(240, 255, 255))
                 painter.setFont(self._ui_font(max(8, int(10*scale)), QFont.DemiBold))
-                painter.drawText(exit_banner, Qt.AlignCenter, "EXIT")
+                painter.drawText(exit_banner, Qt.AlignCenter, "Quit Freehand")
 
                 labels = [
                     (("OS DESKTOP" if self.desktop_mode == "virtual" else "VIRTUAL DESKTOP"), cx-116*scale, cy-101*scale, "▣"),

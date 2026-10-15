@@ -30,10 +30,10 @@ class V60ScrollCloseTimerTests(unittest.TestCase):
         self.assertIn('if self._main_menu_close_rect(cx, cy, scale).contains(point):', self.main)
         self.assertIn('self._set_menu_open(False, now, reset_settings=True)', self.main)
 
-    def test_main_glass_menu_exit_button_is_above_tiles_and_closes_application(self):
+    def test_main_glass_menu_quit_freehand_button_is_above_tiles_and_closes_application(self):
         self.assertIn('def _main_menu_exit_rect(', self.main)
         self.assertIn('cy+(18.0-panel_height*0.5)*scale', self.main)
-        self.assertIn('painter.drawText(exit_banner, Qt.AlignCenter, "EXIT")', self.main)
+        self.assertIn('painter.drawText(exit_banner, Qt.AlignCenter, "Quit Freehand")', self.main)
         self.assertIn('if self._main_menu_exit_rect(cx, cy, scale).contains(point):', self.main)
         self.assertIn('self.close()', self.main)
         self.assertIn('self.status = "Exiting Freehand: Spatial Computing"', self.main)
