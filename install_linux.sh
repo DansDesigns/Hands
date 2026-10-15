@@ -93,7 +93,7 @@ fi
 
 # ZIP extraction can lose Unix executable bits, so restore them before creating
 # a desktop entry which invokes the files.
-chmod +x "$APP_DIR/run_linux.sh" "$APP_DIR/spatial_desktop_launcher.sh"
+chmod +x "$APP_DIR/run_linux.sh"
 
 APPS_DIR="${XDG_DATA_HOME:-$HOME/.local/share}/applications"
 mkdir -p "$APPS_DIR"
@@ -102,8 +102,8 @@ cat > "$APPS_DIR/spatial-desktop-prototype.desktop" <<DESKTOP
 Type=Application
 Name=Freehand: Spatial Computing
 Comment=Hands-free spatial computing and gesture control
-Exec="$APP_DIR/spatial_desktop_launcher.sh"
-TryExec="$APP_DIR/spatial_desktop_launcher.sh"
+Exec="$APP_DIR/run_linux.sh"
+TryExec="$APP_DIR/run_linux.sh"
 $ICON_DESKTOP_ENTRY
 Terminal=true
 Categories=Utility;

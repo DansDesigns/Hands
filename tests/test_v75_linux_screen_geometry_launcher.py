@@ -80,9 +80,9 @@ def test_windows_start_menu_shortcut_uses_local_freehand_icon_without_fetching()
 def test_linux_installer_creates_launcher_without_a_second_installer():
     installer = (ROOT / "install_linux.sh").read_text(encoding="utf-8")
     assert 'cat > "$APPS_DIR/spatial-desktop-prototype.desktop" <<DESKTOP' in installer
-    assert 'Exec="$APP_DIR/spatial_desktop_launcher.sh"' in installer
-    assert 'TryExec="$APP_DIR/spatial_desktop_launcher.sh"' in installer
+    assert 'Exec="$APP_DIR/run_linux.sh"' in installer
+    assert 'TryExec="$APP_DIR/run_linux.sh"' in installer
     assert "Path=" not in installer
-    assert 'chmod +x "$APP_DIR/run_linux.sh" "$APP_DIR/spatial_desktop_launcher.sh"' in installer
+    assert 'chmod +x "$APP_DIR/run_linux.sh"' in installer
     assert 'sh "$APP_DIR/install_desktop_launcher.sh"' not in installer
     assert not (ROOT / "install_desktop_launcher.sh").exists()
