@@ -27,6 +27,7 @@ import uuid
 from datetime import datetime
 from ctypes import wintypes
 from pathlib import Path
+from linux_screen_geometry import resolve_fullscreen_bounds
 
 from gesture_rules import (
     should_dismiss_pinch_menu,
@@ -112,7 +113,7 @@ except Exception as exc:
     print("MediaPipe is required:", exc)
     raise SystemExit(1)
 
-from PySide6.QtCore import Qt, QTimer, QPoint, QPointF, QRectF, QObject, Signal, QMimeData, QBuffer, QIODevice
+from PySide6.QtCore import Qt, QTimer, QPoint, QPointF, QRect, QRectF, QObject, Signal, QMimeData, QBuffer, QIODevice
 from PySide6.QtGui import QPainter, QColor, QPen, QBrush, QFont, QFontMetricsF, QCursor, QLinearGradient, QImage, QPainterPath, QPainterPathStroker, QRadialGradient, QPolygonF, QDrag, QPixmap
 from PySide6.QtCore import QUrl
 from PySide6.QtWidgets import QApplication, QWidget, QMessageBox, QInputDialog
@@ -1279,6 +1280,17 @@ class TliCalibrationWindow(QWidget):
         self.target_positions = [QPointF(x, y) for x, y in
                                  ((fx * max(1, self.width()-1), fy * max(1, self.height()-1))
                                   for fx, fy in TPI_CALIBRATION_TARGET_FRACTIONS)]
+
+    def set_full_screen_geometry(self, geometry):
+        """Resize calibration to the whole native screen, including Qtile panels."""
+        if geometry is None:
+            return
+        self.setGeometry(geometry)
+        width = max(1, self.width() - 1)
+        height = max(1, self.height() - 1)
+        self.target_positions = [QPointF(fx * width, fy * height)
+                                 for fx, fy in TPI_CALIBRATION_TARGET_FRACTIONS]
+        self.update()
 
     def target_local_position(self):
         """Current target centre in fullscreen-window-local screen pixel coordinates."""
@@ -3485,7 +3497,7 @@ class SpatialDesktop(QWidget):
         if not self._set_system_clipboard_for_drop(entry) or pyautogui is None or global_pos is None:
             return False
         try:
-            QCursor.setPos(global_pos)
+            self._set_os_pointer_global(global_pos)
             pyautogui.click(_pause=False)
             keys = ("command", "v") if sys.platform == "darwin" else ("ctrl", "v")
             # Allow the receiving window to process the click/focus change. Do not sleep
@@ -4613,8 +4625,7 @@ class SpatialDesktop(QWidget):
         if self.desktop_mode == "os" and pyautogui is not None:
             try:
                 global_pos = self._virtual_point_to_global(point)
-                QCursor.setPos(global_pos)
-                self.last_os_cursor_pos = global_pos
+                self._set_os_pointer_global(global_pos)
                 pyautogui.click(button="left", _pause=False)
                 self.right_click_context_active[side] = False
             except Exception as exc:
@@ -4672,31 +4683,133 @@ class SpatialDesktop(QWidget):
                 and not self.mouse_detached_by_side.get(side, False)):
             try:
                 global_pos = self._virtual_point_to_global(point)
-                QCursor.setPos(global_pos)
-                self.last_os_cursor_pos = global_pos
+                self._set_os_pointer_global(global_pos)
                 pyautogui.click(button="right", _pause=False)
                 self.right_click_context_active[side] = True
             except Exception as exc:
                 self.status = f"OS right-click failed: {exc}"
 
-    def _virtual_point_to_global(self, point):
-        """Convert a virtual-hand point to physical desktop coordinates.
+    def _linux_x11_screen_context(self):
+        """Return cached native X11 display/root metrics when running on XCB."""
+        if not sys.platform.startswith("linux"):
+            return None
+        try:
+            if QApplication.platformName().lower() not in ("xcb", "x11"):
+                return None
+        except Exception:
+            return None
+        cached = getattr(self, "_linux_x11_screen_context_cache", None)
+        if cached is not None:
+            return cached
+        try:
+            x11 = ctypes.CDLL("libX11.so.6")
+            x11.XOpenDisplay.argtypes = [ctypes.c_char_p]
+            x11.XOpenDisplay.restype = ctypes.c_void_p
+            display = x11.XOpenDisplay(None)
+            if not display:
+                return None
+            x11.XDefaultScreen.argtypes = [ctypes.c_void_p]
+            x11.XDefaultScreen.restype = ctypes.c_int
+            x11.XDefaultRootWindow.argtypes = [ctypes.c_void_p]
+            x11.XDefaultRootWindow.restype = ctypes.c_ulong
+            x11.XDisplayWidth.argtypes = [ctypes.c_void_p, ctypes.c_int]
+            x11.XDisplayWidth.restype = ctypes.c_int
+            x11.XDisplayHeight.argtypes = [ctypes.c_void_p, ctypes.c_int]
+            x11.XDisplayHeight.restype = ctypes.c_int
+            x11.XWarpPointer.argtypes = [
+                ctypes.c_void_p, ctypes.c_ulong, ctypes.c_ulong,
+                ctypes.c_int, ctypes.c_int, ctypes.c_uint, ctypes.c_uint,
+                ctypes.c_int, ctypes.c_int,
+            ]
+            x11.XWarpPointer.restype = ctypes.c_int
+            x11.XFlush.argtypes = [ctypes.c_void_p]
+            x11.XFlush.restype = ctypes.c_int
+            screen_number = int(x11.XDefaultScreen(display))
+            x11.XRaiseWindow.argtypes = [ctypes.c_void_p, ctypes.c_ulong]
+            x11.XRaiseWindow.restype = ctypes.c_int
+            context = {
+                "lib": x11,
+                "display": display,
+                "root": int(x11.XDefaultRootWindow(display)),
+                "width": int(x11.XDisplayWidth(display, screen_number)),
+                "height": int(x11.XDisplayHeight(display, screen_number)),
+                "screen_number": screen_number,
+                "created_at": time.monotonic(),
+            }
+            self._linux_x11_lib = x11
+            self._linux_x11_display = display
+            self._linux_x11_screen_context_cache = context
+            return context
+        except Exception:
+            return None
 
-        interactive_visual_point() maps landmarks in primary-screen-local pixels.
-        Qtile can position a Qt.Tool fullscreen overlay at the work-area origin (below
-        its top bar), so mapToGlobal() would incorrectly add that bar offset and make
-        the cursor unable to reach the top bar. Convert from the actual QScreen origin
-        on Linux; use the native Qt mapping on other platforms.
+    def _interaction_screen_geometry(self):
+        """Use the X11 root-screen rectangle when Qt reports only the work area.
+
+        Qtile can expose a QScreen height that stops above a bottom panel/strut. The X11
+        root size is independent of EWMH work areas, so use it only when width matches
+        closely and the missing height is small enough to be a reserved bar—not a
+        high-DPI scale or multi-monitor geometry mismatch.
         """
+        screen = QApplication.primaryScreen()
+        if screen is None:
+            return QRect(0, 0, max(1, self.width()), max(1, self.height()))
+        qt_rect = screen.geometry()
+        if not sys.platform.startswith("linux"):
+            return qt_rect
+        context = self._linux_x11_screen_context()
+        if context is None:
+            self._linux_native_pointer_warp_compatible = False
+            return qt_rect
+        try:
+            context["width"] = int(context["lib"].XDisplayWidth(
+                context["display"], int(context["screen_number"])))
+            context["height"] = int(context["lib"].XDisplayHeight(
+                context["display"], int(context["screen_number"])))
+        except Exception:
+            pass
+        qt_bounds = (qt_rect.x(), qt_rect.y(), qt_rect.width(), qt_rect.height())
+        resolved, native_compatible = resolve_fullscreen_bounds(
+            qt_bounds, (context["width"], context["height"]))
+        self._linux_native_pointer_warp_compatible = bool(native_compatible)
+        return QRect(*resolved)
+
+    def _virtual_point_to_global(self, point):
+        """Convert a screen-local virtual-hand point into desktop-global coordinates."""
         if point is None:
             return None
         pixel = QPoint(round(point.x()), round(point.y()))
         if sys.platform.startswith("linux"):
-            screen = QApplication.primaryScreen()
-            geometry = screen.geometry() if screen is not None else None
-            if geometry is not None:
-                return geometry.topLeft() + pixel
+            geometry = self._interaction_screen_geometry()
+            return geometry.topLeft() + pixel
         return self.mapToGlobal(pixel)
+
+    def _set_os_pointer_global(self, global_pos):
+        """Warp through X11 root coordinates when Qtile's work area is too short.
+
+        QCursor.setPos is the normal cross-platform route. On an XCB session whose Qt
+        and X11 screen widths match, warping directly to the root avoids any Qt widget/
+        work-area confinement and can reach the lower Qtile bar as well as the top bar.
+        """
+        if global_pos is None:
+            return False
+        if sys.platform.startswith("linux") and getattr(self, "_linux_native_pointer_warp_compatible", False):
+            context = self._linux_x11_screen_context()
+            if context is not None:
+                try:
+                    x = max(0, min(context["width"] - 1, int(global_pos.x())))
+                    y = max(0, min(context["height"] - 1, int(global_pos.y())))
+                    context["lib"].XWarpPointer(
+                        context["display"], ctypes.c_ulong(0), ctypes.c_ulong(context["root"]),
+                        0, 0, 0, 0, x, y)
+                    context["lib"].XFlush(context["display"])
+                    self.last_os_cursor_pos = QPoint(x, y)
+                    return True
+                except Exception:
+                    pass
+        QCursor.setPos(global_pos)
+        self.last_os_cursor_pos = QPoint(global_pos)
+        return True
 
     def _set_os_pointer(self, point):
         clipboard_interaction_active = any(
@@ -4710,8 +4823,7 @@ class SpatialDesktop(QWidget):
         global_pos = self._virtual_point_to_global(point)
         if global_pos is None:
             return
-        QCursor.setPos(global_pos)
-        self.last_os_cursor_pos = global_pos
+        self._set_os_pointer_global(global_pos)
 
     def _release_fist_mouse(self, side):
         if self.fist_mouse_down.get(side) and pyautogui is not None:
@@ -6627,6 +6739,7 @@ try {
                        "move the TPI to point 1 of 9 and pinch-hold")
 
         window = TliCalibrationWindow(side)
+        window.set_full_screen_geometry(self._interaction_screen_geometry())
         window.cancel_requested.connect(self._cancel_tli_calibration)
         self.tli_calibration_window = window
         window.set_target_index(0)
@@ -7064,8 +7177,7 @@ try {
     def interactive_point(self, x, y):
         """Map the calibrated camera area to the physical screen and clamp it there."""
         point = self.interactive_visual_point(x, y)
-        screen = QApplication.primaryScreen()
-        geometry = screen.geometry() if screen is not None else None
+        geometry = self._interaction_screen_geometry()
         width = geometry.width() if geometry is not None else self.width()
         height = geometry.height() if geometry is not None else self.height()
         return QPointF(min(max(0.0, point.x()), max(1, width-1)),
@@ -7081,8 +7193,7 @@ try {
         """
         nx = (float(x)-0.20)/(0.80-0.20)
         ny = (float(y)-0.16)/(0.84-0.16)
-        screen = QApplication.primaryScreen()
-        screen_geometry = screen.geometry() if screen is not None else None
+        screen_geometry = self._interaction_screen_geometry()
         screen_width = screen_geometry.width() if screen_geometry is not None else self.width()
         screen_height = screen_geometry.height() if screen_geometry is not None else self.height()
         calibration = getattr(self, "hand_calibration", {})
@@ -7930,8 +8041,7 @@ try {
         # These landmarks are already in primary-screen coordinates. Use the same
         # physical screen dimensions for the contact correction; QWidget.height()
         # can reflect Qtile's reserved work area and truncate the lower screen band.
-        contact_screen = QApplication.primaryScreen()
-        contact_geometry = contact_screen.geometry() if contact_screen is not None else None
+        contact_geometry = self._interaction_screen_geometry()
         contact_width = contact_geometry.width() if contact_geometry is not None else self.width()
         contact_height = contact_geometry.height() if contact_geometry is not None else self.height()
         px_x = max(1.0, contact_width-1)/0.60
@@ -7977,8 +8087,7 @@ try {
         x, y = scale_hand_point((cursor.x(), cursor.y()), (origin.x(), origin.y()), visual_scale)
         # Clamp to the physical screen, not the Qtile work area. On Linux the reserved
         # top/bottom bars are outside availableGeometry(), but are still valid targets.
-        screen = QApplication.primaryScreen()
-        geometry = screen.geometry() if screen is not None else None
+        geometry = self._interaction_screen_geometry()
         width = geometry.width() if geometry is not None else self.width()
         height = geometry.height() if geometry is not None else self.height()
         clamped = QPointF(min(max(0.0, x), max(1.0, width-1.0)),
@@ -8809,8 +8918,7 @@ try {
         # Use the same full-screen coordinate system as interactive_visual_point().
         # Under Qtile the widget may temporarily report the work-area height (ending
         # above the bottom bar), which would clamp the cursor and hand-follow offset.
-        screen = QApplication.primaryScreen()
-        screen_geometry = screen.geometry() if screen is not None else None
+        screen_geometry = self._interaction_screen_geometry()
         h = max(1.0, float(screen_geometry.height() if screen_geometry is not None else self.height()))
         edge_band = h * 0.055
         target_y = min(h-1.0, max(0.0, target.y()))
@@ -9381,17 +9489,17 @@ try {
     def _sync_linux_fullscreen_geometry(self):
         """Keep the XLibre/X11 overlay aligned to the full physical screen rectangle.
 
-        Some X11 window managers initially report the work area for a fullscreen Qt
-        widget rather than the full physical screen. Force the widget's local (0, 0) to correspond
-        to screen.geometry().topLeft() and make its drawing area match that screen's
-        actual dimensions, so screen-local hand coordinates and mapToGlobal agree.
+        When Qt reports only the Qtile work area, _interaction_screen_geometry() uses
+        matching native X11 root dimensions to recover the missing bottom strip. The
+        fullscreen paint surface, hand coordinates and pointer warping then share that
+        same corrected screen rectangle.
         """
         if not sys.platform.startswith("linux"):
             return
         screen = QApplication.primaryScreen()
         if screen is None:
             return
-        screen_rect = screen.geometry()
+        screen_rect = self._interaction_screen_geometry()
         try:
             reported_origin = self.mapToGlobal(QPoint(0, 0))
         except Exception:
@@ -9406,34 +9514,22 @@ try {
             # a bottom bar even if the WM leaves the native window at work-area height.
             self.setGeometry(screen_rect)
             try:
-                if QApplication.platformName().lower() in ("xcb", "x11"):
-                    x11 = getattr(self, "_linux_x11_lib", None)
-                    display = getattr(self, "_linux_x11_display", None)
-                    if x11 is None:
-                        x11 = ctypes.CDLL("libX11.so.6")
-                    if display is None:
-                        x11.XOpenDisplay.argtypes = [ctypes.c_char_p]
-                        x11.XOpenDisplay.restype = ctypes.c_void_p
-                        display = x11.XOpenDisplay(None)
-                    if display:
-                        x11.XMoveResizeWindow.argtypes = [
-                            ctypes.c_void_p, ctypes.c_ulong, ctypes.c_int, ctypes.c_int,
-                            ctypes.c_uint, ctypes.c_uint,
-                        ]
-                        x11.XMoveResizeWindow.restype = ctypes.c_int
-                        x11.XFlush.argtypes = [ctypes.c_void_p]
-                        x11.XFlush.restype = ctypes.c_int
-                        x11.XMoveResizeWindow(
-                            display, ctypes.c_ulong(int(self.winId())),
-                            ctypes.c_int(screen_rect.x()), ctypes.c_int(screen_rect.y()),
-                            ctypes.c_uint(screen_rect.width()), ctypes.c_uint(screen_rect.height()),
-                        )
-                        x11.XFlush(display)
-                        self._linux_x11_lib = x11
-                        self._linux_x11_display = display
+                context = self._linux_x11_screen_context()
+                if context is not None and getattr(self, "_linux_native_pointer_warp_compatible", False):
+                    x11 = context["lib"]
+                    x11.XMoveResizeWindow.argtypes = [
+                        ctypes.c_void_p, ctypes.c_ulong, ctypes.c_int, ctypes.c_int,
+                        ctypes.c_uint, ctypes.c_uint,
+                    ]
+                    x11.XMoveResizeWindow.restype = ctypes.c_int
+                    x11.XMoveResizeWindow(
+                        context["display"], ctypes.c_ulong(int(self.winId())),
+                        ctypes.c_int(screen_rect.x()), ctypes.c_int(screen_rect.y()),
+                        ctypes.c_uint(screen_rect.width()), ctypes.c_uint(screen_rect.height()),
+                    )
+                    x11.XFlush(context["display"])
             except Exception:
-                # QWidget geometry remains the portable fallback if native X11 resize
-                # is unavailable (for example, when running under Wayland/XWayland).
+                # QWidget geometry remains the portable fallback on unsupported sessions.
                 pass
             self.update()
 
@@ -9911,8 +10007,7 @@ try {
                     self.fist_last_points[side] = QPointF(cursor)
                 self.hand_missing_since[side] = None
 
-            screen = QApplication.primaryScreen()
-            edge_geometry = screen.geometry() if screen is not None else None
+            edge_geometry = self._interaction_screen_geometry()
             edge_width = edge_geometry.width() if edge_geometry is not None else self.width()
             edge_height = edge_geometry.height() if edge_geometry is not None else self.height()
             edge_tolerant = (cursor.x() <= edge_width*0.045 or

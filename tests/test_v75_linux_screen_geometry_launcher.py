@@ -8,11 +8,15 @@ def test_os_pointer_maps_virtual_hand_points_to_physical_screen_coordinates():
     start = source.index("    def _virtual_point_to_global(self, point):")
     end = source.index("    def _release_fist_mouse(self, side):", start)
     method = source[start:end]
-    assert "QApplication.primaryScreen()" in method
+    assert "self._interaction_screen_geometry()" in method
     assert "geometry.topLeft() + pixel" in method
     assert "self.mapToGlobal(pixel)" in method
     assert "self._virtual_point_to_global(point)" in method
-    assert "QCursor.setPos(global_pos)" in method
+    assert "self._set_os_pointer_global(global_pos)" in method
+    native = source[source.index("    def _set_os_pointer_global(self, global_pos):"):
+                    source.index("    def _set_os_pointer(self, point):")]
+    assert "XWarpPointer" in native
+    assert "_linux_native_pointer_warp_compatible" in native
 
 
 def test_virtual_tli_clamps_to_physical_screen_not_qtile_work_area():
@@ -20,7 +24,7 @@ def test_virtual_tli_clamps_to_physical_screen_not_qtile_work_area():
     start = source.index("    def _scale_hand_tli_point(self, cursor, points=None, side=None):")
     end = source.index("    def _visual_tli_position", start)
     method = source[start:end]
-    assert "screen.geometry()" in method
+    assert "self._interaction_screen_geometry()" in method
     assert "geometry.width()" in method
     assert "geometry.height()" in method
     assert "self.width()-1.0" not in method
@@ -41,7 +45,7 @@ def test_fullscreen_geometry_is_rechecked_during_live_linux_tracking():
 def test_linux_overlay_is_synchronized_to_full_screen_geometry():
     source = (ROOT / "main.py").read_text(encoding="utf-8")
     assert "def _sync_linux_fullscreen_geometry(self):" in source
-    assert "screen_rect = screen.geometry()" in source
+    assert "screen_rect = self._interaction_screen_geometry()" in source
     assert "window._sync_linux_fullscreen_geometry()" in source
 
 
@@ -93,14 +97,14 @@ def test_cursor_smoothing_uses_full_screen_height_not_qtile_work_area():
     start = source.index("    def _smooth_cursor(self, side, target, now):")
     end = source.index("    def _notification_stack_opacity", start)
     method = source[start:end]
-    assert "screen.geometry()" in method
+    assert "self._interaction_screen_geometry()" in method
     assert "screen_geometry.height()" in method
     assert "else self.height()" in method  # fallback only when screen data is unavailable
 
 
 def test_bottom_edge_detection_and_two_hand_contact_use_full_screen_dimensions():
     source = (ROOT / "main.py").read_text(encoding="utf-8")
-    edge_start = source.index("            edge_geometry = screen.geometry()")
+    edge_start = source.index("            edge_geometry = self._interaction_screen_geometry()")
     edge_end = source.index("            # This toggle remains active", edge_start)
     edge_block = source[edge_start:edge_end]
     assert "edge_geometry.height()" in edge_block
@@ -108,6 +112,7 @@ def test_bottom_edge_detection_and_two_hand_contact_use_full_screen_dimensions()
     contact_start = source.index("    def _update_hand_contact_display(self):")
     contact_end = source.index("    def _hand_visual_transform", contact_start)
     contact_block = source[contact_start:contact_end]
+    assert "self._interaction_screen_geometry()" in contact_block
     assert "contact_geometry.height()" in contact_block
     assert "px_y = max(1.0, contact_height-1)/0.68" in contact_block
 
@@ -117,6 +122,6 @@ def test_linux_overlay_has_native_x11_full_screen_geometry_fallback():
     start = source.index("    def _sync_linux_fullscreen_geometry(self):")
     end = source.index("    # Repaint interval", start)
     method = source[start:end]
-    assert "screen_rect = screen.geometry()" in method
+    assert "screen_rect = self._interaction_screen_geometry()" in method
     assert "XMoveResizeWindow" in method
     assert "screen_rect.height()" in method
