@@ -98,7 +98,7 @@ TLI paste and lasso operations require **OS Desktop** mode. `paste here` clicks 
 
 The command router is deterministic and offline. It is evaluated before search dictation to keep command phrases from being typed into the launcher.
 
-- **Clipboard:** `copy this`, `copy selection`, `cut this`, `paste`, `paste here`, `select all`, `undo`, `redo`.
+- **Clipboard:** `open clipboard` / `show clipboard`, `close clipboard` / `hide clipboard`, `copy this`, `copy selection`, `cut this`, `paste`, `paste here`, `select all`, `undo`, `redo`.
 - **Text lasso:** say `start text selection`, move your hand to extend the native selection, then say `copy this` or `finish selection`. Say `cancel selection` to release the mouse and cancel.
 - **Image lasso:** say `copy image` or `start image lasso` at the first corner, move the TLI to the opposite corner, then say `copy this` or `finish lasso`. A screen crop goes to the clipboard as an image.
 - **Media:** `play pause`, `next track`, `previous track`, `volume up`, `volume down`, `mute`, `unmute`.

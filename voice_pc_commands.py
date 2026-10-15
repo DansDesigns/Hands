@@ -13,6 +13,8 @@ _ALIASES = {
     "resume_dictation": ("resume dictation", "continue dictation", "dictation resume"),
 
     # Clipboard and spatial selection
+    "show_clipboard": ("open clipboard", "show clipboard", "open floating clipboard", "show floating clipboard"),
+    "hide_clipboard": ("close clipboard", "hide clipboard", "close floating clipboard", "hide floating clipboard"),
     "copy": ("copy this", "copy text", "copy selection", "copy selected text", "copy selected item", "copy that", "copy this text"),
     "cut": ("cut this", "cut selection", "cut selected text", "cut that"),
     "paste_here": ("paste here", "paste this", "paste at cursor", "paste at t l i", "paste at tap point", "paste at the cursor"),

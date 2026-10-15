@@ -20,6 +20,9 @@ import ctypes
 import subprocess
 import getpass
 import shutil
+import hashlib
+import tempfile
+import uuid
 from datetime import datetime
 from ctypes import wintypes
 from pathlib import Path
@@ -100,8 +103,8 @@ except Exception as exc:
     print("MediaPipe is required:", exc)
     raise SystemExit(1)
 
-from PySide6.QtCore import Qt, QTimer, QPoint, QPointF, QRectF, QObject, Signal
-from PySide6.QtGui import QPainter, QColor, QPen, QBrush, QFont, QFontMetricsF, QCursor, QLinearGradient, QImage, QPainterPath, QPainterPathStroker, QRadialGradient, QPolygonF
+from PySide6.QtCore import Qt, QTimer, QPoint, QPointF, QRectF, QObject, Signal, QMimeData, QBuffer, QIODevice
+from PySide6.QtGui import QPainter, QColor, QPen, QBrush, QFont, QFontMetricsF, QCursor, QLinearGradient, QImage, QPainterPath, QPainterPathStroker, QRadialGradient, QPolygonF, QDrag, QPixmap
 from PySide6.QtCore import QUrl
 from PySide6.QtWidgets import QApplication, QWidget, QMessageBox, QInputDialog
 
@@ -1092,6 +1095,7 @@ class SearchHandOverlay(QWidget):
         for side in ("right", "left"):
             owner._paint_gesture_timer_fade(painter, side, now)
             owner._paint_pinch_menu(painter, side, now)
+        owner._paint_floating_clipboard(painter, now)
         owner._paint_middle_pinch_zoom_timer(painter, now)
         # This overlay is the sole hand-visual owner while Search is visible; the main
         # window skips the identical layer to avoid double-painted ghost silhouettes.
@@ -1780,6 +1784,21 @@ class SpatialDesktop(QWidget):
         self.voice_selection_mode = None  # None | "text" | "image"
         self.voice_lasso_start = None     # global screen QPointF
         self.voice_selection_target = None
+        # Floating clipboard history is populated from the real system clipboard. Entries
+        # are kept in memory for this session and can be selected or dragged with a hand.
+        self.floating_clipboard_visible = False
+        self.floating_clipboard_entries = []
+        self.floating_clipboard_max_entries = 36
+        self.floating_clipboard_scroll_offset = 0
+        # Optional screen-local top-left override; None retains the default right-side position.
+        self.floating_clipboard_position = None
+        self.floating_clipboard_drag_state = {"left": None, "right": None}
+        self.floating_clipboard_drag_running = False
+        self.floating_clipboard_temp_dir = Path(tempfile.gettempdir()) / "FreehandClipboard"
+        self.floating_clipboard_temp_dir.mkdir(parents=True, exist_ok=True)
+        self._clipboard_last_signature = None
+        self._clipboard_last_signature_at = 0.0
+        self._clipboard_capture_suppression_until = 0.0
         self.status = f"Ready — offline Vosk STT · Kokoro TTS: {self.tts.status}"
 
         self.desktop_mode = "os"  # start in OS Desktop mode; the menu can switch to virtual/3D mode
@@ -2017,6 +2036,12 @@ class SpatialDesktop(QWidget):
         # A mouse-transparent topmost visual layer keeps the skeleton, TLI and gesture
         # progress visible over the search launcher without blocking its controls.
         self.search_hand_overlay = SearchHandOverlay(self)
+        self._system_clipboard = QApplication.clipboard()
+        try:
+            self._system_clipboard.dataChanged.connect(self._capture_system_clipboard)
+            QTimer.singleShot(350, self._capture_system_clipboard)
+        except Exception:
+            pass
         self.timer = QTimer(self)
         self.timer.timeout.connect(self.update_scene)
         self.timer.start(50)
@@ -2799,15 +2824,631 @@ class SpatialDesktop(QWidget):
         distance, name = min(candidates)
         return name if distance <= y_limit else None
 
+    def _clipboard_payload_from_mime(self, mime):
+        """Snapshot ordinary system clipboard contents into a portable history entry."""
+        if mime is None:
+            return None
+        image = None
+        if mime.hasImage():
+            try:
+                value = mime.imageData()
+                if isinstance(value, QImage):
+                    image = value.copy()
+                elif hasattr(value, "toImage"):
+                    image = value.toImage().copy()
+                elif value is not None:
+                    image = QImage(value).copy()
+                if image is not None and image.isNull():
+                    image = None
+            except Exception:
+                image = None
+        try:
+            urls = [QUrl(url) for url in mime.urls()] if mime.hasUrls() else []
+        except Exception:
+            urls = []
+        try:
+            text = str(mime.text() or "") if mime.hasText() else ""
+        except Exception:
+            text = ""
+        try:
+            html = str(mime.html() or "") if mime.hasHtml() else ""
+        except Exception:
+            html = ""
+        if image is not None:
+            kind = "image"
+        elif urls:
+            kind = "files" if all(url.isLocalFile() for url in urls) else "links"
+            # Explorer/Finder file-copy operations usually expose image files as URLs,
+            # not as imageData. Load a lightweight preview while retaining the original
+            # URLs as the actual drag payload so the copied file remains a file.
+            if kind == "files":
+                image_suffixes = {".png", ".jpg", ".jpeg", ".bmp", ".gif", ".webp", ".tif", ".tiff"}
+                for url in urls[:8]:
+                    if not url.isLocalFile():
+                        continue
+                    local_path = url.toLocalFile()
+                    if Path(local_path).suffix.lower() not in image_suffixes:
+                        continue
+                    try:
+                        candidate = QImage(local_path)
+                        if not candidate.isNull():
+                            image = candidate
+                            break
+                    except Exception:
+                        pass
+        elif text.strip() or html.strip():
+            kind = "text"
+        else:
+            return None
+        # Images are hashed from a tiny thumbnail, avoiding work on full-resolution
+        # screenshots while still deduplicating repeated QClipboard notifications.
+        parts = [kind, text[:200000], html[:200000], "\n".join(url.toString() for url in urls)]
+        if image is not None:
+            try:
+                sample = image.scaled(12, 12, Qt.KeepAspectRatio, Qt.FastTransformation).convertToFormat(QImage.Format_RGBA8888)
+                buffer = QBuffer()
+                buffer.open(QIODevice.WriteOnly)
+                sample.save(buffer, "PNG")
+                parts.append(hashlib.sha1(bytes(buffer.data())).hexdigest())
+                buffer.close()
+                parts.append(f"{image.width()}x{image.height()}")
+            except Exception:
+                parts.append(f"{image.width()}x{image.height()}")
+        signature = hashlib.sha1("\x1f".join(parts).encode("utf-8", "replace")).hexdigest()
+        return {"kind": kind, "text": text[:1000000], "html": html[:1000000],
+                "image": image, "urls": urls, "signature": signature}
+
+    def _capture_system_clipboard(self):
+        """Record new OS clipboard content, including text, file URLs, and copied images."""
+        clipboard = getattr(self, "_system_clipboard", None)
+        if clipboard is None:
+            try:
+                clipboard = QApplication.clipboard()
+            except Exception:
+                return
+        try:
+            payload = self._clipboard_payload_from_mime(clipboard.mimeData())
+        except Exception:
+            return
+        if payload is None:
+            return
+        now = time.monotonic()
+        if now < getattr(self, "_clipboard_capture_suppression_until", 0.0):
+            return
+        signature = payload["signature"]
+        # QClipboard can emit dataChanged more than once for a single native copy.
+        if signature == self._clipboard_last_signature and now-self._clipboard_last_signature_at < 1.0:
+            return
+        if self.floating_clipboard_entries and self.floating_clipboard_entries[-1].get("signature") == signature:
+            self._clipboard_last_signature = signature
+            self._clipboard_last_signature_at = now
+            return
+        entry = {
+            "id": uuid.uuid4().hex,
+            "kind": payload["kind"],
+            "text": payload["text"],
+            "html": payload.get("html", ""),
+            "image": payload["image"],
+            "urls": payload["urls"],
+            "signature": signature,
+            "created": datetime.now(),
+            "image_path": None,
+        }
+        if entry["image"] is not None:
+            original_image = entry["image"]
+            entry["image_width"] = int(original_image.width())
+            entry["image_height"] = int(original_image.height())
+            # Keep original pixels on disk for clipboard/drop fidelity, but keep only a
+            # modest preview in RAM so a run of copied 4K screenshots doesn't balloon
+            # memory use. Image files copied from Explorer retain their original URL.
+            if entry["kind"] == "image":
+                path = self.floating_clipboard_temp_dir / f"clipboard-{entry['id']}.png"
+                try:
+                    if original_image.save(str(path), "PNG"):
+                        entry["image_path"] = str(path)
+                except Exception:
+                    pass
+            if (max(original_image.width(), original_image.height()) > 640 and
+                    (entry["kind"] != "image" or entry["image_path"])):
+                try:
+                    entry["image"] = original_image.scaled(
+                        640, 640, Qt.KeepAspectRatio, Qt.SmoothTransformation)
+                except Exception:
+                    pass
+        self.floating_clipboard_entries.append(entry)
+        evicted = self.floating_clipboard_entries[:-self.floating_clipboard_max_entries]
+        del self.floating_clipboard_entries[:-self.floating_clipboard_max_entries]
+        # Remove cached bitmap previews for history items that rolled out of the cap.
+        for stale in evicted:
+            stale_path = stale.get("image_path")
+            if stale_path:
+                try:
+                    if Path(stale_path).resolve().parent == self.floating_clipboard_temp_dir.resolve():
+                        Path(stale_path).unlink(missing_ok=True)
+                except Exception:
+                    pass
+        self.floating_clipboard_scroll_offset = 0
+        self._clipboard_last_signature = signature
+        self._clipboard_last_signature_at = now
+        self.update()
+        overlay = getattr(self, "search_hand_overlay", None)
+        if overlay is not None:
+            overlay.update()
+
+    def _delete_floating_clipboard_entry(self, entry_id):
+        """Remove one clipboard-history item and its private cached bitmap, if any."""
+        entry = next((item for item in self.floating_clipboard_entries
+                      if item.get("id") == entry_id), None)
+        if entry is None:
+            return False
+        self.floating_clipboard_entries = [
+            item for item in self.floating_clipboard_entries if item.get("id") != entry_id]
+        # Cancel an in-flight drag of the removed item so it cannot paste stale content.
+        for side, state in self.floating_clipboard_drag_state.items():
+            if state and state.get("type") == "entry" and state.get("entry_id") == entry_id:
+                self.floating_clipboard_drag_state[side] = None
+        self.floating_clipboard_drag_running = any(
+            bool(state and state.get("running")) for state in self.floating_clipboard_drag_state.values())
+        stale_path = entry.get("image_path")
+        if stale_path:
+            try:
+                if Path(stale_path).resolve().parent == self.floating_clipboard_temp_dir.resolve():
+                    Path(stale_path).unlink(missing_ok=True)
+            except Exception:
+                pass
+        self.floating_clipboard_scroll_offset = min(
+            int(self.floating_clipboard_scroll_offset), max(0, len(self.floating_clipboard_entries)-1))
+        self.status = "Clipboard item deleted"
+        self.update()
+        overlay = getattr(self, "search_hand_overlay", None)
+        if overlay is not None:
+            overlay.update()
+        return True
+
+    def _set_floating_clipboard_visible(self, visible):
+        self.floating_clipboard_visible = bool(visible)
+        if self.floating_clipboard_visible:
+            self.floating_clipboard_scroll_offset = 0
+            self.status = f"Floating clipboard shown — {len(self.floating_clipboard_entries)} item(s); grab or pinch an item to drag it"
+        else:
+            for side, state in self.floating_clipboard_drag_state.items():
+                if state and not state.get("running"):
+                    self.floating_clipboard_drag_state[side] = None
+            self.status = "Floating clipboard hidden"
+        self.update()
+        overlay = getattr(self, "search_hand_overlay", None)
+        if overlay is not None:
+            overlay.update()
+
+    def _floating_clipboard_layout(self):
+        """Return the floating PowerPoint-style thumbnail strip in screen-local coords."""
+        if not self.floating_clipboard_visible or self.width() <= 0 or self.height() <= 0:
+            return None
+        scale = min(1.0, max(0.72, min(self.width()/1440.0, self.height()/800.0)))
+        panel_w = min(292.0*scale, max(222.0*scale, self.width()*0.205))
+        pad = 10.0*scale
+        header_h = 46.0*scale
+        card_h = 88.0*scale
+        footer_h = 34.0*scale
+        newest_first = list(reversed(self.floating_clipboard_entries))
+        start = max(0, min(int(self.floating_clipboard_scroll_offset), max(0, len(newest_first)-1)))
+        visible = newest_first[start:start+5]
+        content_h = len(visible)*card_h if visible else 75.0*scale
+        panel_h = pad + header_h + content_h + footer_h + pad
+        panel_h = min(panel_h, max(160.0*scale, self.height()*0.82))
+        default_x = max(8.0, self.width()-panel_w-22.0*scale)
+        default_y = max(8.0, min((self.height()-panel_h)*0.5, self.height()-panel_h-8.0))
+        saved_position = getattr(self, "floating_clipboard_position", None)
+        if saved_position is None:
+            x, y = default_x, default_y
+        else:
+            x = max(4.0, min(float(saved_position.x()), max(4.0, self.width()-panel_w-4.0)))
+            y = max(4.0, min(float(saved_position.y()), max(4.0, self.height()-panel_h-4.0)))
+        panel = QRectF(x, y, panel_w, panel_h)
+        header = QRectF(panel.left()+9*scale, panel.top()+6*scale, panel.width()-18*scale, 38*scale)
+        close_rect = QRectF(panel.right()-30*scale, panel.top()+8*scale, 22*scale, 24*scale)
+        cards = []
+        delete_buttons = {}
+        card_y = panel.top()+pad+header_h
+        if visible:
+            for entry in visible:
+                card_rect = QRectF(panel.left()+pad, card_y, panel.width()-2*pad, card_h-5*scale)
+                cards.append((entry, card_rect))
+                # Red delete button fills the card's full height and sits inside its right edge.
+                delete_buttons[entry.get("id")] = QRectF(
+                    card_rect.right()-32*scale, card_rect.top(), 32*scale, card_rect.height())
+                card_y += card_h
+        older_rect = QRectF(panel.left()+pad, panel.bottom()-footer_h, (panel.width()-3*pad)/2, footer_h-2*scale)
+        newer_rect = QRectF(older_rect.right()+pad, older_rect.top(), older_rect.width(), older_rect.height())
+        return {"panel": panel, "header": header, "cards": cards, "delete_buttons": delete_buttons,
+                "close": close_rect, "older": older_rect, "newer": newer_rect, "scale": scale,
+                "empty": not bool(visible), "start": start, "count": len(newest_first)}
+
+    def _floating_clipboard_contains(self, point):
+        layout = self._floating_clipboard_layout()
+        return bool(layout is not None and point is not None and layout["panel"].contains(point))
+
+    def _floating_clipboard_hit_test(self, point):
+        layout = self._floating_clipboard_layout()
+        if layout is None or point is None:
+            return None
+        for name in ("close", "older", "newer"):
+            if layout[name].contains(point):
+                return {"type": "control", "name": name}
+        for entry, rect in layout["cards"]:
+            delete_rect = layout["delete_buttons"].get(entry.get("id"))
+            if delete_rect is not None and delete_rect.contains(point):
+                return {"type": "control", "name": "delete", "entry_id": entry.get("id")}
+        # The title bar is a drag handle; the close button is tested above it.
+        if layout["header"].contains(point):
+            return {"type": "control", "name": "header"}
+        for entry, rect in layout["cards"]:
+            if rect.contains(point):
+                return {"type": "entry", "entry": entry}
+        return None
+
+    def _paint_floating_clipboard(self, painter, now=None):
+        layout = self._floating_clipboard_layout()
+        if layout is None:
+            return
+        panel, scale = layout["panel"], layout["scale"]
+        painter.save()
+        painter.setPen(QPen(QColor(112, 232, 248, 210), 1.5*scale))
+        painter.setBrush(QBrush(QColor(4, 17, 31, 229)))
+        painter.drawRoundedRect(panel, 15*scale, 15*scale)
+        header = QRectF(panel.left()+9*scale, panel.top()+6*scale, panel.width()-18*scale, 38*scale)
+        painter.setPen(Qt.NoPen)
+        painter.setBrush(QBrush(QColor(22, 66, 83, 245)))
+        painter.drawRoundedRect(header, 10*scale, 10*scale)
+        self._paint_clipboard_icon(painter, QRectF(header.left()+5*scale, header.top()+1*scale,
+                                                   30*scale, header.height()-2*scale), True)
+        painter.setPen(QColor(230, 253, 255, 250))
+        painter.setFont(self._ui_font(9, QFont.DemiBold))
+        painter.drawText(QRectF(header.left()+37*scale, header.top(), header.width()-75*scale, header.height()),
+                         Qt.AlignVCenter | Qt.AlignLeft,
+                         f"FLOATING CLIPBOARD  ·  {layout['count']}")
+        close_rect = layout["close"]
+        close_hovered = any(point is not None and close_rect.contains(point)
+                            for point in self.side_cursor_positions.values())
+        close_gradient = QLinearGradient(close_rect.topLeft(), close_rect.bottomRight())
+        if close_hovered:
+            for expansion, alpha in ((7*scale, 45), (3.5*scale, 90)):
+                painter.setPen(QPen(QColor(255, 90, 90, alpha), 3*scale))
+                painter.setBrush(Qt.NoBrush)
+                painter.drawRoundedRect(close_rect.adjusted(-expansion, -expansion, expansion, expansion),
+                                        5*scale+expansion, 5*scale+expansion)
+            close_gradient.setColorAt(0.0, QColor(255, 105, 100, 245))
+            close_gradient.setColorAt(1.0, QColor(215, 30, 40, 250))
+            painter.setPen(QPen(QColor(255, 215, 210, 250), 2.0*scale))
+        else:
+            close_gradient.setColorAt(0.0, QColor(200, 55, 60, 215))
+            close_gradient.setColorAt(1.0, QColor(95, 12, 22, 235))
+            painter.setPen(QPen(QColor(255, 150, 150, 210), 1.5*scale))
+        painter.setBrush(QBrush(close_gradient))
+        painter.drawRoundedRect(close_rect, 5*scale, 5*scale)
+        painter.setPen(QColor(255, 247, 247, 250))
+        painter.setFont(self._ui_font(13, QFont.Bold))
+        painter.drawText(close_rect, Qt.AlignCenter, "×")
+        # A subtle grip indicates that dragging the title bar moves the panel.
+        grip_x = header.right()-37*scale
+        painter.setPen(QPen(QColor(165, 223, 236, 205), 1.4*scale, Qt.SolidLine, Qt.RoundCap))
+        for grip_y in (header.center().y()-5*scale, header.center().y(), header.center().y()+5*scale):
+            painter.drawLine(QPointF(grip_x, grip_y), QPointF(grip_x+8*scale, grip_y))
+        for index, (entry, rect) in enumerate(layout["cards"]):
+            painter.setPen(QPen(QColor(91, 177, 198, 190), 1.0*scale))
+            painter.setBrush(QBrush(QColor(11, 37, 53, 242)))
+            painter.drawRoundedRect(rect, 8*scale, 8*scale)
+            image_rect = QRectF(rect.left()+6*scale, rect.top()+6*scale, 62*scale, rect.height()-12*scale)
+            image = entry.get("image")
+            if image is not None and not image.isNull():
+                painter.setPen(QPen(QColor(122, 220, 237, 200), 1.0*scale))
+                painter.setBrush(QBrush(QColor(4, 15, 25, 240)))
+                painter.drawRoundedRect(image_rect, 5*scale, 5*scale)
+                thumb = image.scaled(max(1, int(image_rect.width()-4*scale)),
+                                     max(1, int(image_rect.height()-4*scale)),
+                                     Qt.KeepAspectRatio, Qt.SmoothTransformation)
+                painter.drawImage(QPointF(image_rect.center().x()-thumb.width()/2,
+                                          image_rect.center().y()-thumb.height()/2), thumb)
+            else:
+                icon_rect = image_rect.adjusted(14*scale, 13*scale, -14*scale, -13*scale)
+                painter.setPen(QPen(QColor(139, 236, 244, 225), 1.6*scale))
+                painter.setBrush(QBrush(QColor(17, 67, 82, 220)))
+                painter.drawRoundedRect(icon_rect, 4*scale, 4*scale)
+                painter.setPen(QPen(QColor(139, 236, 244, 225), 1.3*scale))
+                for row in range(3):
+                    yy = icon_rect.top()+(row+1)*icon_rect.height()/4
+                    painter.drawLine(QPointF(icon_rect.left()+4*scale, yy),
+                                     QPointF(icon_rect.right()-4*scale, yy))
+            delete_rect = layout["delete_buttons"].get(entry.get("id"))
+            text_left = image_rect.right()+8*scale
+            text_right = (delete_rect.left()-5*scale) if delete_rect is not None else rect.right()-5*scale
+            text_rect = QRectF(text_left, rect.top()+7*scale, max(1.0, text_right-text_left), rect.height()-14*scale)
+            if entry.get("kind") == "image":
+                kind_label = "IMAGE"
+                detail = f"{entry.get('image_width', entry['image'].width())} × {entry.get('image_height', entry['image'].height())} px" if image is not None else "Image"
+            elif entry.get("kind") == "files":
+                kind_label = "FILES"
+                names = [Path(url.toLocalFile()).name for url in entry.get("urls", []) if url.isLocalFile()]
+                detail = ", ".join(names) or "Copied file(s)"
+            elif entry.get("kind") == "links":
+                kind_label = "LINK / URL"
+                detail = entry.get("text") or ", ".join(url.toString() for url in entry.get("urls", []))
+            else:
+                kind_label = "TEXT"
+                detail = entry.get("text", "") or re.sub(r"<[^>]+>", " ", entry.get("html", ""))
+            painter.setPen(QColor(132, 226, 239, 245))
+            painter.setFont(self._ui_font(7, QFont.DemiBold))
+            painter.drawText(QRectF(text_rect.left(), text_rect.top(), text_rect.width(), 15*scale),
+                             Qt.AlignLeft | Qt.AlignVCenter, kind_label)
+            painter.setPen(QColor(224, 242, 247, 245))
+            painter.setFont(self._ui_font(7, QFont.Normal))
+            metrics = QFontMetricsF(painter.font())
+            detail_lines = str(detail or "").replace("\r", " ").splitlines() or [""]
+            line_h = 14*scale
+            for line_index in range(min(3, max(1, int((text_rect.height()-17*scale)/line_h)))):
+                line = detail_lines[line_index] if line_index < len(detail_lines) else ""
+                line = metrics.elidedText(line, Qt.ElideRight, int(text_rect.width()))
+                y_line = text_rect.top()+16*scale+line_index*line_h
+                painter.drawText(QRectF(text_rect.left(), y_line, text_rect.width(), line_h),
+                                 Qt.AlignLeft | Qt.AlignVCenter, line)
+            # Full-height red delete affordance for this history item.
+            if delete_rect is not None:
+                delete_hovered = any(point is not None and delete_rect.contains(point)
+                                     for point in self.side_cursor_positions.values())
+                delete_gradient = QLinearGradient(delete_rect.topLeft(), delete_rect.bottomRight())
+                if delete_hovered:
+                    painter.setPen(QPen(QColor(255, 100, 100, 100), 2.5*scale))
+                    painter.setBrush(Qt.NoBrush)
+                    painter.drawRoundedRect(delete_rect.adjusted(-2*scale, -2*scale, 2*scale, 2*scale),
+                                            6*scale, 6*scale)
+                    delete_gradient.setColorAt(0.0, QColor(255, 95, 95, 250))
+                    delete_gradient.setColorAt(1.0, QColor(210, 24, 35, 255))
+                    painter.setPen(QPen(QColor(255, 225, 225, 250), 1.5*scale))
+                else:
+                    delete_gradient.setColorAt(0.0, QColor(192, 48, 56, 225))
+                    delete_gradient.setColorAt(1.0, QColor(92, 13, 25, 245))
+                    painter.setPen(QPen(QColor(255, 165, 165, 225), 1.0*scale))
+                painter.setBrush(QBrush(delete_gradient))
+                painter.drawRoundedRect(delete_rect, 5*scale, 5*scale)
+                painter.setPen(QColor(255, 247, 247, 250))
+                painter.setFont(self._ui_font(14, QFont.Bold))
+                painter.drawText(delete_rect, Qt.AlignCenter, "×")
+        if layout["empty"]:
+            empty_rect = QRectF(panel.left()+12*scale, panel.top()+56*scale,
+                                panel.width()-24*scale, 67*scale)
+            painter.setPen(QColor(178, 213, 225, 235))
+            painter.setFont(self._ui_font(8, QFont.Normal))
+            painter.drawText(empty_rect, Qt.AlignCenter | Qt.TextWordWrap,
+                             "Copy text, images or files to collect them here.\nHold a pinch/grab and move to drag an item.")
+        for name, rect, label in (("older", layout["older"], "↑ OLDER"),
+                                  ("newer", layout["newer"], "↓ NEWER")):
+            enabled = (layout["start"]+5 < layout["count"]) if name == "older" else layout["start"] > 0
+            painter.setPen(QPen(QColor(88, 220, 240, 180 if enabled else 60), 1.0*scale))
+            painter.setBrush(QBrush(QColor(18, 58, 75, 220 if enabled else 100)))
+            painter.drawRoundedRect(rect, 6*scale, 6*scale)
+            painter.setPen(QColor(216, 248, 252, 235 if enabled else 100))
+            painter.setFont(self._ui_font(7, QFont.DemiBold))
+            painter.drawText(rect, Qt.AlignCenter, label)
+
+        # Draw a movable card beneath the live hand while an entry is being dragged.
+        # The OS cursor alone is not enough feedback: without this preview it looked as
+        # if the clipboard card stayed behind even though its drag state was following
+        # the virtual hand. Keep the pixmap cached in the gesture state to avoid per-frame
+        # image/text rendering work.
+        for side, state in getattr(self, "floating_clipboard_drag_state", {}).items():
+            if not state or state.get("type") != "entry" or not state.get("moved"):
+                continue
+            cursor = state.get("last_cursor")
+            pixmap = state.get("preview_pixmap")
+            if cursor is None or pixmap is None or pixmap.isNull():
+                continue
+            preview_w, preview_h = 220*scale, 77*scale
+            px = min(max(4.0, cursor.x()+16*scale), max(4.0, self.width()-preview_w-4.0))
+            py = min(max(4.0, cursor.y()+16*scale), max(4.0, self.height()-preview_h-4.0))
+            painter.save()
+            painter.setOpacity(0.94)
+            painter.drawPixmap(QRectF(px, py, preview_w, preview_h), pixmap, QRectF(pixmap.rect()))
+            painter.restore()
+        painter.restore()
+
+    def _clipboard_full_image(self, entry):
+        """Return original-resolution image data, loading cached pixels only on demand."""
+        image_path = entry.get("image_path") if entry else None
+        if image_path:
+            try:
+                full = QImage(image_path)
+                if not full.isNull():
+                    return full
+            except Exception:
+                pass
+        return entry.get("image") if entry else None
+
+    def _clipboard_mime_for_entry(self, entry, for_drag=False):
+        mime = QMimeData()
+        image = self._clipboard_full_image(entry) if entry.get("kind") == "image" else entry.get("image")
+        urls = list(entry.get("urls") or [])
+        if entry.get("kind") == "image" and image is not None and not image.isNull():
+            mime.setImageData(image)
+            if for_drag and entry.get("image_path"):
+                # A local file URL lets Explorer/Finder/file managers copy the bitmap to
+                # folders, while imageData simultaneously supports chat and browser drops.
+                urls = [QUrl.fromLocalFile(entry["image_path"])]
+        if urls:
+            mime.setUrls(urls)
+        html = str(entry.get("html") or "")
+        text = str(entry.get("text") or "")
+        if html and entry.get("kind") != "image":
+            mime.setHtml(html)
+        if text and (entry.get("kind") != "image" or not for_drag):
+            mime.setText(text)
+        return mime
+
+    def _set_system_clipboard_from_entry(self, entry):
+        if entry is None:
+            return False
+        try:
+            clipboard = QApplication.clipboard()
+            # Selecting from our own history must not immediately create a duplicate
+            # history entry via the clipboard's dataChanged signal.
+            self._clipboard_capture_suppression_until = time.monotonic()+0.8
+            if entry.get("kind") == "image" and entry.get("image") is not None:
+                clipboard.setImage(self._clipboard_full_image(entry))
+            else:
+                clipboard.setMimeData(self._clipboard_mime_for_entry(entry, for_drag=False))
+            return True
+        except Exception as exc:
+            self.status = f"Could not select clipboard item: {exc}"
+            return False
+
+    def _set_system_clipboard_for_drop(self, entry):
+        """Publish drag formats for rejected-drop fallback (image data plus a file URL)."""
+        if entry is None:
+            return False
+        try:
+            mime = self._clipboard_mime_for_entry(entry, for_drag=True)
+            self._clipboard_capture_suppression_until = time.monotonic()+0.8
+            QApplication.clipboard().setMimeData(mime)
+            return True
+        except Exception as exc:
+            self.status = f"Could not prepare clipboard drop: {exc}"
+            return False
+
+    def _clipboard_drag_pixmap(self, entry):
+        pixmap = QPixmap(250, 88)
+        pixmap.fill(Qt.transparent)
+        painter = QPainter(pixmap)
+        painter.setRenderHint(QPainter.Antialiasing, True)
+        painter.setPen(QPen(QColor(116, 231, 246, 235), 1.5))
+        painter.setBrush(QBrush(QColor(5, 26, 41, 238)))
+        painter.drawRoundedRect(QRectF(1, 1, 248, 86), 10, 10)
+        image = entry.get("image")
+        if image is not None and not image.isNull():
+            thumb = image.scaled(70, 70, Qt.KeepAspectRatio, Qt.SmoothTransformation)
+            painter.drawImage(QPointF(7+(70-thumb.width())/2, 9+(70-thumb.height())/2), thumb)
+            label = f"Image · {entry.get('image_width', image.width())} × {entry.get('image_height', image.height())}"
+        else:
+            label = str(entry.get("text") or "Copied item") or "Copied item"
+            label = QFontMetricsF(QFont("Sans", 9)).elidedText(label.replace("\n", " "), Qt.ElideRight, 155)
+        painter.setPen(QColor(234, 251, 255, 250))
+        painter.setFont(QFont("Sans", 9, QFont.DemiBold))
+        painter.drawText(QRectF(84, 8, 155, 72), Qt.AlignVCenter | Qt.AlignLeft | Qt.TextWordWrap, label)
+        painter.end()
+        return pixmap
+
+    def _run_floating_clipboard_native_drag(self, side, state_id):
+        """Run an OS-native MIME drag so drops work with folders and accepting app targets."""
+        state = self.floating_clipboard_drag_state.get(side)
+        if not state or state.get("id") != state_id or not state.get("running"):
+            return
+        entry = next((item for item in self.floating_clipboard_entries
+                      if item.get("id") == state.get("entry_id")), None)
+        if entry is None:
+            self.floating_clipboard_drag_state[side] = None
+            return
+        drag = None
+        result = Qt.IgnoreAction
+        target = None
+        start_global = self._virtual_point_to_global(state.get("start", QPointF()))
+        try:
+            self._set_os_pointer(state.get("last_cursor", state.get("start")))
+            if pyautogui is not None:
+                pyautogui.mouseDown(button="left", _pause=False)
+            drag = QDrag(self)
+            drag.setMimeData(self._clipboard_mime_for_entry(entry, for_drag=True))
+            drag.setPixmap(self._clipboard_drag_pixmap(entry))
+            drag.setHotSpot(QPoint(16, 16))
+            result = drag.exec(Qt.CopyAction | Qt.LinkAction, Qt.CopyAction)
+            try:
+                target = drag.target()
+            except Exception:
+                target = None
+        except Exception as exc:
+            self.status = f"Clipboard drag could not start: {exc}"
+        finally:
+            if pyautogui is not None:
+                try:
+                    pyautogui.mouseUp(button="left", _pause=False)
+                except Exception:
+                    pass
+            drop_global = QCursor.pos()
+            state_now = self.floating_clipboard_drag_state.get(side)
+            if state_now and state_now.get("id") == state_id:
+                self.floating_clipboard_drag_state[side] = None
+            self.floating_clipboard_drag_running = False
+            self.fist_mouse_down[side] = False
+            self.pinch_drag_active[side] = False
+            self.active_action[side] = None
+            self._reset_fist_gesture(side)
+            self._clear_menu_pinch_sequence(side)
+            if self.gesture_owner == side:
+                self.gesture_owner = None
+            self.action_stop_wait_open[side] = True
+            self.action_stop_open_since[side] = None
+            # Some native fields (for example a basic web text input) decline MIME drops.
+            # If a real target was under the drop point, fall back to normal clipboard paste.
+            if result == Qt.IgnoreAction and drop_global is not None:
+                moved_far = (start_global is None or math.hypot(drop_global.x()-start_global.x(),
+                                                                 drop_global.y()-start_global.y()) >= 24)
+                if moved_far and (target is not None or state.get("moved", False)):
+                    self._paste_floating_clipboard_entry_at(entry, drop_global)
+            elif result != Qt.IgnoreAction:
+                self.status = "Clipboard item dropped"
+            self.update()
+            overlay = getattr(self, "search_hand_overlay", None)
+            if overlay is not None:
+                overlay.update()
+
+    def _paste_floating_clipboard_entry_at(self, entry, global_pos):
+        """Focus the drop target and paste without blocking the GUI event loop.
+
+        Move the OS cursor to the Qt global point, then click its *current* position.
+        Passing Qt global coordinates into PyAutoGUI directly can click the wrong place
+        on Windows when display scaling or multiple monitors are involved.
+        """
+        if not self._set_system_clipboard_for_drop(entry) or pyautogui is None or global_pos is None:
+            return False
+        try:
+            QCursor.setPos(global_pos)
+            pyautogui.click(_pause=False)
+            keys = ("command", "v") if sys.platform == "darwin" else ("ctrl", "v")
+            # Allow the receiving window to process the click/focus change. Do not sleep
+            # on the GUI thread: clipboard drops happen while the camera/hand UI is live.
+            QTimer.singleShot(140, lambda paste_keys=keys: self._finish_floating_clipboard_paste(paste_keys))
+            self.status = "Pasting clipboard item at the drop point"
+            return True
+        except Exception as exc:
+            self.status = f"Clipboard paste fallback failed: {exc}"
+            return False
+
+    def _finish_floating_clipboard_paste(self, keys):
+        """Send the final paste shortcut from a non-blocking Qt timer callback."""
+        try:
+            if pyautogui is not None:
+                pyautogui.hotkey(*keys, interval=0.015, _pause=False)
+        except Exception as exc:
+            self.status = f"Clipboard paste fallback failed: {exc}"
+
+    def _set_system_clipboard_from_entry_id(self, entry_id):
+        entry = next((item for item in self.floating_clipboard_entries if item.get("id") == entry_id), None)
+        if entry is None:
+            return False
+        if self._set_system_clipboard_from_entry(entry):
+            label = "image" if entry.get("kind") == "image" else ("text" if entry.get("kind") == "text" else "copied item")
+            self.status = f"Selected clipboard {label}; move to a destination and paste"
+            return True
+        return False
+
     def _action_menu_item_names(self):
-        return ("right_click", "glass_menu", "dictation_toggle", "stt_toggle")
+        return ("right_click", "clipboard_toggle", "glass_menu", "dictation_toggle", "stt_toggle")
 
     def _action_menu_labels(self):
         search_dictation = bool(self.search_dialog is not None and self.search_dialog.isVisible()
                                 and self.search_dialog.dictation_enabled)
         dictation_on = self.focus_dictation_enabled or search_dictation
         return {
-            "right_click": "RIGHT-CLICK MENU" if not self.right_click_mode_enabled else "RIGHT-CLICK MENU  ·  ON",
+            # These two top-row controls are icon-only by design.
+            "right_click": "",
+            "clipboard_toggle": "",
             "glass_menu": ("GLASS MENU  ·  HIDE" if self.menu_open and self.hub_visible else "GLASS MENU  ·  SHOW"),
             "dictation_toggle": "DICTATE  ·  " + ("ON" if dictation_on else "OFF"),
             "stt_toggle": "STT  ·  " + ("ON" if self.speech.running else "OFF"),
@@ -2877,11 +3518,15 @@ class SpatialDesktop(QWidget):
         item_x = x+pad
         item_w = panel_w-2*pad
         top = y+pad+9.0*scale
+        half_w = (item_w-gap)/2
         items = {
-            "right_click": QRectF(item_x, top, item_w, item_h),
+            # Right-click and Clipboard share the top row; their width exactly matches
+            # the Dictate and STT buttons, preserving the existing compact menu rhythm.
+            "right_click": QRectF(item_x, top, half_w, item_h),
+            "clipboard_toggle": QRectF(item_x+half_w+gap, top, half_w, item_h),
             "glass_menu": QRectF(item_x, top+item_h+gap, item_w, item_h),
-            "dictation_toggle": QRectF(item_x, top+2*(item_h+gap), (item_w-gap)/2, item_h),
-            "stt_toggle": QRectF(item_x+(item_w+gap)/2, top+2*(item_h+gap), (item_w-gap)/2, item_h),
+            "dictation_toggle": QRectF(item_x, top+2*(item_h+gap), half_w, item_h),
+            "stt_toggle": QRectF(item_x+half_w+gap, top+2*(item_h+gap), half_w, item_h),
         }
         return panel, items
 
@@ -3521,6 +4166,8 @@ class SpatialDesktop(QWidget):
             self._toggle_focused_dictation_from_menu()
         elif action == "stt_toggle":
             self._toggle_stt_from_menu()
+        elif action == "clipboard_toggle":
+            self._set_floating_clipboard_visible(not self.floating_clipboard_visible)
         else:
             self.status = "Unknown Pinch Menu option"
 
@@ -3956,7 +4603,13 @@ class SpatialDesktop(QWidget):
         return self.mapToGlobal(pixel)
 
     def _set_os_pointer(self, point):
-        if point is None or self._gesture_ui_modal_open():
+        clipboard_interaction_active = any(
+            state is not None for state in getattr(self, "floating_clipboard_drag_state", {}).values()
+        )
+        # The floating clipboard is a glass UI, but once a hand has picked an entry up,
+        # it must be allowed to move the native pointer out of the glass panel and into
+        # another application even if the main Glass Menu remains visible behind it.
+        if point is None or (self._gesture_ui_modal_open() and not clipboard_interaction_active):
             return
         global_pos = self._virtual_point_to_global(point)
         if global_pos is None:
@@ -4833,6 +5486,7 @@ class SpatialDesktop(QWidget):
             image = QImage(raw, captured.width, captured.height, captured.width*4,
                            QImage.Format_RGBA8888).copy()
             QApplication.clipboard().setImage(image)
+            QTimer.singleShot(120, self._capture_system_clipboard)
         except Exception as exc:
             self.status = f"Could not capture image region: {exc}"
             return False
@@ -4850,6 +5504,7 @@ class SpatialDesktop(QWidget):
         if self.voice_selection_mode == "text":
             self._clear_voice_selection(release_mouse=True)
         if self._voice_hotkey("ctrl", "c"):
+            QTimer.singleShot(180, self._capture_system_clipboard)
             self.status = "Copy sent to the selected text or item. Say 'paste here' at the destination."
             self.tts.speak("Copied. Move to the destination and say paste here.")
             return True
@@ -4955,6 +5610,12 @@ class SpatialDesktop(QWidget):
     def execute_pc_voice_command(self, action):
         """Run a matched deterministic desktop command; no shell text is interpreted."""
         self._clear_heard_popup()
+        if action == "show_clipboard":
+            self._set_floating_clipboard_visible(True)
+            return True
+        if action == "hide_clipboard":
+            self._set_floating_clipboard_visible(False)
+            return True
         if action == "copy":
             self._copy_current_selection(); return True
         if action == "cut":
@@ -7362,6 +8023,53 @@ class SpatialDesktop(QWidget):
             selected, color = snapshot["selected"], QColor(snapshot["color"])
         return panel, items, selected, color, alpha
 
+    def _paint_right_click_icon(self, painter, rect, highlighted=False):
+        """Draw a clear mouse pictogram with its right button visibly pressed."""
+        painter.save()
+        cx, cy = rect.center().x(), rect.center().y()
+        height = min(34.0, rect.height()*0.64)
+        width = height*0.68
+        mouse = QRectF(cx-width/2, cy-height/2, width, height)
+        accent = QColor(150, 246, 255, 255) if highlighted else QColor(105, 220, 245, 245)
+        painter.setPen(QPen(QColor(222, 251, 255, 245), 1.8))
+        painter.setBrush(QBrush(QColor(14, 48, 65, 235)))
+        painter.drawRoundedRect(mouse, width*0.48, width*0.48)
+        # The highlighted top-right half is the pressed secondary button.
+        pressed = QRectF(cx+0.7, mouse.top()+1.7, width/2-1.7, height*0.34)
+        painter.setPen(Qt.NoPen)
+        painter.setBrush(QBrush(accent))
+        painter.drawRoundedRect(pressed, 3.0, 3.0)
+        painter.setPen(QPen(QColor(220, 250, 255, 230), 1.4))
+        painter.drawLine(QPointF(cx, mouse.top()+2), QPointF(cx, mouse.bottom()-4))
+        painter.drawLine(QPointF(mouse.left()+2, mouse.top()+height*0.36),
+                         QPointF(mouse.right()-2, mouse.top()+height*0.36))
+        # Short press marks reinforce that the right button is being activated.
+        painter.setPen(QPen(accent, 1.5, Qt.SolidLine, Qt.RoundCap))
+        painter.drawLine(QPointF(mouse.right()+3, cy-10), QPointF(mouse.right()+7, cy-13))
+        painter.drawLine(QPointF(mouse.right()+4, cy-4), QPointF(mouse.right()+9, cy-5))
+        painter.restore()
+
+    def _paint_clipboard_icon(self, painter, rect, highlighted=False):
+        """Draw a compact clipboard pictogram for the floating-history toggle."""
+        painter.save()
+        cx, cy = rect.center().x(), rect.center().y()
+        height = min(34.0, rect.height()*0.64)
+        width = height*0.72
+        body = QRectF(cx-width/2, cy-height/2+2, width, height-2)
+        accent = QColor(135, 249, 207, 255) if highlighted else QColor(112, 228, 242, 245)
+        painter.setPen(QPen(QColor(224, 253, 255, 245), 1.8))
+        painter.setBrush(QBrush(QColor(13, 48, 64, 235)))
+        painter.drawRoundedRect(body, 4.0, 4.0)
+        clip = QRectF(cx-width*0.24, body.top()-3, width*0.48, 7)
+        painter.setPen(QPen(accent, 1.6))
+        painter.setBrush(QBrush(QColor(20, 73, 88, 255)))
+        painter.drawRoundedRect(clip, 2.5, 2.5)
+        painter.setPen(QPen(accent, 1.8, Qt.SolidLine, Qt.RoundCap))
+        for row in range(3):
+            yy = body.top()+height*(0.37+row*0.19)
+            painter.drawLine(QPointF(body.left()+5, yy), QPointF(body.right()-5, yy))
+        painter.restore()
+
     def _paint_pinch_menu(self, painter, side, now=None):
         state = self._pinch_menu_visual_state(side, now)
         if state is None:
@@ -7392,8 +8100,13 @@ class SpatialDesktop(QWidget):
             painter.drawRoundedRect(rect, 9*scale, 9*scale)
             painter.setPen(QColor(248, 253, 255))
             label_text = labels.get(name, name.replace("_", " ").upper())
-            self._draw_fitted_button_label(painter, rect, label_text,
-                                           base_size=max(9, int(12*scale)), min_size=7, inset=7*scale)
+            if name == "right_click":
+                self._paint_right_click_icon(painter, rect, hovered)
+            elif name == "clipboard_toggle":
+                self._paint_clipboard_icon(painter, rect, hovered or self.floating_clipboard_visible)
+            else:
+                self._draw_fitted_button_label(painter, rect, label_text,
+                                               base_size=max(9, int(12*scale)), min_size=7, inset=7*scale)
         painter.restore()
 
     def _paint_gesture_timer_fade(self, painter, side, now=None):
@@ -8605,8 +9318,11 @@ class SpatialDesktop(QWidget):
             # outside the visible panel may still be tracked/rendered, but its pose
             # cannot start a pinch timer, drag, scroll, or click through to an app.
             search_surface_active = (self.search_dialog is not None and self.search_dialog.isVisible())
+            clipboard_drag_in_progress = self.floating_clipboard_drag_state.get(side) is not None
             if (self.menu_open and self.hub_visible and not search_surface_active and
-                    not self._canvas_menu_panel_contains(cursor)):
+                    not self._canvas_menu_panel_contains(cursor) and
+                    not self._floating_clipboard_contains(cursor) and
+                    not clipboard_drag_in_progress):
                 self._clear_menu_pinch_sequence(side)
                 self._reset_fist_gesture(side)
                 self.active_action[side] = None
@@ -8774,11 +9490,34 @@ class SpatialDesktop(QWidget):
             timeout = self.tracking_loss_grace_seconds if self._needs_tracking_loss_grace(side) else 0.16
             if missing_for <= timeout:
                 continue
+            clipboard_was_active = self.floating_clipboard_drag_state.get(side) is not None
+            if clipboard_was_active:
+                clipboard_state = self.floating_clipboard_drag_state.get(side) or {}
+                # If tracking drops during a non-modal text/image drag, treat it as a
+                # release at the last OS cursor point rather than silently discarding it.
+                # The preview follows the hand and the destination receives clipboard paste
+                # without entering Qt's blocking native drag loop.
+                if (clipboard_state.get("running") and
+                        clipboard_state.get("mode") in ("text_paste", "image_paste") and
+                        clipboard_state.get("moved")):
+                    entry_id = clipboard_state.get("entry_id")
+                    entry_obj = next((item for item in self.floating_clipboard_entries
+                                      if item.get("id") == entry_id), None)
+                    drop_global = QCursor.pos()
+                    if entry_obj is not None:
+                        QTimer.singleShot(0, lambda item=entry_obj, pos=drop_global:
+                                          self._paste_floating_clipboard_entry_at(item, pos))
+                elif clipboard_state.get("running") and pyautogui is not None:
+                    try:
+                        pyautogui.mouseUp(button="left", _pause=False)
+                    except Exception:
+                        pass
+                self.floating_clipboard_drag_state[side] = None
             was_active = (self.fist_started_at[side] is not None or
                           self.menu_pinch_started[side] is not None or
                           self.pinch_drag_active[side] or
                           self.active_action[side] is not None or
-                          self.fist_action_menu_open[side])
+                          self.fist_action_menu_open[side] or clipboard_was_active)
             self._end_pinch_drag(side, status=False)
             if self.fist_started_at[side] is not None:
                 self._reset_fist_gesture(side)
@@ -8847,6 +9586,195 @@ class SpatialDesktop(QWidget):
                 # Once a fist gesture has begun, a non-open pinch classification is noise;
                 # keep the fist action in control until the user clearly opens the hand.
                 is_fist, is_pinch = True, False
+
+            # Floating clipboard cards take gesture ownership before ordinary pinch/fist
+            # clicks. Moving a held gesture out of a card starts a real OS MIME drag; a
+            # short hold/release simply loads that item into the system clipboard.
+            clipboard_state = self.floating_clipboard_drag_state.get(side)
+            if clipboard_state is not None:
+                clipboard_state["last_cursor"] = QPointF(cursor)
+                held_for_clipboard = bool(is_fist or is_pinch)
+                if held_for_clipboard:
+                    clipboard_state["last_held_at"] = now
+                    clipboard_state["release_candidate_since"] = None
+                elif clipboard_state.get("release_candidate_since") is None:
+                    clipboard_state["release_candidate_since"] = now
+                movement = math.hypot(cursor.x()-clipboard_state["start"].x(),
+                                      cursor.y()-clipboard_state["start"].y())
+                clipboard_state["moved"] = movement >= 18.0
+                if (clipboard_state.get("type") == "control" and
+                        clipboard_state.get("control") == "header"):
+                    if held_for_clipboard:
+                        if movement >= 6.0:
+                            panel_layout = self._floating_clipboard_layout()
+                            panel_start = clipboard_state.get("panel_start")
+                            if panel_layout is not None and panel_start is not None:
+                                panel_rect = panel_layout["panel"]
+                                new_x = panel_start.x()+cursor.x()-clipboard_state["start"].x()
+                                new_y = panel_start.y()+cursor.y()-clipboard_state["start"].y()
+                                new_x = max(4.0, min(new_x, max(4.0, self.width()-panel_rect.width()-4.0)))
+                                new_y = max(4.0, min(new_y, max(4.0, self.height()-panel_rect.height()-4.0)))
+                                self.floating_clipboard_position = QPointF(new_x, new_y)
+                                self.floating_clipboard_drag_state[side]["moved"] = True
+                                self.update()
+                                overlay = getattr(self, "search_hand_overlay", None)
+                                if overlay is not None:
+                                    overlay.update()
+                        continue
+                    # Releasing on the header ends a possible panel move; there is no click action.
+                    if (clipboard_state.get("release_candidate_since") is not None and
+                            now-clipboard_state["release_candidate_since"] >= 0.14):
+                        self.floating_clipboard_drag_state[side] = None
+                        self._clear_menu_pinch_sequence(side)
+                        self._reset_fist_gesture(side)
+                        if self.gesture_owner == side:
+                            self.gesture_owner = None
+                        self.action_stop_wait_open[side] = True
+                        self.action_stop_open_since[side] = None
+                    continue
+                if clipboard_state.get("running"):
+                    # Plain text and copied bitmap items use a non-modal cursor-follow
+                    # + click/paste path. QDrag.exec enters a platform-native nested drag
+                    # loop, which can starve camera/gesture updates on some Windows/Qt
+                    # combinations and can prevent the preview from following the hand.
+                    if clipboard_state.get("mode") in ("text_paste", "image_paste"):
+                        self._set_os_pointer(cursor)
+                        release_since = clipboard_state.get("release_candidate_since")
+                        should_finish = (not held_for_clipboard and (
+                            (release_since is not None and now-release_since >= 0.14) or
+                            now-clipboard_state.get("last_held_at", now) > 0.65))
+                        if should_finish:
+                            entry_id = clipboard_state.get("entry_id")
+                            entry_obj = next((item for item in self.floating_clipboard_entries
+                                              if item.get("id") == entry_id), None)
+                            self.floating_clipboard_drag_state[side] = None
+                            self.floating_clipboard_drag_running = False
+                            self.fist_mouse_down[side] = False
+                            self.pinch_drag_active[side] = False
+                            self.active_action[side] = None
+                            self._reset_fist_gesture(side)
+                            self._clear_menu_pinch_sequence(side)
+                            if self.gesture_owner == side:
+                                self.gesture_owner = None
+                            self.action_stop_wait_open[side] = True
+                            self.action_stop_open_since[side] = None
+                            # _set_os_pointer(cursor) has already put the native pointer
+                            # at this hand position. Use Qt's authoritative current global
+                            # point for the drop instead of recomputing from the overlay's
+                            # potentially work-area-offset origin.
+                            drop_global = QCursor.pos()
+                            if entry_obj is not None and clipboard_state.get("moved"):
+                                QTimer.singleShot(0, lambda item=entry_obj, pos=drop_global:
+                                                   self._paste_floating_clipboard_entry_at(item, pos))
+                            elif entry_obj is not None:
+                                self._set_system_clipboard_from_entry_id(entry_id)
+                            self.update()
+                            overlay = getattr(self, "search_hand_overlay", None)
+                            if overlay is not None:
+                                overlay.update()
+                        continue
+                    # Native file/image/link drags release their OS mouse grab when the
+                    # hand opens. This path deliberately does not handle plain text.
+                    if ((is_open and not held_for_clipboard) or
+                            (not held_for_clipboard and now-clipboard_state.get("last_held_at", now) > 1.0)):
+                        if not clipboard_state.get("release_sent") and pyautogui is not None:
+                            try:
+                                pyautogui.mouseUp(button="left", _pause=False)
+                            except Exception:
+                                pass
+                            clipboard_state["release_sent"] = True
+                    continue
+                if (held_for_clipboard and clipboard_state.get("type") == "entry" and
+                        clipboard_state.get("can_drag") and movement >= 22.0 and
+                        now-clipboard_state.get("started_at", now) >= 0.08):
+                    entry_id = clipboard_state.get("entry_id")
+                    entry_obj = next((item for item in self.floating_clipboard_entries
+                                      if item.get("id") == entry_id), None)
+                    if entry_obj is not None and entry_obj.get("kind") in ("text", "image"):
+                        # Track text and copied bitmaps without starting Qt's blocking
+                        # native drag loop. The image remains available as image data and
+                        # as its cached PNG file URL in the system clipboard, so Ctrl+V can
+                        # paste it into image-aware targets or copy the PNG into folders.
+                        clipboard_state["running"] = True
+                        clipboard_state["mode"] = (
+                            "text_paste" if entry_obj.get("kind") == "text" else "image_paste")
+                        self.floating_clipboard_drag_running = True
+                        self.status = ("Dragging clipboard text — release over a text field to paste"
+                                       if entry_obj.get("kind") == "text" else
+                                       "Dragging clipboard image — release over an image target or folder to paste")
+                        continue
+                    clipboard_state["running"] = True
+                    clipboard_state["mode"] = "native"
+                    self.floating_clipboard_drag_running = True
+                    drag_id = clipboard_state["id"]
+                    QTimer.singleShot(0, lambda captured_side=side, captured_id=drag_id:
+                                       self._run_floating_clipboard_native_drag(captured_side, captured_id))
+                    continue
+                if is_open and not held_for_clipboard:
+                    if clipboard_state.get("type") == "entry":
+                        entry_id = clipboard_state.get("entry_id")
+                        entry_obj = next((item for item in self.floating_clipboard_entries
+                                          if item.get("id") == entry_id), None)
+                        if entry_obj is not None:
+                            self._set_system_clipboard_from_entry_id(entry_id)
+                            if clipboard_state.get("moved") and not clipboard_state.get("can_drag"):
+                                self.status = "Clipboard item selected; attach this hand to drag it into desktop apps"
+                    else:
+                        control = clipboard_state.get("control")
+                        if control == "close":
+                            self._set_floating_clipboard_visible(False)
+                        elif control == "delete":
+                            self._delete_floating_clipboard_entry(clipboard_state.get("entry_id"))
+                        elif control == "older":
+                            self.floating_clipboard_scroll_offset = min(
+                                max(0, len(self.floating_clipboard_entries)-1),
+                                self.floating_clipboard_scroll_offset+5)
+                        elif control == "newer":
+                            self.floating_clipboard_scroll_offset = max(0, self.floating_clipboard_scroll_offset-5)
+                        self.update()
+                    self.floating_clipboard_drag_state[side] = None
+                    self._clear_menu_pinch_sequence(side)
+                    self._reset_fist_gesture(side)
+                    if self.gesture_owner == side:
+                        self.gesture_owner = None
+                    self.action_stop_wait_open[side] = True
+                    self.action_stop_open_since[side] = None
+                    continue
+                if not held_for_clipboard and now-clipboard_state.get("last_held_at", now) > 0.65:
+                    self.floating_clipboard_drag_state[side] = None
+                    if self.gesture_owner == side:
+                        self.gesture_owner = None
+                else:
+                    continue
+            elif (self.floating_clipboard_visible and (is_fist or is_pinch) and
+                  self.active_action.get(side) is None and not self.pinch_drag_active.get(side, False) and
+                  not self.fist_action_menu_open.get(side, False) and
+                  not self.action_stop_wait_open.get(side, False) and
+                  self.fist_started_at.get(side) is None and self.menu_pinch_started.get(side) is None and
+                  not self.left_click_modifier_active and self.gesture_owner in (None, side)):
+                hit = self._floating_clipboard_hit_test(cursor)
+                if hit is not None:
+                    can_drag = bool(self.desktop_mode == "os" and pyautogui is not None and
+                                    not self.mouse_detached_by_side.get(side, False))
+                    selected_entry = hit.get("entry")
+                    preview_pixmap = self._clipboard_drag_pixmap(selected_entry) if selected_entry is not None else None
+                    panel_layout = self._floating_clipboard_layout() if (
+                        hit.get("type") == "control" and hit.get("name") == "header") else None
+                    panel_start = QPointF(panel_layout["panel"].topLeft()) if panel_layout is not None else None
+                    state = {"id": uuid.uuid4().hex, "type": hit["type"],
+                             "entry_id": (selected_entry.get("id") if selected_entry is not None
+                                          else hit.get("entry_id")),
+                             "control": hit.get("name"), "start": QPointF(cursor),
+                             "panel_start": panel_start,
+                             "last_cursor": QPointF(cursor), "started_at": now,
+                             "last_held_at": now, "release_candidate_since": None,
+                             "preview_pixmap": preview_pixmap, "running": False, "moved": False,
+                             "can_drag": can_drag, "release_sent": False}
+                    self.floating_clipboard_drag_state[side] = state
+                    self.gesture_owner = side
+                    self.canvas_active_side = side
+                    self.active_push_sides.add(side)
+                    continue
 
             # A moving held pinch is a native click-and-hold drag. Consume every frame
             # until release, so the same gesture cannot also fire a quick click or menu.
@@ -10583,6 +11511,7 @@ class SpatialDesktop(QWidget):
             for side in ("left", "right"):
                 self._paint_gesture_timer_fade(painter, side, now)
                 self._paint_pinch_menu(painter, side, now)
+            self._paint_floating_clipboard(painter, now)
             self._paint_middle_pinch_zoom_timer(painter, now)
 
             # Reticle and skeleton use the fixed hand-relative (optionally calibrated) TLI anchor.
