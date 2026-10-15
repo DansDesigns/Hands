@@ -9804,6 +9804,14 @@ try {
                     self.status = f"{side.title()} hand gesture tracking {state}"
                     self.hand_tracking_notice_text = f"{side.title()} hand gestures {state}"
                     self.hand_tracking_notice_until = now + 5.0
+                    # Confirm thumbs-up toggles aloud. If both hands toggle into the same
+                    # state in one brief interval, avoid speaking the identical phrase twice.
+                    spoken_state = "on" if self.gesture_tracking_enabled[side] else "off"
+                    last_toggle_tts = getattr(self, "_last_thumb_toggle_tts", None)
+                    if not (last_toggle_tts and last_toggle_tts[0] == spoken_state and
+                            now-last_toggle_tts[1] < 0.8):
+                        self.tts.speak(f"Freehand gestures {spoken_state}.")
+                        self._last_thumb_toggle_tts = (spoken_state, now)
                     # Clear only this hand's pending gestures/actions. Never interrupt the
                     # other hand, which remains fully usable throughout the toggle.
                     self.peace_hold_started[side] = None
