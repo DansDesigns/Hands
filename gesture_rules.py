@@ -293,6 +293,105 @@ def thumb_pinches_index(thumb_to_fingertip_distances):
     return d[0] < min(d[1:4])
 
 
+def thumb_middle_pinch_pose(*, normalized_middle_gap, normalized_index_gap,
+                            finger_straightness, edge_tolerant=False):
+    """Recognise thumb-to-middle fingertip contact, distinct from the menu pinch.
+
+    The middle tip must be close to the thumb relative to palm length and clearly
+    closer than the index tip. At least two of index/ring/little should remain
+    extended, so a curled fist or an ordinary thumb-index pinch does not qualify.
+    ``finger_straightness`` is ordered index, middle, ring, little.
+    """
+    try:
+        middle_gap = float(normalized_middle_gap)
+        index_gap = float(normalized_index_gap)
+        straight = [float(value) for value in finger_straightness]
+    except (TypeError, ValueError):
+        return False
+    if (len(straight) < 4 or not all(math.isfinite(v) for v in (middle_gap, index_gap, *straight[:4]))):
+        return False
+    max_gap = 0.57 if edge_tolerant else 0.50
+    if middle_gap > max_gap or middle_gap >= index_gap * 0.90:
+        return False
+    extended_threshold = 0.64 if edge_tolerant else 0.68
+    return sum(straight[i] >= extended_threshold for i in (0, 2, 3)) >= 2
+
+
+def opposite_diagonal_corner_assignment(rect, left_point, right_point,
+                                        tolerance_ratio=0.14,
+                                        min_tolerance=28.0, max_tolerance=82.0):
+    """Return per-hand opposite-corner labels when both points pin a window's diagonal.
+
+    ``rect`` is (left, top, right, bottom); points are global (x, y). Coordinates
+    must be near actual corners, rather than merely near any point on the border.
+    """
+    try:
+        left, top, right, bottom = (float(v) for v in rect)
+        points = {"left": (float(left_point[0]), float(left_point[1])),
+                  "right": (float(right_point[0]), float(right_point[1]))}
+    except (TypeError, ValueError, IndexError):
+        return None
+    width, height = right-left, bottom-top
+    if width <= 0 or height <= 0:
+        return None
+    tol_x = min(float(max_tolerance), max(float(min_tolerance), width*float(tolerance_ratio)))
+    tol_y = min(float(max_tolerance), max(float(min_tolerance), height*float(tolerance_ratio)))
+    corners = {"tl": (left, top), "tr": (right, top),
+               "bl": (left, bottom), "br": (right, bottom)}
+    nearest = {}
+    for side, (x, y) in points.items():
+        ranked = sorted(((math.hypot((x-cx)/tol_x, (y-cy)/tol_y), name, cx, cy)
+                         for name, (cx, cy) in corners.items()), key=lambda row: row[0])
+        distance, name, cx, cy = ranked[0]
+        if distance > math.sqrt(2.0) or abs(x-cx) > tol_x or abs(y-cy) > tol_y:
+            return None
+        nearest[side] = name
+    opposite = {("tl", "br"), ("br", "tl"), ("tr", "bl"), ("bl", "tr")}
+    if (nearest["left"], nearest["right"]) not in opposite:
+        return None
+    return nearest
+
+
+def resize_rect_from_corner_deltas(rect, start_points, current_points, corners,
+                                   min_width=260.0, min_height=160.0):
+    """Calculate a native-window rect by dragging its two pinned diagonal corners."""
+    try:
+        left, top, right, bottom = (float(v) for v in rect)
+        new_edges = {"l": left, "t": top, "r": right, "b": bottom}
+        for side in ("left", "right"):
+            sx, sy = (float(v) for v in start_points[side])
+            cx, cy = (float(v) for v in current_points[side])
+            dx, dy = cx-sx, cy-sy
+            corner = corners[side]
+            if corner not in ("tl", "tr", "bl", "br"):
+                return None
+            # Normal corner names are two characters (tl/tr/bl/br), with axis order
+            # y then x; apply each hand's movement to the two edges it controls.
+            if corner[1] == "l":
+                new_edges["l"] = left + dx
+            else:
+                new_edges["r"] = right + dx
+            if corner[0] == "t":
+                new_edges["t"] = top + dy
+            else:
+                new_edges["b"] = bottom + dy
+        # If a moved edge reaches the opposite edge, preserve the opposite edge and
+        # clamp the moved one, so the window never collapses or reverses its geometry.
+        if new_edges["r"]-new_edges["l"] < float(min_width):
+            if new_edges["l"] != left:
+                new_edges["l"] = new_edges["r"]-float(min_width)
+            else:
+                new_edges["r"] = new_edges["l"]+float(min_width)
+        if new_edges["b"]-new_edges["t"] < float(min_height):
+            if new_edges["t"] != top:
+                new_edges["t"] = new_edges["b"]-float(min_height)
+            else:
+                new_edges["b"] = new_edges["t"]+float(min_height)
+        return (new_edges["l"], new_edges["t"], new_edges["r"], new_edges["b"])
+    except (KeyError, TypeError, ValueError, IndexError):
+        return None
+
+
 def should_recognize_menu_pinch(*, normalized_gap, finger_straightness, edge_tolerant=False):
     """Recognise a natural thumb/index pinch even if the index bends slightly.
 
@@ -560,6 +659,36 @@ def thumb_across_palm(landmarks):
     offset = tuple(p - q for p, q in zip(tip, index_mcp))
     value = sum(o*a for o, a in zip(offset, across)) / (width*width)
     return value if math.isfinite(value) else None
+
+
+def thumb_axis_is_vertical_up(landmarks, max_angle_degrees=25.0, min_rise_pixels=8.0):
+    """Require the thumb base-to-tip axis to point nearly straight up in the image.
+
+    MediaPipe x/y are normalized independently, so convert to the camera's 640x360
+    reference pixels before judging angle. This deliberately rejects diagonal thumbs
+    that previously slipped through the thumbs-up timer detector.
+    """
+    try:
+        if landmarks is None or len(landmarks) < 5:
+            return False
+
+        def xy(index):
+            point = landmarks[index]
+            if isinstance(point, (tuple, list)):
+                return float(point[0]), float(point[1])
+            return float(point.x), float(point.y)
+
+        base_x, base_y = xy(2)
+        tip_x, tip_y = xy(4)
+        dx = (tip_x - base_x) * 640.0
+        dy = (tip_y - base_y) * 360.0
+        angle_limit = math.tan(math.radians(max(1.0, min(89.0, float(max_angle_degrees)))))
+        rise = -dy
+        return (math.isfinite(dx) and math.isfinite(dy) and
+                rise >= max(0.0, float(min_rise_pixels)) and
+                abs(dx) <= rise * angle_limit)
+    except (TypeError, ValueError, IndexError, AttributeError):
+        return False
 
 
 def thumb_sticking_out(landmarks, threshold=THUMB_OUT_ACROSS_PALM):

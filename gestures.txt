@@ -20,9 +20,11 @@
 #
 # TIMED PINCH / PINCH MENU
 # DO NOT REMOVE: the fixed 0.8-second continuous pinch-confirmation buffer is separate from release cooldown.
-# Pinch Menu and peace-sign gestures show a ring and numeric countdown. Right-fist scrolling has no circle timer. A timed pinch must stay held through the 0.8-second confirmation buffer.
+# Pinch Menu, two-hand thumb-middle pinch zoom, and peace-sign gestures show a ring and numeric countdown. Right-fist scrolling has no circle timer. A timed pinch must stay held through the 0.8-second confirmation buffer.
 # PINCH MENU / EXIT MODE: the circle stays empty during a continuous 0.8-second pinch confirmation. Releasing before that expires cancels the sequence, so quick/double pinches cannot accumulate. After confirmation, the circle fills only while the pinch is held; release gaps never advance it.
 # The Pinch Menu has RIGHT-CLICK MENU, GLASS MENU, DICTATE, and STT; DICTATE and STT sit side by side. Scrolling is a grip gesture, not a menu option. Pinch recognition tolerates more landmark jitter while still requiring two extended non-index fingers.
+# TWO-HAND PINCH ZOOM: pinch thumb to middle fingertip with both hands and hold through pinch_buffer_seconds; move hands apart/together to zoom application content using Ctrl/Command+wheel.
+# WINDOW RESIZE: start the same gesture with both TLIs near opposite diagonal corners of one app window, then move the pinched hands to drag those corners. Linux resizing uses X11/wmctrl and floats tiled Qtile clients first.
 # Release the opening pinch, then use a fresh grab or pinch over an option to select it.
 # Once selection-ready, a fresh pinch or grip with the TLI OUTSIDE the popup closes the popup.
 # That outside gesture is consumed; it will not click, drag, or start another timer.

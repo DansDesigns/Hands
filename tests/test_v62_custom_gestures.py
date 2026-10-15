@@ -3,6 +3,8 @@ import tempfile
 import unittest
 from pathlib import Path
 
+from gesture_rules import thumb_axis_is_vertical_up
+
 from custom_gestures import (
     FINGERS, HoldTrigger, best_pose_match, builtin_conflict, describe, feature_distance,
     hand_features, load_custom_gestures, mean_features, save_custom_gestures, tli_overlap,
@@ -167,6 +169,20 @@ def make_thumb_pose(direction):
 
 
 class ThumbAndFistTests(unittest.TestCase):
+    def test_tracking_toggle_requires_thumb_axis_to_be_vertical_up(self):
+        up = make_thumb_pose("up")
+        self.assertTrue(thumb_axis_is_vertical_up(up))
+
+        # Tilt the thumb base-to-tip axis 40 degrees away from vertical while
+        # keeping the four fingers unchanged; this is not a strict thumbs-up.
+        tilted = [tuple(point) for point in up]
+        base_x, base_y = tilted[2][0], tilted[2][1]
+        tip_x, tip_y = tilted[4][0], tilted[4][1]
+        rise_px = (base_y-tip_y) * 360.0
+        tilted[4] = (base_x + (rise_px * math.tan(math.radians(40.0))) / 640.0,
+                     tip_y, tilted[4][2])
+        self.assertFalse(thumb_axis_is_vertical_up(tilted))
+
     def test_thumb_out_is_detected_and_tucked_thumb_is_not(self):
         from gesture_rules import thumb_sticking_out, thumb_across_palm
         tucked = make_hand(set(), False)
@@ -183,6 +199,8 @@ class ThumbAndFistTests(unittest.TestCase):
         self.assertIn("return fingers_closed and not thumb_sticking_out(landmarks, threshold=-0.55)", main)
 
     def test_thumbs_up_and_down_are_labelled_and_distinguished(self):
+        main = (Path(__file__).resolve().parents[1] / "main.py").read_text(encoding="utf-8")
+        self.assertIn("thumb_axis_is_vertical_up(landmarks, max_angle_degrees=25.0)", main)
         up = hand_features(make_thumb_pose("up"))
         down = hand_features(make_thumb_pose("down"))
         self.assertEqual(describe(up), "THUMBS UP")

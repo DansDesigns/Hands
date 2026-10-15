@@ -53,6 +53,10 @@ from gesture_rules import (
     ease_toward,
     pinch_drag_should_start,
     thumb_sticking_out,
+    thumb_axis_is_vertical_up,
+    thumb_middle_pinch_pose,
+    opposite_diagonal_corner_assignment,
+    resize_rect_from_corner_deltas,
 )
 from voice_services import Speech, KokoroTTS
 from hand_occlusion import TuckSmoother
@@ -267,8 +271,10 @@ def save_gesture_settings(values: dict) -> None:
         "# DOUBLE-CLICK: two quick thumb/index pinches near the same point are snapped to one target for a native double-click.",
         "# PINCH MENU: hold thumb/index pinch continuously for pinch_buffer_seconds (default 0.8s); then the circle fills for the hold timer.",
         "# PINCH MENU: while open, a fresh pinch/grab outside the popup closes it without clicking through.",
+        "# TWO-HAND PINCH ZOOM: pinch thumb to middle fingertip with BOTH hands and hold through pinch_buffer_seconds; move hands apart/together to zoom app content with Ctrl/Command+wheel.",
+        "# WINDOW RESIZE: begin the same two-hand pinch with TLIs at opposite diagonal corners of one application window; keep pinching and move the corners to resize it.",
         "# FIST MOVEMENT: a moving RIGHT-only fist starts smooth vertical page scrolling without a fist timer; left fist remains the modifier, and two-fist window drag remains available.",
-        "# TIMERS: only Pinch Menu and peace-sign gestures show countdowns. Right-fist scrolling starts on deliberate vertical movement and has no circle timer.",
+        "# TIMERS: Pinch Menu, two-hand thumb-middle pinch zoom, and peace-sign gestures show countdowns. Right-fist scrolling has no circle timer.",
         "# A release before 0.8s cancels that timer sequence. Quick/double pinches start a fresh buffer; after confirmation only held-pinch time counts.",
         "# A fist/grip has priority over pinch recognition; a fist alone cannot start the Pinch Menu timer.",
         "# PEACE SIGN: hold an index+middle V-sign for 1.5 seconds to detach/reattach that hand from native OS mouse movement; glass and Pinch Menu gestures and live TLI tracking remain active.",
@@ -572,6 +578,21 @@ def is_thumb_index_menu_pinch(landmarks, edge_tolerant=False):
     return should_recognize_menu_pinch(normalized_gap=pinch_gap,
                                        finger_straightness=straight,
                                        edge_tolerant=edge_tolerant)
+
+
+def is_thumb_middle_zoom_pinch(landmarks, edge_tolerant=False):
+    """True for a thumb-to-middle fingertip pinch, distinct from the Pinch Menu."""
+    if landmarks is None or len(landmarks) < 21:
+        return False
+    palm = max(1e-5, distance3d(landmarks, 0, 9))
+    middle_gap = distance3d(landmarks, 4, 12) / palm
+    index_gap = distance3d(landmarks, 4, 8) / palm
+    return thumb_middle_pinch_pose(
+        normalized_middle_gap=middle_gap,
+        normalized_index_gap=index_gap,
+        finger_straightness=_finger_straightness_values(landmarks),
+        edge_tolerant=edge_tolerant,
+    )
 
 
 class Tracker:
@@ -1068,6 +1089,7 @@ class SearchHandOverlay(QWidget):
         for side in ("right", "left"):
             owner._paint_gesture_timer_fade(painter, side, now)
             owner._paint_pinch_menu(painter, side, now)
+        owner._paint_middle_pinch_zoom_timer(painter, now)
         # This overlay is the sole hand-visual owner while Search is visible; the main
         # window skips the identical layer to avoid double-painted ghost silhouettes.
         for side in ("left", "right"):
@@ -1878,6 +1900,14 @@ class SpatialDesktop(QWidget):
         # Pinch Menu confirmation buffer before the circle timer starts; adjustable in
         # Settings -> Interaction (PINCH BUFFER). Fist holds keep the fixed buffer above.
         self.pinch_buffer_seconds = float(settings.get("pinch_buffer_seconds", 0.8))
+        # Two-hand thumb-to-middle pinch zoom. The existing Pinch Menu buffer is reused;
+        # once the hold is confirmed, hand separation drives content zoom or corner resize.
+        self.middle_pinch_zoom = {
+            "started_at": None, "last_both_seen_at": None, "active": False,
+            "mode": None, "hwnd": None, "rect": None, "corners": None,
+            "start_points": None, "last_distance": None, "zoom_remainder": 0.0,
+            "last_resize_rect": None, "last_resize_at": 0.0,
+        }
         self.fist_quick_click_max_seconds = 0.65
         self.fist_started_at = {side: None for side in sides}
         self.fist_release_candidate_since = {side: None for side in sides}
@@ -3031,6 +3061,33 @@ class SpatialDesktop(QWidget):
                                             int(round(top)), 0, 0, flags))
         except Exception as exc:
             self.status = f"Window move failed: {exc}"
+            return False
+
+    def _resize_native_window(self, hwnd, left, top, width, height):
+        """Resize a native top-level application window without taking keyboard focus."""
+        if not hwnd:
+            return False
+        left, top = int(round(left)), int(round(top))
+        width, height = max(260, int(round(width))), max(160, int(round(height)))
+        if sys.platform.startswith("linux"):
+            try:
+                subprocess.run(["wmctrl", "-ir", hex(int(hwnd)), "-e",
+                                f"0,{left},{top},{width},{height}"],
+                               check=True, timeout=0.35, stdout=subprocess.DEVNULL,
+                               stderr=subprocess.DEVNULL)
+                return True
+            except Exception as exc:
+                self.status = f"Linux window resize failed (X11/wmctrl required): {exc}"
+                return False
+        if not sys.platform.startswith("win"):
+            return False
+        try:
+            user32 = ctypes.windll.user32
+            flags = 0x0004 | 0x0010 | 0x4000  # NOZORDER | NOACTIVATE | ASYNCWINDOWPOS
+            return bool(user32.SetWindowPos(wintypes.HWND(int(hwnd)), None,
+                                            left, top, width, height, flags))
+        except Exception as exc:
+            self.status = f"Window resize failed: {exc}"
             return False
 
     def _is_native_taskbar_point(self, point):
@@ -7452,7 +7509,10 @@ class SpatialDesktop(QWidget):
                                  for tip, pip in ((8, 6), (12, 10), (16, 14), (20, 18)))
             thumb_extended = math.hypot(float(landmarks[4].x)-float(landmarks[2].x),
                                         float(landmarks[4].y)-float(landmarks[2].y)) > 0.08
-            return thumb_up and fingers_folded and thumb_extended
+            # A true tracking-toggle thumbs-up must point nearly vertically upward,
+            # not diagonally out to the side. Use aspect-corrected camera pixels.
+            thumb_vertical = thumb_axis_is_vertical_up(landmarks, max_angle_degrees=25.0)
+            return thumb_up and fingers_folded and thumb_extended and thumb_vertical
         except (IndexError, AttributeError, TypeError, ValueError):
             return False
 
@@ -7982,6 +8042,264 @@ class SpatialDesktop(QWidget):
         if timer is not None and timer.interval() != desired_ms:
             timer.setInterval(desired_ms)
 
+    def _reset_middle_pinch_zoom(self):
+        """Clear a pending or active two-hand pinch zoom session."""
+        state = getattr(self, "middle_pinch_zoom", None)
+        if state is None:
+            return
+        state.update({
+            "started_at": None, "last_both_seen_at": None, "active": False,
+            "mode": None, "hwnd": None, "rect": None, "corners": None,
+            "start_points": None, "last_distance": None, "zoom_remainder": 0.0,
+            "last_resize_rect": None, "last_resize_at": 0.0,
+        })
+
+    def _begin_middle_pinch_zoom(self, cursor_points, now):
+        """Arm resize on opposite window corners, otherwise use Ctrl+wheel content zoom."""
+        state = self.middle_pinch_zoom
+        points = {side: self._virtual_point_to_global(cursor_points[side])
+                  for side in ("left", "right")}
+        if any(point is None for point in points.values()):
+            return False
+        point_tuples = {side: (float(point.x()), float(point.y())) for side, point in points.items()}
+        midpoint = QPointF((cursor_points["left"].x()+cursor_points["right"].x())*0.5,
+                           (cursor_points["left"].y()+cursor_points["right"].y())*0.5)
+        left_hwnd = self._find_native_window_at(cursor_points["left"], prefer_smallest=True)
+        right_hwnd = self._find_native_window_at(cursor_points["right"], prefer_smallest=True)
+        centre_hwnd = self._find_native_window_at(midpoint, prefer_smallest=True)
+        resize_target = None
+        # Near a window border the OS may report a different child/edge window under one
+        # TLI. Prefer the shared handle, but also test a window under the midpoint against
+        # its full outer rectangle before falling back to content zoom.
+        candidates = []
+        for candidate in (left_hwnd, right_hwnd, centre_hwnd):
+            if candidate and all(int(candidate) != int(existing) for existing in candidates):
+                candidates.append(candidate)
+        for candidate in candidates:
+            rect = self._native_window_rect(candidate)
+            corners = opposite_diagonal_corner_assignment(
+                rect, point_tuples["left"], point_tuples["right"]) if rect else None
+            if corners is None:
+                continue
+            # Qtile must float tiled clients before they can be interactively resized.
+            self._prepare_native_window_drag(candidate)
+            rect = self._native_window_rect(candidate) or rect
+            corners = opposite_diagonal_corner_assignment(
+                rect, point_tuples["left"], point_tuples["right"]) if rect else None
+            if corners is not None:
+                resize_target = (candidate, rect, corners)
+                break
+        state["active"] = True
+        state["start_points"] = point_tuples
+        state["zoom_remainder"] = 0.0
+        state["last_resize_at"] = 0.0
+        if resize_target is not None:
+            hwnd, rect, corners = resize_target
+            state["mode"] = "resize"
+            state["hwnd"] = hwnd
+            state["rect"] = rect
+            state["corners"] = corners
+            state["last_resize_rect"] = rect
+            state["last_distance"] = math.hypot(
+                point_tuples["right"][0]-point_tuples["left"][0],
+                point_tuples["right"][1]-point_tuples["left"][1])
+            self.status = "Pinch resize active — move both pinched hands at opposite corners"
+        else:
+            target = self._find_native_window_at(midpoint, prefer_smallest=True)
+            if target is None:
+                target = left_hwnd or right_hwnd
+            state["mode"] = "zoom"
+            state["hwnd"] = target
+            state["rect"] = self._native_window_rect(target) if target else None
+            state["corners"] = None
+            state["last_resize_rect"] = None
+            state["last_distance"] = math.hypot(
+                point_tuples["right"][0]-point_tuples["left"][0],
+                point_tuples["right"][1]-point_tuples["left"][1])
+            self.status = "Pinch zoom active — move hands apart to zoom in, together to zoom out"
+        self.update()
+        return True
+
+    def _apply_middle_pinch_zoom_step(self, midpoint, direction):
+        """Send one Ctrl/Command+wheel zoom notch at the live midpoint."""
+        if pyautogui is None or midpoint is None:
+            self.status = "Pinch zoom unavailable: pyautogui is not installed"
+            return False
+        screen_point = self._virtual_point_to_global(midpoint)
+        if screen_point is None:
+            return False
+        modifier = "command" if sys.platform == "darwin" else "ctrl"
+        modifier_down = False
+        try:
+            pyautogui.moveTo(int(screen_point.x()), int(screen_point.y()), duration=0, _pause=False)
+            pyautogui.keyDown(modifier, _pause=False)
+            modifier_down = True
+            pyautogui.scroll(int(direction), _pause=False)
+            return True
+        except Exception as exc:
+            self.status = f"Pinch zoom input failed: {exc}"
+            return False
+        finally:
+            if modifier_down:
+                try:
+                    pyautogui.keyUp(modifier, _pause=False)
+                except Exception:
+                    pass
+
+    def _update_middle_pinch_zoom(self, cursor_points, now):
+        """Apply the active pinch delta as a native window resize or Ctrl+wheel zoom."""
+        state = self.middle_pinch_zoom
+        points = {side: self._virtual_point_to_global(cursor_points[side])
+                  for side in ("left", "right")}
+        if any(point is None for point in points.values()):
+            return
+        current = {side: (float(point.x()), float(point.y())) for side, point in points.items()}
+        if state.get("mode") == "resize":
+            rect = resize_rect_from_corner_deltas(
+                state["rect"], state["start_points"], current, state["corners"])
+            if rect is None:
+                return
+            previous = state.get("last_resize_rect")
+            moved_enough = previous is None or any(abs(a-b) >= 2.0 for a, b in zip(rect, previous))
+            # wmctrl resizing spawns a process on X11; cap it at ~15 Hz to keep the
+            # new built-in gesture from adding a large CPU cost during a resize.
+            if (moved_enough and now-float(state.get("last_resize_at", 0.0)) >= 0.065):
+                left, top, right, bottom = rect
+                resized = self._resize_native_window(state.get("hwnd"), left, top,
+                                                      right-left, bottom-top)
+                state["last_resize_at"] = now
+                if resized:
+                    state["last_resize_rect"] = rect
+            return
+        distance = math.hypot(current["right"][0]-current["left"][0],
+                              current["right"][1]-current["left"][1])
+        previous_distance = state.get("last_distance")
+        state["last_distance"] = distance
+        if previous_distance is None:
+            return
+        midpoint = QPointF((cursor_points["left"].x()+cursor_points["right"].x())*0.5,
+                           (cursor_points["left"].y()+cursor_points["right"].y())*0.5)
+        # Ignore small tremor and emit discrete native zoom wheel notches only after
+        # a meaningful increase/decrease in the separation of the two hand anchors.
+        state["zoom_remainder"] = float(state.get("zoom_remainder", 0.0)) + (distance-previous_distance)
+        remainder = state["zoom_remainder"]
+        if abs(remainder) < 34.0:
+            return
+        # Window enumeration can spawn wmctrl/xdotool on Linux; query only when the
+        # movement accumulator has enough travel to emit an actual zoom wheel notch.
+        target = self._find_native_window_at(midpoint, prefer_smallest=True)
+        if not target:
+            state["zoom_remainder"] = 0.0
+            return
+        emitted = 0
+        while abs(remainder) >= 34.0 and emitted < 3:
+            direction = 1 if remainder > 0 else -1
+            if not self._apply_middle_pinch_zoom_step(midpoint, direction):
+                state["zoom_remainder"] = 0.0
+                return
+            remainder -= 34.0*direction
+            emitted += 1
+        state["zoom_remainder"] = remainder
+
+    def _process_middle_pinch_zoom(self, cursor_points, poses, now):
+        """Consume the two-hand thumb-middle pinch and its shared Pinch Menu buffer."""
+        state = self.middle_pinch_zoom
+        middle = {side: bool(poses.get(side, {}).get("middle_pinch") and side in cursor_points)
+                  for side in ("left", "right")}
+        any_middle = middle["left"] or middle["right"]
+        both_middle = middle["left"] and middle["right"]
+        if not any_middle and state.get("started_at") is None and not state.get("active"):
+            return False
+        # A middle-finger pinch is reserved for this built-in action. If the glass UI owns
+        # gestures, consume it without touching underlying application windows.
+        search_dialog = getattr(self, "search_dialog", None)
+        modal = (self._gesture_ui_modal_open() or self.tli_calibration_active_side is not None or
+                 getattr(self, "hand_calibration_active", False) or self.voice_selection_mode is not None or
+                 self.custom_gesture_recording is not None or
+                 any(self.fist_action_menu_open.values()) or
+                 (search_dialog is not None and search_dialog.isVisible()))
+        if modal or self.desktop_mode != "os":
+            was_active = bool(state.get("active"))
+            self._reset_middle_pinch_zoom()
+            if any_middle and not modal and self.status != "Pinch zoom and native window resize require OS desktop mode":
+                self.status = "Pinch zoom and native window resize require OS desktop mode"
+            elif was_active and not modal:
+                self.status = "Pinch zoom and native window resize require OS desktop mode"
+            return any_middle
+        if both_middle:
+            state["last_both_seen_at"] = now
+            if state.get("started_at") is None:
+                state["started_at"] = now
+                # Do not let this two-hand hold continue an in-progress click/drag/menu.
+                for side in ("left", "right"):
+                    self._end_pinch_drag(side, status=False)
+                    if self.fist_mouse_down.get(side, False):
+                        self._release_fist_mouse(side)
+                    self.active_action[side] = None
+                    self._reset_fist_gesture(side)
+                    self._clear_menu_pinch_sequence(side)
+                    self.active_push_sides.discard(side)
+                if self.gesture_owner in ("left", "right"):
+                    self.gesture_owner = None
+            if not state.get("active") and now-float(state["started_at"]) >= self.pinch_buffer_seconds:
+                if not self._begin_middle_pinch_zoom(cursor_points, now):
+                    self._reset_middle_pinch_zoom()
+            if state.get("active"):
+                self._update_middle_pinch_zoom(cursor_points, now)
+            self._request_scene_repaint(now)
+            return True
+        # Tolerate a brief one-frame landmark glitch, but release if either pinch ends.
+        if state.get("started_at") is not None:
+            last_seen = state.get("last_both_seen_at") or state.get("started_at")
+            if now-float(last_seen) <= 0.16:
+                self._request_scene_repaint(now)
+                return True
+            was_active = bool(state.get("active"))
+            self._reset_middle_pinch_zoom()
+            if was_active:
+                self.status = "Pinch zoom/resize released"
+            self._request_scene_repaint(now)
+        return any_middle
+
+    def _paint_middle_pinch_zoom_timer(self, painter, now=None):
+        """Draw the shared buffer countdown on each hand while pinch zoom is arming."""
+        state = getattr(self, "middle_pinch_zoom", {})
+        started = state.get("started_at") if isinstance(state, dict) else None
+        if started is None:
+            return
+        now = time.monotonic() if now is None else float(now)
+        if state.get("active"):
+            points = [self.side_cursor_positions.get(side) for side in ("left", "right")]
+            if all(point is not None for point in points):
+                centre = QPointF((points[0].x()+points[1].x())*0.5,
+                                 (points[0].y()+points[1].y())*0.5)
+                label = "RESIZE WINDOW" if state.get("mode") == "resize" else "PINCH ZOOM"
+                badge = QRectF(centre.x()-68, centre.y()-16, 136, 32)
+                painter.setPen(QPen(QColor(90, 235, 255, 210), 1.5))
+                painter.setBrush(QColor(12, 24, 36, 185))
+                painter.drawRoundedRect(badge, 8, 8)
+                painter.setPen(QColor(220, 252, 255, 245))
+                painter.setFont(self._ui_font(8, QFont.DemiBold))
+                painter.drawText(badge, Qt.AlignCenter, label)
+            return
+        elapsed = max(0.0, now-float(started))
+        remaining = max(0.0, self.pinch_buffer_seconds-elapsed)
+        progress = min(1.0, elapsed/max(0.01, self.pinch_buffer_seconds))
+        for side in ("left", "right"):
+            cursor = self.side_cursor_positions.get(side)
+            if cursor is None:
+                continue
+            ring = QRectF(cursor.x()-39, cursor.y()-39, 78, 78)
+            painter.setBrush(Qt.NoBrush)
+            painter.setPen(QPen(QColor(95, 235, 255, 80), 3))
+            painter.drawEllipse(ring)
+            painter.setPen(QPen(QColor(95, 235, 255, 245), 4))
+            painter.drawArc(ring, 90*16, -int(progress*360*16))
+            painter.setPen(QColor(225, 252, 255, 245))
+            painter.setFont(self._ui_font(8, QFont.DemiBold))
+            painter.drawText(QRectF(cursor.x()-24, cursor.y()+25, 48, 16), Qt.AlignCenter,
+                             f"{remaining:.1f}s")
+
     def update_scene(self):
         """Mutually-exclusive quick clicks, direct fist manipulation, and Pinch Menu gestures."""
         # Track which hand toggled this frame so only that hand's gesture processing pauses.
@@ -8187,16 +8505,17 @@ class SpatialDesktop(QWidget):
                 self.peace_toggle_latched[side] = False
             raw_fist = is_fist_or_grip_pose(landmarks, edge_tolerant=edge_tolerant)
             raw_pinch = is_thumb_index_menu_pinch(landmarks, edge_tolerant=edge_tolerant)
+            raw_middle_pinch = is_thumb_middle_zoom_pinch(landmarks, edge_tolerant=edge_tolerant)
             raw_open = is_open_hand_pose(landmarks, edge_tolerant=edge_tolerant)
             if not self.gesture_tracking_enabled.get(side, True) or side in gesture_tracking_just_toggled:
-                raw_fist = raw_pinch = raw_open = False
+                raw_fist = raw_pinch = raw_middle_pinch = raw_open = False
             if peace:
-                raw_fist = raw_pinch = raw_open = False
+                raw_fist = raw_pinch = raw_middle_pinch = raw_open = False
             calibration_consumes_gesture = self._process_tli_calibration_frame(
                 side, landmarks, raw_pinch)
             if calibration_modal_frame or calibration_consumes_gesture:
-                # Calibration pinches must never also click, drag, or start the Pinch Menu timer.
-                raw_fist = raw_pinch = raw_open = False
+                # Calibration pinches must never also click, drag, or start built-in timers.
+                raw_fist = raw_pinch = raw_middle_pinch = raw_open = False
             # Treat the open glass menu/settings as a gesture-modal surface. A hand
             # outside the visible panel may still be tracked/rendered, but its pose
             # cannot start a pinch timer, drag, scroll, or click through to an app.
@@ -8270,6 +8589,7 @@ class SpatialDesktop(QWidget):
                 "clear_left_pinch": clear_left_pinch,
                 # Fingers folded with or without the thumb out: a thumbs-up counts.
                 "fingers_closed": fingers_closed_pose(landmarks, edge_tolerant),
+                "middle_pinch": raw_middle_pinch,
             }
 
         self._update_hand_contact_display()
@@ -8304,6 +8624,15 @@ class SpatialDesktop(QWidget):
             self.active_push_sides = set()
             self.depth += (self.target_depth-self.depth)*0.16
             self.update()
+            return
+
+        if self._process_middle_pinch_zoom(cursor_points, poses, now):
+            # While this two-hand pose is arming or active, do not let it leak into
+            # custom-pose recognition, pinch-menu timers, clicks or ordinary pointer moves.
+            self.pointer_side = None
+            self.active_push_sides.clear()
+            self.depth += (self.target_depth-self.depth)*0.16
+            self._request_scene_repaint(now)
             return
 
         self._process_custom_gestures(hands_by_side, cursor_points, poses, now)
@@ -9740,6 +10069,8 @@ class SpatialDesktop(QWidget):
                             ("keep one still, then move the other.", False),
                             ("A vertical fist movement can scroll", False),
                             ("inside content or a scrollbar.", False),
+                            ("Both hands: thumb-middle pinch to zoom.", False),
+                            ("Pinch opposite window corners to resize.", False),
                             ("Open hand to end a normal drag/scroll.", False),
                             ("", False),
                             ("SETTINGS", True),
@@ -10142,6 +10473,7 @@ class SpatialDesktop(QWidget):
             for side in ("left", "right"):
                 self._paint_gesture_timer_fade(painter, side, now)
                 self._paint_pinch_menu(painter, side, now)
+            self._paint_middle_pinch_zoom_timer(painter, now)
 
             # Reticle and skeleton use the fixed hand-relative (optionally calibrated) TLI anchor.
             # During TLI calibration the dedicated target window is the sole visual owner;
