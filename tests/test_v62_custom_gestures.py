@@ -9,6 +9,7 @@ from custom_gestures import (
     FINGERS, HoldTrigger, best_pose_match, builtin_conflict, describe, feature_distance,
     hand_features, load_custom_gestures, mean_features, save_custom_gestures, tli_overlap,
     pyautogui_key_combo, display_key_combo, windows_shortcut_from_vk,
+    x11_key_name_from_keysym, x11_shortcut_from_keysym,
 )
 
 KN = {"index": (-30, 90), "middle": (-10, 95), "ring": (10, 90), "pinky": (28, 80)}
@@ -117,7 +118,11 @@ class CustomGestureTests(unittest.TestCase):
         self.assertIn('"action": r(action_x, y+3, action_width, 32)', main)
         self.assertIn('"capture": r(capture_x, y+3, 48, 32)', main)
         self.assertIn('"delete": r(delete_x, y+3, 32, 32)', main)
+        self.assertIn('delete_x = L + list_width - 32.0', main)
+        self.assertIn('capture_x = delete_x - 48.0 - 8.0', main)
+        self.assertIn('action_width = capture_x - action_x - 8.0', main)
         self.assertIn('if row["capture"].contains(point):', main)
+        self.assertIn('if gesture.get("action") == "custom_key":', main)
         self.assertIn('self._start_custom_gesture_key_capture(index)', main)
         self.assertIn('"PRESS" if capturing else "KEY"', main)
         self.assertIn("click KEY to capture a shortcut", main)
@@ -131,6 +136,25 @@ class CustomGestureTests(unittest.TestCase):
         self.assertIn("modifiers & Qt.MetaModifier", capture)
         self.assertIn('parts.append("meta")', capture)
         self.assertIn('"Key_Super_L", "Key_Super_R", "Key_Command"', capture)
+
+    def test_x11_super_combo_maps_to_portable_meta_shortcut(self):
+        # X11 KeySyms: Super_L=0xffeb, Ctrl_L=0xffe3, Shift_L=0xffe1, Alt_L=0xffe9.
+        self.assertIsNone(x11_key_name_from_keysym(0xFFEB))
+        self.assertEqual(x11_shortcut_from_keysym(0x61, {0xFFEB, 0x61}), "meta+a")
+        self.assertEqual(x11_shortcut_from_keysym(0x61, {0xFFE3, 0xFFEB, 0x61}), "ctrl+meta+a")
+        self.assertEqual(x11_shortcut_from_keysym(0xFF09, {0xFFEB, 0xFF09}), "meta+tab")
+        self.assertEqual(x11_shortcut_from_keysym(0x6B, {0xFFE3, 0xFFE9, 0xFFE1, 0x6B}),
+                         "ctrl+alt+shift+k")
+
+    def test_linux_capture_is_started_for_super_key_sequences(self):
+        main = (Path(__file__).resolve().parents[1] / "main.py").read_text(encoding="utf-8")
+        start = main.index("    def _start_custom_gesture_key_capture(self, index):")
+        end = main.index("    def _save_captured_custom_key_combo", start)
+        method = main[start:end]
+        self.assertIn('elif sys.platform.startswith("linux"):', method)
+        self.assertIn("capture = X11ShortcutCapture()", method)
+        self.assertIn("capture.start()", method)
+        self.assertIn("Global shortcut capture is unavailable", method)
 
     def test_save_and_load_round_trip_drops_invalid_entries(self):
         with tempfile.TemporaryDirectory() as tmp:

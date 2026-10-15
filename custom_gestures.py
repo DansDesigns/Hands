@@ -342,6 +342,272 @@ class WindowsShortcutCapture:
                 self._active = False
             self._hook_ready.set()
 
+
+# X11 keysyms used while a temporary active keyboard grab captures global shortcuts.
+# This is needed on Qtile/XLibre: combinations such as Super+A are usually consumed by
+# the window manager before the Qt application can receive keyPressEvent.
+def x11_key_name_from_keysym(keysym):
+    """Map an X11 KeySym to the portable key token used by custom gestures."""
+    value = int(keysym)
+    if 0x61 <= value <= 0x7A:
+        return chr(value)
+    if 0x41 <= value <= 0x5A:
+        return chr(value).lower()
+    if 0x30 <= value <= 0x39:
+        return chr(value)
+    if 0xFFBE <= value <= 0xFFE0:
+        return "f" + str(value - 0xFFBE + 1)
+    names = {
+        0xFFE1: None, 0xFFE2: None,  # Shift L/R
+        0xFFE3: None, 0xFFE4: None,  # Control L/R
+        0xFFE7: None, 0xFFE8: None,  # Meta L/R
+        0xFFE9: None, 0xFFEA: None,  # Alt L/R
+        0xFFEB: None, 0xFFEC: None,  # Super L/R
+        0xFFED: None, 0xFFEE: None,  # Hyper L/R
+        0xFE03: None,                # ISO_Level3_Shift (AltGr)
+        0xFF1B: "esc", 0xFF09: "tab", 0xFF0D: "enter",
+        0xFF8D: "enter", 0xFF08: "backspace", 0xFFFF: "delete",
+        0xFF63: "insert", 0xFF50: "home", 0xFF57: "end",
+        0xFF55: "pageup", 0xFF56: "pagedown", 0xFF51: "left",
+        0xFF53: "right", 0xFF52: "up", 0xFF54: "down",
+        0xFF13: "pause", 0xFF61: "printscreen", 0xFF14: "scrolllock",
+        0xFF7F: "numlock", 0xFFE5: "capslock", 0xFF80: "space",
+        0x0020: "space", 0x002B: "plus", 0x002D: "minus",
+        0x002C: "comma", 0x002E: "period", 0x002F: "slash",
+        0x005C: "backslash", 0x003B: "semicolon", 0x0027: "quote",
+        0x005B: "[", 0x005D: "]", 0x003D: "=", 0x0060: "`",
+    }
+    if value in names:
+        return names[value]
+    if value == 0xFF7E:  # Mode_switch
+        return None
+    if 0x21 <= value <= 0x7E:
+        return chr(value).lower()
+    return None
+
+
+def x11_shortcut_from_keysym(keysym, pressed_keysyms):
+    """Create a portable combo (e.g. ``meta+a``) from X11 keysyms currently down."""
+    pressed = {int(item) for item in pressed_keysyms}
+    modifiers = []
+    if pressed.intersection({0xFFE3, 0xFFE4}):
+        modifiers.append("ctrl")
+    if pressed.intersection({0xFFE9, 0xFFEA, 0xFE03}):
+        modifiers.append("alt")
+    if pressed.intersection({0xFFE1, 0xFFE2}):
+        modifiers.append("shift")
+    if pressed.intersection({0xFFE7, 0xFFE8, 0xFFEB, 0xFFEC, 0xFFED, 0xFFEE}):
+        modifiers.append("meta")
+    token = x11_key_name_from_keysym(keysym)
+    if token is None:
+        return None
+    modifiers.append(token)
+    return "+".join(modifiers)
+
+
+class X11ShortcutCapture:
+    """Temporarily grab the X11 keyboard to capture WM-reserved key combinations.
+
+    The grab is active only while the user is explicitly in the shortcut-capture UI.
+    It intercepts Super+key chords before Qtile can consume them, and always ungrabs
+    and destroys its temporary off-screen window when capture completes or is cancelled.
+    """
+
+    _UNSET = object()
+    _MODIFIER_KEYSYMS = {
+        0xFFE1, 0xFFE2, 0xFFE3, 0xFFE4, 0xFFE7, 0xFFE8, 0xFFE9, 0xFFEA,
+        0xFFEB, 0xFFEC, 0xFFED, 0xFFEE, 0xFE03,
+    }
+
+    def __init__(self):
+        self._lock = threading.RLock()
+        self._active = False
+        self._result = self._UNSET
+        self._error = None
+        self._thread = None
+        self._ready = threading.Event()
+        self._stop_event = threading.Event()
+
+    def start(self):
+        if not os.environ.get("DISPLAY") or os.environ.get("XDG_SESSION_TYPE", "").lower() == "wayland":
+            return False
+        with self._lock:
+            self._active = True
+            self._result = self._UNSET
+            self._error = None
+        self._ready.clear()
+        self._stop_event.clear()
+        self._thread = threading.Thread(target=self._run_grab, name="FreehandX11ShortcutCapture", daemon=True)
+        self._thread.start()
+        if not self._ready.wait(timeout=0.9):
+            self.stop()
+            with self._lock:
+                if self._error is None:
+                    self._error = "X11 keyboard capture did not become ready"
+            return False
+        with self._lock:
+            return self._error is None and self._active
+
+    def is_active(self):
+        with self._lock:
+            return self._active and self._error is None
+
+    def poll_result(self):
+        with self._lock:
+            if self._error is not None:
+                error, self._error = self._error, None
+                return "error", error
+            if self._result is not self._UNSET:
+                result, self._result = self._result, self._UNSET
+                return result
+        return "pending", None
+
+    def stop(self):
+        self._stop_event.set()
+        with self._lock:
+            self._active = False
+        thread = self._thread
+        if thread is not None and thread is not threading.current_thread():
+            thread.join(timeout=0.35)
+        self._thread = None
+
+    def _run_grab(self):
+        import ctypes
+        import time
+
+        class XKeyEvent(ctypes.Structure):
+            _fields_ = [
+                ("type", ctypes.c_int), ("serial", ctypes.c_ulong),
+                ("send_event", ctypes.c_int), ("display", ctypes.c_void_p),
+                ("window", ctypes.c_ulong), ("root", ctypes.c_ulong),
+                ("subwindow", ctypes.c_ulong), ("time", ctypes.c_ulong),
+                ("x", ctypes.c_int), ("y", ctypes.c_int),
+                ("x_root", ctypes.c_int), ("y_root", ctypes.c_int),
+                ("state", ctypes.c_uint), ("keycode", ctypes.c_uint),
+                ("same_screen", ctypes.c_int),
+            ]
+
+        class XEvent(ctypes.Union):
+            _fields_ = [("type", ctypes.c_int), ("xkey", XKeyEvent), ("pad", ctypes.c_long * 24)]
+
+        display = None
+        window = 0
+        x11 = None
+        try:
+            x11 = ctypes.CDLL("libX11.so.6")
+            x11.XOpenDisplay.argtypes = [ctypes.c_char_p]
+            x11.XOpenDisplay.restype = ctypes.c_void_p
+            x11.XDefaultScreen.argtypes = [ctypes.c_void_p]
+            x11.XDefaultScreen.restype = ctypes.c_int
+            x11.XRootWindow.argtypes = [ctypes.c_void_p, ctypes.c_int]
+            x11.XRootWindow.restype = ctypes.c_ulong
+            x11.XCreateSimpleWindow.argtypes = [ctypes.c_void_p, ctypes.c_ulong, ctypes.c_int,
+                                                 ctypes.c_int, ctypes.c_uint, ctypes.c_uint,
+                                                 ctypes.c_uint, ctypes.c_ulong, ctypes.c_ulong]
+            x11.XCreateSimpleWindow.restype = ctypes.c_ulong
+            x11.XSelectInput.argtypes = [ctypes.c_void_p, ctypes.c_ulong, ctypes.c_long]
+            x11.XMapWindow.argtypes = [ctypes.c_void_p, ctypes.c_ulong]
+            x11.XDestroyWindow.argtypes = [ctypes.c_void_p, ctypes.c_ulong]
+            x11.XSync.argtypes = [ctypes.c_void_p, ctypes.c_int]
+            x11.XGrabKeyboard.argtypes = [ctypes.c_void_p, ctypes.c_ulong, ctypes.c_int,
+                                          ctypes.c_int, ctypes.c_int, ctypes.c_ulong]
+            x11.XGrabKeyboard.restype = ctypes.c_int
+            x11.XUngrabKeyboard.argtypes = [ctypes.c_void_p, ctypes.c_ulong]
+            x11.XPending.argtypes = [ctypes.c_void_p]
+            x11.XPending.restype = ctypes.c_int
+            x11.XNextEvent.argtypes = [ctypes.c_void_p, ctypes.POINTER(XEvent)]
+            x11.XCloseDisplay.argtypes = [ctypes.c_void_p]
+            x11.XkbKeycodeToKeysym.argtypes = [ctypes.c_void_p, ctypes.c_ubyte,
+                                               ctypes.c_uint, ctypes.c_int]
+            x11.XkbKeycodeToKeysym.restype = ctypes.c_ulong
+            x11.XChangeWindowAttributes.argtypes = [ctypes.c_void_p, ctypes.c_ulong,
+                                                     ctypes.c_ulong, ctypes.c_void_p]
+
+            class XSetWindowAttributes(ctypes.Structure):
+                _fields_ = [
+                    ("background_pixmap", ctypes.c_ulong), ("background_pixel", ctypes.c_ulong),
+                    ("border_pixmap", ctypes.c_ulong), ("border_pixel", ctypes.c_ulong),
+                    ("bit_gravity", ctypes.c_int), ("win_gravity", ctypes.c_int),
+                    ("backing_store", ctypes.c_int), ("backing_planes", ctypes.c_ulong),
+                    ("backing_pixel", ctypes.c_ulong), ("save_under", ctypes.c_int),
+                    ("event_mask", ctypes.c_long), ("do_not_propagate_mask", ctypes.c_long),
+                    ("override_redirect", ctypes.c_int), ("colormap", ctypes.c_ulong),
+                    ("cursor", ctypes.c_ulong),
+                ]
+
+            display = x11.XOpenDisplay(None)
+            if not display:
+                raise RuntimeError("XOpenDisplay failed")
+            root = x11.XRootWindow(display, x11.XDefaultScreen(display))
+            # Tiny off-screen override-redirect window: it receives the active grab but
+            # cannot acquire decorations, enter the taskbar, or steal visual focus.
+            window = x11.XCreateSimpleWindow(display, root, -2, -2, 1, 1, 0, 0, 0)
+            if not window:
+                raise RuntimeError("Could not create X11 shortcut-capture window")
+            attrs = XSetWindowAttributes()
+            attrs.override_redirect = 1
+            x11.XChangeWindowAttributes(display, window, 1 << 9, ctypes.byref(attrs))  # CWOverrideRedirect
+            x11.XSelectInput(display, window, (1 << 0) | (1 << 1))  # KeyPressMask | KeyReleaseMask
+            x11.XMapWindow(display, window)
+            x11.XSync(display, 0)
+            grab_status = int(x11.XGrabKeyboard(display, window, 0, 1, 1, 0))
+            x11.XSync(display, 0)
+            if grab_status != 0:
+                raise RuntimeError(f"XGrabKeyboard failed (status {grab_status})")
+            self._ready.set()
+            pressed = {}
+            pending = None
+            while not self._stop_event.is_set():
+                available = int(x11.XPending(display))
+                if available <= 0:
+                    time.sleep(0.004)
+                    continue
+                event = XEvent()
+                x11.XNextEvent(display, ctypes.byref(event))
+                if event.type not in (2, 3):  # KeyPress, KeyRelease
+                    continue
+                keycode = int(event.xkey.keycode)
+                if event.type == 2:
+                    # Ignore auto-repeat presses for a key already physically held.
+                    if keycode in pressed:
+                        continue
+                    keysym = int(x11.XkbKeycodeToKeysym(display, keycode, 0, 0))
+                    pressed[keycode] = keysym
+                    if pending is None:
+                        token = x11_key_name_from_keysym(keysym)
+                        current_keysyms = set(pressed.values())
+                        if token == "esc" and not current_keysyms.intersection(self._MODIFIER_KEYSYMS):
+                            pending = ("cancel", None)
+                        elif token is not None and keysym not in self._MODIFIER_KEYSYMS:
+                            combo = x11_shortcut_from_keysym(keysym, current_keysyms)
+                            if combo:
+                                pending = ("combo", combo)
+                else:
+                    pressed.pop(keycode, None)
+                    if pending is not None and not pressed:
+                        with self._lock:
+                            self._result = pending
+                            self._active = False
+                        break
+        except Exception as exc:
+            with self._lock:
+                if self._active:
+                    self._error = str(exc)
+                    self._active = False
+        finally:
+            if display and x11 is not None:
+                try:
+                    x11.XUngrabKeyboard(display, 0)
+                    if window:
+                        x11.XDestroyWindow(display, window)
+                    x11.XCloseDisplay(display)
+                except Exception:
+                    pass
+            self._ready.set()
+            with self._lock:
+                self._active = False
+
+
 def display_key_combo(combo, platform=None):
     """Show META using the conventional name for the current operating system."""
     import sys as _sys

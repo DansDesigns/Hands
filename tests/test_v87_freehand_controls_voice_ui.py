@@ -51,7 +51,10 @@ class FreehandControlsVoiceUiTests(unittest.TestCase):
         self.assertIn("def draw_control_glow(rect, rgb=(100, 255, 255))", self.main)
         self.assertIn('side_hovered = draw_control_glow(row["side"])', self.main)
         self.assertIn('timer_hovered = draw_control_glow(row["timer"])', self.main)
+        self.assertIn('elif capture_enabled:', self.main)
         self.assertIn('draw_control_glow(row["capture"])', self.main)
+        self.assertIn('capture_enabled = action == "custom_key"', self.main)
+        self.assertIn('if gesture.get("action") == "custom_key":', self.main)
         self.assertIn('delete_hovered = draw_control_glow(row["delete"], (255, 75, 85))', self.main)
         self.assertIn("if capturing:", self.main)
 

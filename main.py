@@ -74,7 +74,7 @@ from custom_gestures import (
     MAX_GESTURES as CUSTOM_GESTURE_MAX, INSTANT_HOLD_SECONDS as CUSTOM_GESTURE_INSTANT_HOLD, HoldTrigger, hand_features, mean_features, describe as describe_pose,
     builtin_conflict, pinch_ratio as custom_pinch_ratio, best_pose_match, tli_overlap,
     load_custom_gestures, save_custom_gestures, pyautogui_key_combo, display_key_combo,
-    WindowsShortcutCapture,
+    WindowsShortcutCapture, X11ShortcutCapture,
 )
 from voice_pc_commands import match_pc_command, aliases_for_help, parse_navigation_command, is_navigation_intent, has_explicit_create_prefix
 from voice_assistant_commands import live_answer, file_query
@@ -7022,10 +7022,11 @@ try {
         top = self._settings_layout("gestures")["top"]
         L, W = self.SETTINGS_LEFT_X, self.SETTINGS_COLUMN_W
         list_width = self.SETTINGS_RIGHT_X + self.SETTINGS_COLUMN_W - L
-        capture_x = L + list_width - 74.0
-        delete_x = L + list_width - 35.0
-        action_x = L + 146.0
-        action_width = capture_x - action_x - 2.0
+        # Leave clear visual gutters between action, shortcut capture, and delete.
+        delete_x = L + list_width - 32.0
+        capture_x = delete_x - 48.0 - 8.0
+        action_x = L + 150.0
+        action_width = capture_x - action_x - 8.0
 
         def r(x, y, w, h):
             return QRectF(cx+x*scale, cy+(top+y)*scale, w*scale, h*scale)
@@ -7035,8 +7036,8 @@ try {
             rows.append({
                 "row": r(L, y, list_width, 38),
                 "side": r(L+2, y+3, 40, 32),
-                "timer": r(L+44, y+3, 42, 32),
-                "label": r(L+88, y+3, 56, 32),
+                "timer": r(L+46, y+3, 42, 32),
+                "label": r(L+94, y+3, 48, 32),
                 "action": r(action_x, y+3, action_width, 32),
                 "capture": r(capture_x, y+3, 48, 32),
                 "delete": r(delete_x, y+3, 32, 32),
@@ -7295,7 +7296,10 @@ try {
                 continue
             gesture = self.custom_gestures[index]
             if row["capture"].contains(point):
-                self._start_custom_gesture_key_capture(index)
+                # KEY is deliberately disabled for actions that don't invoke a key
+                # combo. Users must choose CUSTOM KEY from the action selector first.
+                if gesture.get("action") == "custom_key":
+                    self._start_custom_gesture_key_capture(index)
                 return
             if row["delete"].contains(point):
                 if self.custom_gesture_key_capture is not None:
@@ -7559,6 +7563,7 @@ try {
                                     row["action"].height()), Qt.AlignCenter, "▴" if is_open else "▾")
 
             capturing = self.custom_gesture_key_capture == index
+            capture_enabled = action == "custom_key"
             if capturing:
                 # Active capture gets a persistent amber glow even when not hovered.
                 for expansion, alpha, width in ((6*scale, 45, 3*scale), (2.5*scale, 95, 2*scale)):
@@ -7566,15 +7571,23 @@ try {
                     painter.setBrush(Qt.NoBrush)
                     painter.drawRoundedRect(row["capture"].adjusted(-expansion, -expansion, expansion, expansion),
                                             8*scale+expansion, 8*scale+expansion)
-            else:
+            elif capture_enabled:
                 draw_control_glow(row["capture"])
-            painter.setBrush(QBrush(QColor(145, 92, 24, 245) if capturing else
-                                    QColor(24, 89, 92, 235) if action == "custom_key" else
-                                    QColor(10, 47, 67, 225)))
-            painter.setPen(QPen(QColor(255, 224, 145, 245) if capturing else
-                                QColor(175, 250, 255, 190), 1.0*scale))
+            # A KEY button is genuinely inert until CUSTOM KEY is chosen in the
+            # action selector: no hover glow, no bright border, and muted label.
+            if capturing:
+                capture_fill, capture_edge, capture_text = (
+                    QColor(145, 92, 24, 245), QColor(255, 224, 145, 245), QColor(255, 248, 222))
+            elif capture_enabled:
+                capture_fill, capture_edge, capture_text = (
+                    QColor(24, 89, 92, 235), QColor(175, 250, 255, 190), QColor(225, 250, 255))
+            else:
+                capture_fill, capture_edge, capture_text = (
+                    QColor(17, 35, 43, 155), QColor(86, 116, 125, 100), QColor(105, 137, 146))
+            painter.setBrush(QBrush(capture_fill))
+            painter.setPen(QPen(capture_edge, 1.0*scale))
             painter.drawRoundedRect(row["capture"], 7*scale, 7*scale)
-            painter.setPen(QColor(255, 248, 222) if capturing else QColor(225, 250, 255))
+            painter.setPen(capture_text)
             self._draw_fitted_button_label(painter, row["capture"], "PRESS" if capturing else "KEY",
                                            base_size=8, min_size=6, inset=2*scale)
 
@@ -11153,6 +11166,20 @@ try {
                 self.custom_gesture_message = (
                     "Native keyboard capture could not start. Use Ctrl/Alt/Shift shortcuts; "
                     "Windows may intercept Win+Tab.")
+        elif sys.platform.startswith("linux"):
+            # Qtile consumes many Super shortcuts (e.g. Super+A) before Qt sees
+            # keyPressEvent. On X11/XLibre, temporarily grab the keyboard globally
+            # so the chosen combo is captured instead of launching the OS shortcut.
+            capture = X11ShortcutCapture()
+            if capture.start():
+                self._native_shortcut_capture = capture
+                timer = getattr(self, "custom_key_capture_poll_timer", None)
+                if timer is not None:
+                    timer.start()
+            else:
+                self.custom_gesture_message = (
+                    "Global shortcut capture is unavailable. On Linux this requires an X11/XLibre "
+                    "session; the window manager may intercept Super shortcuts otherwise.")
         self.update()
 
     def _save_captured_custom_key_combo(self, index, combo):
@@ -11203,9 +11230,13 @@ try {
             # Keep the ordinary Qt event-based capture available if the native hook
             # cannot be installed. A warning makes the Win+Tab limitation explicit.
             self.custom_gesture_key_capture = index
+            if sys.platform.startswith("linux"):
+                limitation = "Super shortcuts may still be intercepted by the window manager."
+            else:
+                limitation = "Windows may intercept system-reserved shortcuts."
             self.custom_gesture_message = (
                 f"Native key capture unavailable ({value}). Ordinary shortcuts can still be captured; "
-                "Windows may intercept Win+Tab. Press Esc to cancel.")
+                f"{limitation} Press Esc to cancel.")
             self.update()
 
     def _custom_key_name_from_event(self, event):
