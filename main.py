@@ -28,6 +28,7 @@ from datetime import datetime
 from ctypes import wintypes
 from pathlib import Path
 from linux_screen_geometry import resolve_fullscreen_bounds
+from garden_weather import fetch_live_weather, calculate_solar_state, weather_kind, WEATHER_REFRESH_SECONDS
 
 from gesture_rules import (
     should_dismiss_pinch_menu,
@@ -157,7 +158,7 @@ VIRTUAL_PEN_PALETTE = (
 )
 VIRTUAL_DESKTOP_DEFAULTS = {
     "background": {
-        "grid_enabled": True, "style": 0, "brightness": 78.0,
+        "grid_enabled": True, "garden_mode": False, "style": 0, "brightness": 78.0,
         "glow": 55.0, "spacing": 64.0, "thickness": 1.25,
     },
     "strokes": [],
@@ -189,6 +190,9 @@ def normalise_virtual_desktop_data(value):
         "grid_enabled": (background_source.get("grid_enabled")
                          if isinstance(background_source.get("grid_enabled"), bool)
                          else defaults["grid_enabled"]),
+        "garden_mode": (background_source.get("garden_mode")
+                        if isinstance(background_source.get("garden_mode"), bool)
+                        else defaults["garden_mode"]),
         "style": max(0, min(len(VIRTUAL_BACKGROUND_STYLES)-1, style)),
         "brightness": _finite_clamped(background_source.get("brightness"), 10, 100, defaults["brightness"]),
         "glow": _finite_clamped(background_source.get("glow"), 0, 100, defaults["glow"]),
@@ -1880,6 +1884,7 @@ class SpatialDesktop(QWidget):
         self.virtual_desktop_data = load_virtual_desktop_data()
         virtual_bg = self.virtual_desktop_data["background"]
         self.virtual_grid_enabled = bool(virtual_bg["grid_enabled"])
+        self.virtual_garden_mode = bool(virtual_bg.get("garden_mode", False))
         self.virtual_background_style = int(virtual_bg["style"])
         self.virtual_grid_brightness = float(virtual_bg["brightness"])
         self.virtual_grid_glow = float(virtual_bg["glow"])
@@ -1896,6 +1901,22 @@ class SpatialDesktop(QWidget):
         self.virtual_pen_erase = False
         self.virtual_pen_active_stroke = None
         self.virtual_pen_last_status_at = 0.0
+        # Garden weather is refreshed only while Garden Mode is visible. Network work runs
+        # off the GUI thread and uses city-level IP geolocation, never webcam/hand data.
+        self.garden_weather = {
+            "source": "local-time", "city": "Local area", "country": "",
+            "weather_code": 0, "temperature": float("nan"), "cloud_cover": 0.0,
+            "wind_speed": 4.0, "precipitation": 0.0, "rain": 0.0, "snowfall": 0.0,
+            "sunrise": None, "sunset": None, "timezone": "", "observed_at": "",
+        }
+        self.garden_weather_location = None
+        self._garden_weather_lock = threading.Lock()
+        self._garden_weather_fetching = False
+        self._garden_weather_last_attempt = 0.0
+        self._garden_background_cache = None
+        self._garden_background_cache_key = None
+        self._garden_grass_specs_size = None
+        self._garden_grass_specs = None
         self.d1_ui_log = ["Engine panel ready."]
         self._last_d1_log_signature = None
         # Slider interaction intentionally moves at less than half the cursor speed for finer control.
@@ -2351,7 +2372,10 @@ class SpatialDesktop(QWidget):
         return VIRTUAL_BACKGROUND_STYLES[index]
 
     def _paint_virtual_background(self, painter, width, height):
-        """Paint the Virtual desktop base and customizable glowing grid."""
+        """Paint the active Virtual desktop scene (grid canvas or separate Garden scene)."""
+        if getattr(self, "virtual_garden_mode", False):
+            self._paint_virtual_garden(painter, width, height)
+            return
         style = self._virtual_background_style_data()
         painter.fillRect(QRectF(0, 0, width, height), QColor(style["background"]))
         if not self.virtual_grid_enabled:
@@ -2390,10 +2414,450 @@ class SpatialDesktop(QWidget):
                 painter.drawLine(QPointF(0, pos), QPointF(width, pos))
         painter.restore()
 
+    def _maybe_refresh_garden_weather(self):
+        """Refresh live weather asynchronously, no more often than the provider cadence."""
+        if not getattr(self, "virtual_garden_mode", False):
+            return
+        now = time.monotonic()
+        lock = getattr(self, "_garden_weather_lock", None)
+        if lock is None:
+            return
+        with lock:
+            if self._garden_weather_fetching:
+                return
+            if now - float(self._garden_weather_last_attempt) < WEATHER_REFRESH_SECONDS:
+                return
+            self._garden_weather_last_attempt = now
+            self._garden_weather_fetching = True
+            location = dict(self.garden_weather_location) if isinstance(self.garden_weather_location, dict) else None
+
+        def fetch_worker():
+            try:
+                fresh = fetch_live_weather(location=location, timeout=5.0)
+                with self._garden_weather_lock:
+                    self.garden_weather = fresh
+                    cached_location = fresh.get("location")
+                    self.garden_weather_location = (dict(cached_location)
+                                                    if isinstance(cached_location, dict) else location)
+                    self._garden_background_cache_key = None
+            except Exception:
+                # Keep the last successful report; if there isn't one, the garden falls
+                # back to a local-time sun/moon cycle and a clear, calm scene.
+                pass
+            finally:
+                with self._garden_weather_lock:
+                    self._garden_weather_fetching = False
+
+        threading.Thread(target=fetch_worker, name="FreehandGardenWeather", daemon=True).start()
+
+    def _garden_scene_state(self):
+        """Snapshot weather and calculate current daylight, so paint never performs I/O."""
+        with self._garden_weather_lock:
+            weather = dict(self.garden_weather)
+        now = datetime.now()
+        timezone_name = str(weather.get("timezone") or "")
+        if timezone_name:
+            try:
+                from zoneinfo import ZoneInfo
+                now = datetime.now(ZoneInfo(timezone_name))
+            except Exception:
+                now = datetime.now()
+        solar = calculate_solar_state(now, weather.get("sunrise"), weather.get("sunset"))
+        try:
+            cloud_cover = max(0.0, min(100.0, float(weather.get("cloud_cover", 0.0))))
+        except (TypeError, ValueError):
+            cloud_cover = 0.0
+        try:
+            wind_speed = max(0.0, min(120.0, float(weather.get("wind_speed", 4.0))))
+        except (TypeError, ValueError):
+            wind_speed = 4.0
+        kind = weather_kind(weather.get("weather_code", 0))
+        cloudiness = cloud_cover / 100.0
+        if kind == "mostly-clear":
+            cloudiness = max(cloudiness, 0.16)
+        elif kind == "partly-cloudy":
+            cloudiness = max(cloudiness, 0.42)
+        elif kind == "overcast":
+            cloudiness = max(cloudiness, 0.88)
+        elif kind == "cloudy":
+            cloudiness = max(cloudiness, 0.38)
+        elif kind == "fog":
+            cloudiness = max(cloudiness, 0.76)
+        elif kind in ("rain", "snow", "storm"):
+            cloudiness = max(cloudiness, 0.72)
+        # Clouds and precipitation dim the sun; clear weather leaves the time-of-day
+        # brightness curve intact.
+        sun_brightness = float(solar["solar_factor"])
+        if solar["is_day"]:
+            sun_brightness = (0.18 + 0.82 * sun_brightness) * (1.0 - 0.68 * cloudiness)
+            if kind == "storm":
+                sun_brightness *= 0.38
+            elif kind in ("rain", "snow", "fog"):
+                sun_brightness *= 0.72
+        return {
+            **weather, **solar,
+            "kind": kind,
+            "cloud_cover": cloud_cover,
+            "cloudiness": min(1.0, max(0.0, cloudiness)),
+            "wind_speed": wind_speed,
+            "sun_brightness": min(1.0, max(0.0, sun_brightness)),
+            # Before dawn, the sun will enter from the left and the moon sits right;
+            # after sunset, the moon appears on the opposite (left) side.
+            "moon_progress": float(solar.get("night_progress", 0.0)),
+        }
+
+    @staticmethod
+    def _garden_mix_colour(first, second, amount):
+        amount = min(1.0, max(0.0, float(amount)))
+        return QColor(
+            round(first.red() * (1.0 - amount) + second.red() * amount),
+            round(first.green() * (1.0 - amount) + second.green() * amount),
+            round(first.blue() * (1.0 - amount) + second.blue() * amount),
+            round(first.alpha() * (1.0 - amount) + second.alpha() * amount),
+        )
+
+    def _paint_virtual_garden_background(self, painter, width, height, scene):
+        """Render static sky, celestial objects, clouds and hills into a cached image."""
+        width, height = float(width), float(height)
+        is_day = bool(scene["is_day"])
+        solar = float(scene["solar_factor"])
+        cloudiness = float(scene["cloudiness"])
+        kind = scene["kind"]
+        painter.save()
+        painter.setRenderHint(QPainter.Antialiasing, True)
+
+        if is_day:
+            day_luma = 0.48 + 0.52 * solar
+            sky_top = QColor(round(62*day_luma), round(163*day_luma), round(239*day_luma))
+            sky_mid = QColor(round(117*day_luma), round(202*day_luma), round(250*day_luma))
+            sky_bottom = QColor(round(224*day_luma), round(245*day_luma), round(255*day_luma))
+            twilight = max(0.0, 1.0 - solar * 2.7)
+            sky_mid = self._garden_mix_colour(sky_mid, QColor(246, 166, 121), twilight * 0.54)
+            sky_bottom = self._garden_mix_colour(sky_bottom, QColor(255, 205, 158), twilight * 0.40)
+            sky_top = self._garden_mix_colour(sky_top, QColor(101, 116, 143), cloudiness * 0.52)
+            sky_mid = self._garden_mix_colour(sky_mid, QColor(161, 174, 185), cloudiness * 0.36)
+        else:
+            sky_top = self._garden_mix_colour(QColor(6, 13, 34), QColor(67, 77, 93), cloudiness * 0.62)
+            sky_mid = self._garden_mix_colour(QColor(18, 32, 59), QColor(79, 91, 103), cloudiness * 0.56)
+            sky_bottom = self._garden_mix_colour(QColor(48, 63, 83), QColor(116, 122, 123), cloudiness * 0.50)
+        sky = QLinearGradient(0, 0, 0, height * 0.80)
+        sky.setColorAt(0.0, sky_top)
+        sky.setColorAt(0.48, sky_mid)
+        sky.setColorAt(1.0, sky_bottom)
+        painter.fillRect(QRectF(0, 0, width, height), QBrush(sky))
+
+        if not is_day:
+            # Deterministic star placement means the cached scene is stable between weather updates.
+            for index in range(38):
+                x = ((index * 131.7 + 19.0) % max(1.0, width))
+                y = ((index * 37.9 + 11.0) % max(1.0, height * 0.50))
+                alpha = 95 + ((index * 29) % 145)
+                radius = 0.7 + (index % 3) * 0.32
+                painter.setPen(Qt.NoPen)
+                painter.setBrush(QColor(221, 237, 255, alpha))
+                painter.drawEllipse(QPointF(x, y), radius, radius)
+
+            # A soft crescent moon on the other side of the scene from the day's sun path.
+            moon_x = width * (0.16 + 0.68 * float(scene.get("moon_progress", 0.5)))
+            moon = QPointF(moon_x, height * 0.19)
+            moon_radius = max(17.0, height * 0.036)
+            halo = QRadialGradient(moon, moon_radius * 3.3)
+            halo.setColorAt(0.0, QColor(195, 220, 255, 60))
+            halo.setColorAt(0.48, QColor(174, 207, 255, 25))
+            halo.setColorAt(1.0, QColor(174, 207, 255, 0))
+            painter.setPen(Qt.NoPen)
+            painter.setBrush(QBrush(halo))
+            painter.drawEllipse(moon, moon_radius * 3.3, moon_radius * 3.3)
+            painter.setBrush(QColor(235, 241, 249, 245))
+            painter.drawEllipse(moon, moon_radius, moon_radius)
+            shadow_offset = moon_radius * 0.42
+            cut = self._garden_mix_colour(sky_top, sky_mid, 0.28)
+            painter.setBrush(cut)
+            painter.drawEllipse(QPointF(moon.x() + shadow_offset, moon.y() - moon_radius * 0.10),
+                                moon_radius * 0.90, moon_radius * 0.90)
+        else:
+            # The sun traverses the sky over daylight; its halo and colour follow both
+            # solar elevation and real cloud cover/conditions.
+            progress = float(scene["progress"])
+            sun = QPointF(width * (0.12 + 0.76 * progress),
+                          height * (0.27 - 0.15 * math.sin(math.pi * progress)))
+            sun_radius = max(22.0, height * 0.050)
+            brightness = float(scene["sun_brightness"])
+            halo_radius = sun_radius * (2.1 + 1.6 * brightness)
+            halo = QRadialGradient(sun, halo_radius)
+            halo.setColorAt(0.0, QColor(255, 222, 137, int(108 * brightness)))
+            halo.setColorAt(0.42, QColor(255, 218, 120, int(60 * brightness)))
+            halo.setColorAt(1.0, QColor(255, 218, 120, 0))
+            painter.setPen(Qt.NoPen)
+            painter.setBrush(QBrush(halo))
+            painter.drawEllipse(sun, halo_radius, halo_radius)
+            sun_fill = QRadialGradient(
+                QPointF(sun.x() - sun_radius * 0.23, sun.y() - sun_radius * 0.27),
+                sun_radius * 1.5,
+            )
+            sun_fill.setColorAt(0.0, QColor(255, 255, 224, int(255 * brightness)))
+            sun_fill.setColorAt(0.62, QColor(255, 236, 166, int(250 * brightness)))
+            sun_fill.setColorAt(1.0, QColor(255, 180, 85, int(240 * brightness)))
+            painter.setBrush(QBrush(sun_fill))
+            painter.setPen(QPen(QColor(255, 241, 187, int(180*brightness)), max(1.0, height*0.001)))
+            painter.drawEllipse(sun, sun_radius, sun_radius)
+
+        # Real-time cloud cover changes both the light and the visible cloud layer.
+        cloud_count = min(7, max(0, int(round(cloudiness * 7))))
+        for index in range(cloud_count):
+            cloud_x = ((index * 0.217 + 0.035) % 1.0) * width
+            cloud_y = height * (0.095 + ((index * 7) % 7) * 0.023)
+            cloud_w = height * (0.095 + ((index * 5) % 4) * 0.010)
+            cloud_h = height * (0.027 + ((index * 3) % 3) * 0.006)
+            if is_day:
+                cloud_colour = QColor(245, 249, 251, int(35 + cloudiness * 175))
+                cloud_shadow = QColor(93, 119, 142, int(10 + cloudiness * 60))
+            else:
+                cloud_colour = QColor(126, 145, 171, int(25 + cloudiness * 100))
+                cloud_shadow = QColor(15, 28, 49, int(25 + cloudiness * 70))
+            painter.setPen(Qt.NoPen)
+            painter.setBrush(cloud_shadow)
+            painter.drawEllipse(QRectF(cloud_x-cloud_w*0.34, cloud_y-cloud_h*0.02,
+                                       cloud_w*0.68, cloud_h*1.20))
+            painter.drawEllipse(QRectF(cloud_x-cloud_w*0.12, cloud_y-cloud_h*0.35,
+                                       cloud_w*0.45, cloud_h*1.15))
+            painter.drawEllipse(QRectF(cloud_x+cloud_w*0.10, cloud_y-cloud_h*0.10,
+                                       cloud_w*0.48, cloud_h*1.0))
+            painter.setBrush(cloud_colour)
+            painter.drawEllipse(QRectF(cloud_x-cloud_w*0.35, cloud_y-cloud_h*0.12,
+                                       cloud_w*0.66, cloud_h))
+            painter.drawEllipse(QRectF(cloud_x-cloud_w*0.10, cloud_y-cloud_h*0.44,
+                                       cloud_w*0.46, cloud_h*1.04))
+            painter.drawEllipse(QRectF(cloud_x+cloud_w*0.12, cloud_y-cloud_h*0.15,
+                                       cloud_w*0.45, cloud_h*0.98))
+
+        # Rolling hills change to cooler, darker greens at night and in poor weather.
+        if is_day:
+            far_top, far_bottom = QColor(137, 199, 137), QColor(78, 158, 91)
+            mid_top, mid_bottom = QColor(93, 183, 92), QColor(37, 126, 62)
+            fore_top, fore_mid, fore_bottom = QColor(79, 179, 70), QColor(42, 143, 54), QColor(22, 93, 43)
+            if kind in ("rain", "storm", "fog", "snow") or cloudiness > 0.65:
+                far_top = self._garden_mix_colour(far_top, QColor(115, 143, 132), cloudiness * 0.55)
+                far_bottom = self._garden_mix_colour(far_bottom, QColor(57, 104, 83), cloudiness * 0.48)
+                mid_top = self._garden_mix_colour(mid_top, QColor(77, 122, 91), cloudiness * 0.50)
+                mid_bottom = self._garden_mix_colour(mid_bottom, QColor(26, 82, 57), cloudiness * 0.42)
+                fore_top = self._garden_mix_colour(fore_top, QColor(62, 122, 61), cloudiness * 0.35)
+        else:
+            far_top, far_bottom = QColor(35, 74, 78), QColor(21, 50, 53)
+            mid_top, mid_bottom = QColor(29, 83, 58), QColor(15, 53, 40)
+            fore_top, fore_mid, fore_bottom = QColor(28, 74, 42), QColor(17, 58, 34), QColor(7, 34, 24)
+        distant = QPainterPath()
+        distant.moveTo(0, height*0.59)
+        distant.cubicTo(width*0.13, height*0.48, width*0.20, height*0.50, width*0.32, height*0.57)
+        distant.cubicTo(width*0.44, height*0.65, width*0.52, height*0.49, width*0.67, height*0.55)
+        distant.cubicTo(width*0.80, height*0.60, width*0.88, height*0.46, width, height*0.53)
+        distant.lineTo(width, height); distant.lineTo(0, height); distant.closeSubpath()
+        hill_grad = QLinearGradient(0, height*0.48, 0, height*0.91)
+        hill_grad.setColorAt(0.0, far_top); hill_grad.setColorAt(1.0, far_bottom)
+        painter.setPen(Qt.NoPen); painter.setBrush(QBrush(hill_grad)); painter.drawPath(distant)
+
+        middle = QPainterPath()
+        middle.moveTo(0, height*0.70)
+        middle.cubicTo(width*0.16, height*0.59, width*0.27, height*0.66, width*0.40, height*0.70)
+        middle.cubicTo(width*0.55, height*0.75, width*0.62, height*0.59, width*0.76, height*0.66)
+        middle.cubicTo(width*0.87, height*0.70, width*0.94, height*0.61, width, height*0.65)
+        middle.lineTo(width, height); middle.lineTo(0, height); middle.closeSubpath()
+        middle_grad = QLinearGradient(0, height*0.59, 0, height)
+        middle_grad.setColorAt(0.0, mid_top); middle_grad.setColorAt(1.0, mid_bottom)
+        painter.setBrush(QBrush(middle_grad)); painter.drawPath(middle)
+
+        foreground = QPainterPath()
+        foreground.moveTo(0, height*0.79)
+        foreground.cubicTo(width*0.20, height*0.71, width*0.31, height*0.77, width*0.47, height*0.81)
+        foreground.cubicTo(width*0.64, height*0.85, width*0.82, height*0.70, width, height*0.77)
+        foreground.lineTo(width, height); foreground.lineTo(0, height); foreground.closeSubpath()
+        fore_grad = QLinearGradient(0, height*0.72, 0, height)
+        fore_grad.setColorAt(0.0, fore_top); fore_grad.setColorAt(0.45, fore_mid); fore_grad.setColorAt(1.0, fore_bottom)
+        painter.setBrush(QBrush(fore_grad)); painter.drawPath(foreground)
+        painter.setPen(QPen(QColor(184, 229, 124, 48 if is_day else 18), max(1.0, height*0.0025),
+                            Qt.SolidLine, Qt.RoundCap))
+        highlight = QPainterPath(QPointF(0, height*0.79))
+        highlight.cubicTo(width*0.20, height*0.71, width*0.31, height*0.77, width*0.47, height*0.81)
+        highlight.cubicTo(width*0.64, height*0.85, width*0.82, height*0.70, width, height*0.77)
+        painter.drawPath(highlight)
+
+        if kind == "fog":
+            fog = QLinearGradient(0, height*0.33, 0, height*0.86)
+            fog.setColorAt(0.0, QColor(224, 235, 241, 0))
+            fog.setColorAt(0.45, QColor(224, 235, 241, 78))
+            fog.setColorAt(1.0, QColor(224, 235, 241, 12))
+            painter.fillRect(QRectF(0, height*0.30, width, height*0.60), QBrush(fog))
+        painter.restore()
+
+    def _garden_grass_specs_for_size(self, width, height):
+        """Precompute static grass blade geometry; only hand response moves per frame."""
+        key = (int(width), int(height))
+        if self._garden_grass_specs_size == key and self._garden_grass_specs is not None:
+            return self._garden_grass_specs
+        specs = []
+        rows = (
+            (0.700, 18.0, 30.0, 0.64, QColor(139, 218, 103), max(28.0, width/72.0)),
+            (0.785, 27.0, 43.0, 0.82, QColor(97, 196, 72), max(22.0, width/88.0)),
+            (0.905, 34.0, 57.0, 1.0, QColor(59, 159, 57), max(17.0, width/112.0)),
+        )
+        for row_index, (base_ratio, min_len, max_len, alpha_scale, base_color, step) in enumerate(rows):
+            row_step = step * (1.12 if row_index == 0 else 1.0)
+            blades = []
+            x = -row_step
+            while x < width + row_step:
+                wave = math.sin(x*0.0081 + row_index*1.7) * height * 0.011
+                base_y = min(height+4.0, height*base_ratio+wave)
+                variation = (math.sin(x*0.047 + row_index*2.4)+1.0)*0.5
+                blade_len = min_len + (max_len-min_len)*variation
+                base_sway = math.sin(x*0.015+row_index*2.7)*4.0
+                blades.append((x, base_y, blade_len, base_sway))
+                x += row_step
+            specs.append((row_index, alpha_scale, base_color, blades))
+        self._garden_grass_specs_size = key
+        self._garden_grass_specs = specs
+        return specs
+
+    def _paint_garden_grass(self, painter, width, height, scene):
+        """Paint a compact, batched grass layer that bends away from nearby hand cursors."""
+        cursor_points = []
+        for side in ("left", "right"):
+            cursor = getattr(self, "side_cursor_positions", {}).get(side)
+            if cursor is None:
+                continue
+            try:
+                cursor_x, cursor_y = float(cursor.x()), float(cursor.y())
+            except (AttributeError, TypeError, ValueError):
+                continue
+            if cursor_y >= height * 0.53:
+                cursor_points.append((cursor_x, cursor_y, side))
+        wind = min(1.0, float(scene["wind_speed"])/28.0)
+        phase = time.monotonic() * (0.35 + wind*1.4)
+        influence_radius = max(110.0, height*0.20)
+        radius_sq = influence_radius * influence_radius
+        painter.save()
+        painter.setRenderHint(QPainter.Antialiasing, True)
+        for row_index, alpha_scale, base_color, blades in self._garden_grass_specs_for_size(width, height):
+            path = QPainterPath()
+            for x, base_y, blade_len, base_sway in blades:
+                sway = base_sway + math.sin(x*0.008 + phase + row_index*1.1) * wind * 3.2
+                push = 0.0
+                for cursor_x, cursor_y, side in cursor_points:
+                    dx = x - cursor_x
+                    if abs(dx) >= influence_radius:
+                        continue
+                    dy = (base_y - blade_len*0.53) - cursor_y
+                    if abs(dy) >= influence_radius:
+                        continue
+                    distance_sq = dx*dx + dy*dy
+                    if distance_sq >= radius_sq:
+                        continue
+                    influence = 1.0 - distance_sq/radius_sq
+                    direction = (-1.0 if side == "left" else 1.0) if abs(dx) < 1.0 else (1.0 if dx > 0 else -1.0)
+                    push += direction * blade_len * 0.92 * influence
+                bend = max(-blade_len*1.12, min(blade_len*1.12, sway+push))
+                tip_x = x + bend
+                tip_y = base_y - blade_len
+                path.moveTo(QPointF(x, base_y))
+                path.cubicTo(QPointF(x+bend*0.12, base_y-blade_len*0.42),
+                             QPointF(x+bend*0.86, base_y-blade_len*0.78),
+                             QPointF(tip_x, tip_y))
+            colour = QColor(base_color)
+            colour.setAlpha(int((210 if scene["is_day"] else 145)*alpha_scale))
+            pen_width = (1.2 + 1.8*alpha_scale) * (1.0 if row_index == 2 else 0.76)
+            painter.setPen(QPen(colour, pen_width, Qt.SolidLine, Qt.RoundCap))
+            painter.drawPath(path)
+        painter.restore()
+
+    def _paint_garden_weather_effects(self, painter, width, height, scene):
+        """Low-cost animated precipitation driven by the latest current weather code."""
+        kind = scene["kind"]
+        if kind not in ("rain", "storm", "snow"):
+            return
+        phase = (time.monotonic() * (82.0 + float(scene["wind_speed"])*1.7)) % max(1.0, height+80.0)
+        painter.save()
+        if kind in ("rain", "storm"):
+            rain_path = QPainterPath()
+            count = 74 if kind == "storm" else 52
+            slant = 3.0 + min(12.0, float(scene["wind_speed"])*0.22)
+            for index in range(count):
+                x = (index*97.31 + phase*0.62) % max(1.0, width)
+                y = (index*71.27 + phase*1.35) % max(1.0, height)
+                rain_path.moveTo(QPointF(x, y))
+                rain_path.lineTo(QPointF(x-slant, y+9.0+(index%4)))
+            painter.setPen(QPen(QColor(206, 231, 255, 108 if kind == "storm" else 78),
+                                1.1, Qt.SolidLine, Qt.RoundCap))
+            painter.drawPath(rain_path)
+        else:
+            for index in range(34):
+                x = (index*83.7 + math.sin(index*1.9)*19.0) % max(1.0, width)
+                y = (index*59.1 + phase*0.60) % max(1.0, height)
+                radius = 1.0 + (index%3)*0.65
+                painter.setPen(Qt.NoPen)
+                painter.setBrush(QColor(241, 248, 255, 185))
+                painter.drawEllipse(QPointF(x, y), radius, radius)
+        painter.restore()
+
+    def _paint_garden_weather_label(self, painter, width, height, scene):
+        """Show unobtrusive current-weather status and required Open-Meteo attribution."""
+        if scene.get("source") == "open-meteo":
+            city = str(scene.get("city") or "Local area").strip()
+            temperature = scene.get("temperature")
+            try:
+                temperature_text = f" · {float(temperature):.0f}°C" if math.isfinite(float(temperature)) else ""
+            except (TypeError, ValueError):
+                temperature_text = ""
+            text = f"LIVE WEATHER · {city}{temperature_text} · Open-Meteo"
+        else:
+            text = "WEATHER OFFLINE · local day/night"
+        painter.save()
+        painter.setFont(self._ui_font(7, QFont.DemiBold))
+        metrics = QFontMetricsF(painter.font())
+        label_width = min(max(205.0, metrics.horizontalAdvance(text)+22.0), max(205.0, width-24.0))
+        rect = QRectF(max(12.0, width-label_width-14.0), max(8.0, height-31.0), label_width, 21.0)
+        painter.setPen(Qt.NoPen)
+        painter.setBrush(QColor(8, 18, 32, 92 if scene["is_day"] else 142))
+        painter.drawRoundedRect(rect, 8.0, 8.0)
+        painter.setPen(QColor(255, 255, 255, 210 if scene["is_day"] else 225))
+        painter.drawText(rect.adjusted(9.0, 0.0, -6.0, 0.0), Qt.AlignVCenter | Qt.AlignLeft, text)
+        painter.restore()
+
+    def _paint_virtual_garden(self, painter, width, height):
+        """Paint a cached, weather-aware Garden scene with hand-reactive foreground grass."""
+        width, height = float(width), float(height)
+        if width <= 0 or height <= 0:
+            return
+        self._maybe_refresh_garden_weather()
+        scene = self._garden_scene_state()
+        cache_key = (
+            int(round(width)), int(round(height)), bool(scene["is_day"]),
+            round(float(scene["progress"]), 2), round(float(scene.get("night_progress", 0.0)), 2),
+            round(float(scene["solar_factor"]), 2), scene["kind"], int(float(scene["cloud_cover"])//8),
+        )
+        background = self._garden_background_cache
+        if background is None or background.isNull() or self._garden_background_cache_key != cache_key:
+            background = QImage(max(1, int(round(width))), max(1, int(round(height))),
+                                QImage.Format.Format_ARGB32_Premultiplied)
+            background.fill(QColor(7, 15, 35))
+            background_painter = QPainter(background)
+            try:
+                self._paint_virtual_garden_background(background_painter, width, height, scene)
+            finally:
+                background_painter.end()
+            self._garden_background_cache = background
+            self._garden_background_cache_key = cache_key
+        painter.save()
+        painter.setRenderHint(QPainter.Antialiasing, False)
+        painter.drawImage(QPointF(0, 0), background)
+        self._paint_garden_weather_effects(painter, width, height, scene)
+        self._paint_garden_grass(painter, width, height, scene)
+        self._paint_garden_weather_label(painter, width, height, scene)
+        painter.restore()
+
     def _save_virtual_desktop_data(self):
         self.virtual_desktop_data = {
             "background": {
                 "grid_enabled": bool(self.virtual_grid_enabled),
+                "garden_mode": bool(self.virtual_garden_mode),
                 "style": int(self.virtual_background_style),
                 "brightness": float(self.virtual_grid_brightness),
                 "glow": float(self.virtual_grid_glow),
@@ -2424,7 +2888,8 @@ class SpatialDesktop(QWidget):
         """Colour/eraser palette positioned directly above the Pen dock item."""
         pen = self._virtual_dock_geometry()["pen"]
         cell, gap, margin = 29.0, 7.0, 12.0
-        count = len(VIRTUAL_PEN_PALETTE)+2
+        # Palette items: seven colours, eraser, pointer and Clear Canvas.
+        count = len(VIRTUAL_PEN_PALETTE)+3
         width = margin*2 + count*cell + (count-1)*gap
         height = 54.0
         left = min(max(8.0, pen.center().x()-width*0.5), max(8.0, self.width()-width-8.0))
@@ -2438,10 +2903,12 @@ class SpatialDesktop(QWidget):
         items["eraser"] = QRectF(eraser_x, top+12.0, cell, cell)
         pointer_x = eraser_x+(cell+gap)
         items["pointer"] = QRectF(pointer_x, top+12.0, cell, cell)
+        clear_x = pointer_x+(cell+gap)
+        items["clear"] = QRectF(clear_x, top+12.0, cell, cell)
         return {"panel": panel, "items": items}
 
     def _virtual_pen_ui_contains(self, point):
-        if point is None:
+        if point is None or getattr(self, "virtual_garden_mode", False):
             return False
         dock = self._virtual_dock_geometry()["dock"]
         if dock.contains(point):
@@ -2452,7 +2919,7 @@ class SpatialDesktop(QWidget):
 
     def _handle_virtual_dock_click(self, point):
         """Handle hand clicks on the Virtual apps dock and Pen palette."""
-        if point is None or self.desktop_mode != "virtual":
+        if point is None or self.desktop_mode != "virtual" or self.virtual_garden_mode:
             return False
         # The glass menu is modal, but this handler runs only after its own hit tests.
         if self.menu_open and self.hub_visible:
@@ -2471,6 +2938,20 @@ class SpatialDesktop(QWidget):
                         self.virtual_pen_active = False
                         self.virtual_pen_erase = False
                         self.status = "Virtual pen disabled — normal gestures restored"
+                    elif name == "clear":
+                        active_stroke = self.virtual_pen_active_stroke
+                        if active_stroke is not None:
+                            active_side = active_stroke.get("side")
+                            self.active_push_sides.discard(active_side)
+                            if self.gesture_owner == active_side:
+                                self.gesture_owner = None
+                        self.virtual_pen_active_stroke = None
+                        self.virtual_canvas_strokes = []
+                        self.virtual_canvas_layer = None
+                        self.virtual_canvas_layer_size = None
+                        self.virtual_canvas_layer_dirty = True
+                        self._save_virtual_desktop_data()
+                        self.status = "Virtual canvas cleared"
                     else:
                         color = next(color for label, color in VIRTUAL_PEN_PALETTE
                                      if label.lower() == name)
@@ -2483,6 +2964,11 @@ class SpatialDesktop(QWidget):
                     return True
         geometry = self._virtual_dock_geometry()
         if geometry["pen"].contains(point):
+            if self.virtual_garden_mode:
+                self.virtual_pen_popup_open = False
+                self.status = "Pen drawing is available in Grid mode; switch off Garden Mode in Settings → Virtual"
+                self.update()
+                return True
             self.virtual_pen_popup_open = not self.virtual_pen_popup_open
             self.status = "Choose a pen colour or eraser" if self.virtual_pen_popup_open else "Pen palette closed"
             self.update()
@@ -2616,8 +3102,8 @@ class SpatialDesktop(QWidget):
             self.action_stop_wait_open[side] = True
             self.action_stop_open_since[side] = None
             return True
-        if (self.desktop_mode != "virtual" or not self.virtual_pen_active or
-                (self.menu_open and self.hub_visible) or self.settings_open or
+        if (self.desktop_mode != "virtual" or getattr(self, "virtual_garden_mode", False) or
+                not self.virtual_pen_active or (self.menu_open and self.hub_visible) or self.settings_open or
                 self.floating_clipboard_visible or not is_pinch or
                 self._virtual_pen_ui_contains(cursor)):
             return False
@@ -2638,7 +3124,8 @@ class SpatialDesktop(QWidget):
 
     def _paint_virtual_app_dock(self, painter):
         """Draw the bottom Virtual Apps dock and its Pen colour/eraser popup."""
-        if self.desktop_mode != "virtual" or (self.menu_open and self.hub_visible) or self.settings_open:
+        if (self.desktop_mode != "virtual" or self.virtual_garden_mode or
+                (self.menu_open and self.hub_visible) or self.settings_open):
             return
         geometry = self._virtual_dock_geometry()
         dock, pen = geometry["dock"], geometry["pen"]
@@ -2658,11 +3145,13 @@ class SpatialDesktop(QWidget):
         painter.drawText(QRectF(dock.left()+12, dock.top()+7, 86, 16), Qt.AlignLeft | Qt.AlignVCenter, "VIRTUAL APPS")
         painter.setPen(QPen(QColor(120, 205, 222, 100), 1.0))
         painter.drawLine(QPointF(dock.left()+101, dock.top()+11), QPointF(dock.left()+101, dock.bottom()-11))
-        active_fill = QColor(49, 139, 158, 235) if self.virtual_pen_active else QColor(14, 42, 59, 235)
+        active_fill = (QColor(49, 139, 158, 235) if self.virtual_pen_active and not self.virtual_garden_mode
+                       else QColor(42, 53, 61, 220) if self.virtual_garden_mode
+                       else QColor(14, 42, 59, 235))
         painter.setBrush(QBrush(active_fill))
         painter.setPen(QPen(QColor(103, 226, 245, 235), 1.4))
         painter.drawRoundedRect(pen, 12, 12)
-        if self.virtual_pen_active:
+        if self.virtual_pen_active and not self.virtual_garden_mode:
             painter.setPen(QPen(QColor(115, 255, 245, 70), 5.0))
             painter.setBrush(Qt.NoBrush)
             painter.drawRoundedRect(pen.adjusted(-2, -2, 2, 2), 13, 13)
@@ -2681,9 +3170,10 @@ class SpatialDesktop(QWidget):
         painter.setPen(QColor(235, 250, 255))
         painter.setFont(self._ui_font(9, QFont.DemiBold))
         painter.drawText(QRectF(pen.right()+9, pen.top()+3, 90, pen.height()-6), Qt.AlignLeft | Qt.AlignVCenter,
-                         "PEN" if not self.virtual_pen_active else ("ERASER" if self.virtual_pen_erase else "PEN ACTIVE"))
+                         ("PEN" if not self.virtual_pen_active else
+                          ("ERASER" if self.virtual_pen_erase else "PEN ACTIVE")))
 
-        if self.virtual_pen_popup_open:
+        if self.virtual_pen_popup_open and not self.virtual_garden_mode:
             popup = self._virtual_pen_popup_geometry()
             panel = popup["panel"]
             painter.setPen(Qt.NoPen)
@@ -2703,6 +3193,17 @@ class SpatialDesktop(QWidget):
                     painter.drawRoundedRect(rect, 7, 7)
                     painter.setPen(QPen(QColor(255, 240, 240), 2.2, Qt.SolidLine, Qt.RoundCap))
                     painter.drawLine(QPointF(rect.left()+7, rect.bottom()-8), QPointF(rect.right()-7, rect.top()+8))
+                elif name == "clear":
+                    painter.setBrush(QBrush(QColor(156, 43, 53, 240)))
+                    painter.setPen(QPen(QColor(255, 125, 132, 240), 1.2))
+                    painter.drawRoundedRect(rect, 7, 7)
+                    painter.setPen(QPen(QColor(255, 244, 244), 2.2, Qt.SolidLine, Qt.RoundCap))
+                    # Bin body, lid and handle.
+                    painter.drawLine(QPointF(rect.left()+9, rect.top()+12), QPointF(rect.right()-9, rect.top()+12))
+                    painter.drawLine(QPointF(rect.left()+12, rect.top()+14), QPointF(rect.left()+13, rect.bottom()-7))
+                    painter.drawLine(QPointF(rect.right()-12, rect.top()+14), QPointF(rect.right()-13, rect.bottom()-7))
+                    painter.drawLine(QPointF(rect.left()+13, rect.bottom()-7), QPointF(rect.right()-13, rect.bottom()-7))
+                    painter.drawLine(QPointF(rect.center().x()-3, rect.top()+9), QPointF(rect.center().x()+3, rect.top()+9))
                 elif name == "pointer":
                     selected = not self.virtual_pen_active
                     painter.setBrush(QBrush(QColor(45, 115, 139, 235) if selected else QColor(46, 57, 70, 235)))
@@ -2899,6 +3400,7 @@ class SpatialDesktop(QWidget):
             texts["about"] = (L, y, 2*W+(R-(L+W)), 44.0)
             y += 44.0 + gap
         elif page == "virtual":
+            stack("virtual_garden_toggle")
             stack("virtual_grid_toggle")
             stack("virtual_background_style")
             texts["help"] = (L, y, W, 58.0)
@@ -5038,7 +5540,19 @@ class SpatialDesktop(QWidget):
                 return
 
             if self.settings_page == "virtual":
-                if pressed("virtual_grid_toggle"):
+                if pressed("virtual_garden_toggle"):
+                    self.virtual_garden_mode = not self.virtual_garden_mode
+                    if self.virtual_garden_mode:
+                        self._finish_virtual_pen_stroke()
+                        self.virtual_pen_active = False
+                        self.virtual_pen_erase = False
+                        self.virtual_pen_popup_open = False
+                    self._glass_virtual_backdrop = None
+                    self._glass_virtual_backdrop_size = None
+                    self._schedule_virtual_desktop_save()
+                    self.status = "Garden Mode enabled" if self.virtual_garden_mode else "Garden Mode disabled — Grid restored"
+                    self.update()
+                elif pressed("virtual_grid_toggle"):
                     self.virtual_grid_enabled = not self.virtual_grid_enabled
                     self._glass_virtual_backdrop = None
                     self._glass_virtual_backdrop_size = None
@@ -12266,9 +12780,12 @@ try {
         notification_stack_offsets = {}
         if self.desktop_mode == "virtual":
             self._paint_virtual_background(painter, width, height)
-            canvas_layer = self._ensure_virtual_canvas_layer()
-            if canvas_layer is not None and not canvas_layer.isNull():
-                painter.drawImage(QPointF(0, 0), canvas_layer)
+            # Garden is its own scene: keep the saved grid canvas hidden, not layered
+            # beneath the garden. Returning to Grid mode reveals those strokes again.
+            if not self.virtual_garden_mode:
+                canvas_layer = self._ensure_virtual_canvas_layer()
+                if canvas_layer is not None and not canvas_layer.isNull():
+                    painter.drawImage(QPointF(0, 0), canvas_layer)
             self._paint_virtual_app_dock(painter)
             active_stroke = self.virtual_pen_active_stroke
             if active_stroke is not None and active_stroke.get("points"):
@@ -12672,6 +13189,17 @@ try {
                                 label, base_size=label_size, min_size=6, inset=2)
 
                     elif self.settings_page == "virtual":
+                        garden_button = controls["virtual_garden_toggle"]
+                        garden_fill = QColor(55, 145, 82, 235) if self.virtual_garden_mode else QColor(75, 80, 89, 205)
+                        garden_edge = QColor(155, 245, 180, 230) if self.virtual_garden_mode else QColor(155, 162, 172, 200)
+                        painter.setBrush(QBrush(garden_fill))
+                        painter.setPen(QPen(garden_edge, 1.5*scale))
+                        painter.drawRoundedRect(garden_button, 10*scale, 10*scale)
+                        painter.setPen(QColor(240, 255, 245) if self.virtual_garden_mode else QColor(225, 238, 242))
+                        self._draw_fitted_button_label(
+                            painter, garden_button, "GARDEN MODE  ·  "+("ON" if self.virtual_garden_mode else "OFF"),
+                            base_size=label_size, min_size=6, inset=12*scale)
+
                         grid_button = controls["virtual_grid_toggle"]
                         grid_fill = QColor(55, 145, 82, 225) if self.virtual_grid_enabled else QColor(75, 80, 89, 205)
                         grid_edge = QColor(155, 245, 180, 220) if self.virtual_grid_enabled else QColor(155, 162, 172, 200)
@@ -12695,7 +13223,7 @@ try {
                         painter.setPen(QColor(185, 225, 235))
                         self._draw_wrapped_fitted_text(
                             painter, text_rects["help"],
-                            "Adjust the glowing grid with the sliders. Drawings made with the Virtual Pen are saved between sessions.",
+                            "Garden is a separate, dock-free scene with a time-aware sun/moon and live weather. Weather uses an approximate network location only while Garden Mode is active and refreshes every 15 minutes via Open-Meteo. Offline, local time still drives day/night; turn Garden off to restore the grid and saved drawings.",
                             base_size=max(7, int(8*scale)), min_size=6,
                             align=Qt.AlignLeft | Qt.AlignTop)
 
