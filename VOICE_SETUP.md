@@ -86,7 +86,7 @@ The PC command router is deterministic and offline. It handles exact phrase alia
 | `minimize window`, `maximize window`, `restore window` | Control the external active window |
 | `switch window`, `show desktop`, `snap window left/right` | Window management shortcuts |
 | `open file explorer`, `open downloads`, `open documents`, `open pictures`, `open videos`, `open music folder` | Open common user folders |
-| `new folder`, `new tab`, `close tab`, `go back`, `go forward`, `go up`, `refresh` | File-browser/browser navigation shortcuts |
+| `create new folder`, `create new text file`, `create new powerpoint`, `new tab`, `close tab`, `go back`, `go forward`, `go up`, `refresh` | File-browser/browser navigation shortcuts |
 | `rename selected`, `delete selected` | Standard rename/delete actions in apps that support them |
 | `open notepad`, `open calculator`, `open user folder` | Launch app or open home folder |
 
@@ -104,7 +104,7 @@ The command router is deterministic and offline. It is evaluated before search d
 - **Media:** `play pause`, `next track`, `previous track`, `volume up`, `volume down`, `mute`, `unmute`.
 - **Windows:** `minimize window`, `maximize window`, `restore window`, `switch window`, `show desktop`, `snap window left`, `snap window right`, `close window`.
 - **Folders/apps:** `open file explorer`, `open user folder`, `open downloads`, `open documents`, `open desktop folder`, `open pictures`, `open videos`, `open music folder`, `open notepad`, `open calculator`.
-- **Navigation:** `new folder`, `new tab`, `close tab`, `go back`, `go forward`, `go up`, `refresh`, `rename selected`, `delete selected`.
+- **Navigation:** `create new folder`, `create new text file`, `create new powerpoint`, `new tab`, `close tab`, `go back`, `go forward`, `go up`, `refresh`, `rename selected`, `delete selected`.
 
 `paste here` restores the last external application, clicks at the TLI and presses Paste. Use OS Desktop mode. Always inspect the target before saying `delete selected`; it sends the normal Delete key. On Linux, media controls use `playerctl` and `pactl` when installed. Voice commands execute locally without an LLM.
 
@@ -136,3 +136,24 @@ Open **Settings → Engine → Open StreamTTS Config** to launch the standalone 
 ## StreamTTS voice configuration
 
 Open Settings → Voice → **OPEN STREAMTTS CONFIG** to access the full StreamTTS voice controls: the complete bundled Piper/VITS voice catalog, installed operating-system voices (when `pyttsx3` is available), downloading another model by ID, importing a local model folder, speech rate, pitch shift, streaming mode, voice test, and saving settings. Changes to voice, pitch, and streaming mode are read by Spatial Desktop at startup; restart Spatial Desktop after saving. Missing neural voice models can be downloaded with **Apply selected voice** or on first speech use.
+
+
+## Voice-driven file navigation and selection
+
+With Voice Input enabled, the file-navigation commands can operate on the active file manager:
+
+| Say | Action |
+|---|---|
+| `open my computer` / `open this PC` | Open the system's computer/drives view (This PC on Windows; filesystem root on Linux/macOS) |
+| `go to C drive` / `open D drive` | Open that drive in Windows File Explorer |
+| `open Agents folder` / `go to Agents folder` | Open or navigate into a named folder in the current file manager |
+| `open report.docx` | Open a named file from the current folder |
+| `select the Agents folder` | Select a named folder without opening it |
+| `select report.docx and notes.pdf` | Select multiple named items as one multi-selection |
+| `select all files` | Select files in the current Windows File Explorer folder, excluding folders |
+| `select all folders` | Select folders in the current Windows File Explorer folder, excluding files |
+| `select all files and folders` | Select every item in the current folder |
+
+On Windows, named-item selection uses Windows Shell automation against the active File Explorer folder. Names are matched case-insensitively; if a filename extension is omitted, a unique basename match is allowed. When names are ambiguous, say the full filename or specify `file`/`folder`. For named item and type-filtered selection commands, keep the target File Explorer folder active. `open my computer` and drive navigation can be used from elsewhere.
+
+On macOS, Finder name selection/opening uses AppleScript. On Linux, named selection is best-effort using X11 type-ahead via `xdotool`, and support for filtering only files versus folders depends on the file manager; Wayland sessions or file managers without type-ahead support may not support those operations. These voice commands are local and rule-based.

@@ -10,6 +10,7 @@ from __future__ import annotations
 import sys
 import os
 import json
+import base64
 import time
 import math
 import threading
@@ -75,7 +76,7 @@ from custom_gestures import (
     load_custom_gestures, save_custom_gestures, pyautogui_key_combo, display_key_combo,
     WindowsShortcutCapture,
 )
-from voice_pc_commands import match_pc_command, aliases_for_help
+from voice_pc_commands import match_pc_command, aliases_for_help, parse_navigation_command, is_navigation_intent, has_explicit_create_prefix
 from voice_assistant_commands import live_answer, file_query
 from d1_decision import (classify_voice_command, start_loading as start_d1_loading,
                          selected_model as selected_d1_model, select_model as select_d1_model,
@@ -2249,6 +2250,15 @@ class SpatialDesktop(QWidget):
         return QRectF(cx-175.0*scale, cy+(panel_height*0.5-54.0)*scale,
                       350.0*scale, 36.0*scale)
 
+    def _main_menu_exit_rect(self, cx=None, cy=None, scale=None):
+        """Wide EXIT button at the top of the main glass menu, above its tiles."""
+        cx = self.hub_pos.x()*self.width() if cx is None else cx
+        cy = self.hub_pos.y()*self.height() if cy is None else cy
+        scale = self.menu_ui_scale() if scale is None else scale
+        _panel_width, panel_height = self._menu_panel_dimensions()
+        return QRectF(cx-175.0*scale, cy+(18.0-panel_height*0.5)*scale,
+                      350.0*scale, 36.0*scale)
+
     def _tli_calibration_button_rects(self, cx=None, cy=None, scale=None):
         """Left/right TLI calibration buttons, taken from the shared Hands-page layout."""
         rects = self._settings_control_rects(cx, cy, scale, page="hands")
@@ -4328,6 +4338,10 @@ class SpatialDesktop(QWidget):
                     self._set_menu_open(False, now, reset_settings=True)
                     self.status = "Glass menu hidden"
                     return
+                if self._main_menu_exit_rect(cx, cy, scale).contains(point):
+                    self.status = "Exiting Freehand: Spatial Computing"
+                    self.close()
+                    return
                 tiles = [
                     (QRectF(cx-166*scale, cy-145*scale, 100*scale, 88*scale), "desktop"),
                     (QRectF(cx-50*scale, cy-145*scale, 100*scale, 88*scale), "gesture_map"),
@@ -5378,7 +5392,11 @@ class SpatialDesktop(QWidget):
         if sys.platform.startswith("win") and target:
             try:
                 user32 = ctypes.windll.user32
-                user32.ShowWindow(wintypes.HWND(target), 9)  # SW_RESTORE
+                # Restore only a minimised target. SW_RESTORE also unmaximises a
+                # maximised Explorer window, which unexpectedly shrinks it for every
+                # voice navigation/selection command.
+                if user32.IsIconic(wintypes.HWND(target)):
+                    user32.ShowWindow(wintypes.HWND(target), 9)  # SW_RESTORE
                 user32.SetForegroundWindow(wintypes.HWND(target))
                 self.last_external_foreground_hwnd = int(target)
                 time.sleep(0.045)
@@ -5643,6 +5661,278 @@ class SpatialDesktop(QWidget):
             pass
         return False
 
+    def _run_windows_explorer_navigation(self, command):
+        """Use Shell automation to select/open items in the remembered Explorer view."""
+        self._remember_external_foreground_window(force=True)
+        hwnd = int(getattr(self, "last_external_foreground_hwnd", 0) or 0)
+        if not hwnd or not self._focus_external_target(close_search=True):
+            return False, "Open File Explorer to the folder you want to control, then repeat the command."
+        hwnd = int(getattr(self, "last_external_foreground_hwnd", 0) or hwnd)
+        payload = dict(command)
+        payload["hwnd"] = hwnd
+        payload_data = base64.b64encode(json.dumps(payload, ensure_ascii=True).encode("utf-8")).decode("ascii")
+        script = r"""$ErrorActionPreference = 'Stop'
+try {
+  $payload = [System.Text.Encoding]::UTF8.GetString([System.Convert]::FromBase64String('__PAYLOAD__')) | ConvertFrom-Json
+  $shell = New-Object -ComObject Shell.Application
+  $view = $null
+  foreach ($candidate in $shell.Windows()) {
+    try {
+      if ([Int64]$candidate.HWND -eq [Int64]$payload.hwnd -and $candidate.Document -and $candidate.Document.Folder) {
+        $view = $candidate
+        break
+      }
+    } catch { }
+  }
+  if ($null -eq $view) { throw 'The active external window is not a File Explorer folder. Open the target folder in File Explorer and try again.' }
+  $document = $view.Document
+  $items = @($document.Folder.Items())
+
+  function Test-ItemKind($item, $kind) {
+    if (-not $kind -or $kind -eq 'all') { return $true }
+    $isFolder = [bool]$item.IsFolder
+    if ($kind -eq 'folder') { return $isFolder }
+    if ($kind -eq 'file') { return (-not $isFolder) }
+    return $true
+  }
+  function Normalize-SpokenItemName($value) {
+    # People naturally omit punctuation while speaking names like llama.cpp,
+    # my-folder, or my_folder. Strip separators only for the fallback match.
+    return [regex]::Replace(([string]$value).ToLowerInvariant(), '[^\p{L}\p{N}]', '')
+  }
+  function Find-SpokenItem($name, $kind) {
+    $foundItems = @($items | Where-Object { ([string]$_.Name).Equals([string]$name, [System.StringComparison]::OrdinalIgnoreCase) -and (Test-ItemKind $_ $kind) })
+    if ($foundItems.Count -eq 0 -and -not ([string]$name).Contains('.')) {
+      $foundItems = @($items | Where-Object {
+        ([System.IO.Path]::GetFileNameWithoutExtension([string]$_.Name)).Equals([string]$name, [System.StringComparison]::OrdinalIgnoreCase) -and (Test-ItemKind $_ $kind)
+      })
+    }
+    if ($foundItems.Count -eq 0) {
+      $spokenKey = Normalize-SpokenItemName $name
+      if ($spokenKey.Length -gt 0) {
+        $foundItems = @($items | Where-Object {
+          (Normalize-SpokenItemName $_.Name) -eq $spokenKey -and (Test-ItemKind $_ $kind)
+        })
+      }
+    }
+    if ($foundItems.Count -eq 0) { throw ("No matching item named '{0}' was found in the current folder." -f $name) }
+    if ($foundItems.Count -gt 1) { throw ("More than one item matches '{0}'. Say its full filename or specify file/folder." -f $name) }
+    return $foundItems[0]
+  }
+
+  switch ([string]$payload.action) {
+    'select_all_kind' {
+      $selected = @($items | Where-Object { Test-ItemKind $_ ([string]$payload.kind) })
+      if ($selected.Count -eq 0) { throw ("There are no {0} to select in this folder." -f $payload.kind) }
+      $first = $true
+      foreach ($item in $selected) {
+        $flags = 1
+        if ($first) { $flags = 29 }
+        $document.SelectItem($item, $flags)
+        $first = $false
+      }
+      [Console]::Out.WriteLine(('Selected {0} {1}.' -f $selected.Count, $payload.kind))
+    }
+    'select_items' {
+      $selected = @()
+      foreach ($name in $payload.names) { $selected += Find-SpokenItem ([string]$name) ([string]$payload.kind) }
+      $first = $true
+      foreach ($item in $selected) {
+        $flags = 1
+        if ($first) { $flags = 29 }
+        $document.SelectItem($item, $flags)
+        $first = $false
+      }
+      [Console]::Out.WriteLine(('Selected {0} item(s).' -f $selected.Count))
+    }
+    'open_item' {
+      $item = Find-SpokenItem ([string]$payload.name) ([string]$payload.kind)
+      if ([bool]$item.IsFolder) {
+        try { $view.Navigate2([string]$item.Path) } catch { $view.Navigate([string]$item.Path) }
+      } else {
+        Start-Process -FilePath ([string]$item.Path)
+      }
+      [Console]::Out.WriteLine(('Opened {0}.' -f $item.Name))
+    }
+    'navigate_item' {
+      $item = Find-SpokenItem ([string]$payload.name) 'folder'
+      if (-not [bool]$item.IsFolder) { throw ("'{0}' is not a folder." -f $item.Name) }
+      try { $view.Navigate2([string]$item.Path) } catch { $view.Navigate([string]$item.Path) }
+      [Console]::Out.WriteLine(('Navigating to {0}.' -f $item.Name))
+    }
+    'create_item' {
+      $directory = [string]$document.Folder.Self.Path
+      if (-not (Test-Path -LiteralPath $directory -PathType Container)) { throw 'The active location is not a file-system folder.' }
+      $kind = [string]$payload.kind
+      if ($kind -eq 'folder') {
+        $base = 'New folder'
+        $target = Join-Path $directory $base
+        $index = 2
+        while (Test-Path -LiteralPath $target) { $target = Join-Path $directory (('{0} ({1})' -f $base, $index)); $index++ }
+        New-Item -ItemType Directory -Path $target -ErrorAction Stop | Out-Null
+        [Console]::Out.WriteLine(('Created folder {0}.' -f [System.IO.Path]::GetFileName($target)))
+      } elseif ($kind -eq 'text') {
+        $base = 'New Text Document'
+        $target = Join-Path $directory ($base + '.txt')
+        $index = 2
+        while (Test-Path -LiteralPath $target) { $target = Join-Path $directory (('{0} ({1}).txt' -f $base, $index)); $index++ }
+        [System.IO.File]::WriteAllText($target, '')
+        [Console]::Out.WriteLine(('Created text file {0}.' -f [System.IO.Path]::GetFileName($target)))
+        Start-Process -FilePath $target
+      } elseif ($kind -eq 'powerpoint') {
+        $base = 'Presentation'
+        $target = Join-Path $directory ($base + '.pptx')
+        $index = 2
+        while (Test-Path -LiteralPath $target) { $target = Join-Path $directory (('{0} ({1}).pptx' -f $base, $index)); $index++ }
+        $powerPoint = $null
+        $presentation = $null
+        try {
+          $powerPoint = New-Object -ComObject PowerPoint.Application
+          $presentation = $powerPoint.Presentations.Add()
+          $presentation.SaveAs($target, 24)
+          $presentation.Close()
+          $powerPoint.Quit()
+          [Console]::Out.WriteLine(('Created PowerPoint presentation {0}.' -f [System.IO.Path]::GetFileName($target)))
+          Start-Process -FilePath $target
+        } catch {
+          try { if ($presentation) { $presentation.Close() } } catch { }
+          try { if ($powerPoint) { $powerPoint.Quit() } } catch { }
+          throw 'PowerPoint could not create a presentation. Check that Microsoft PowerPoint is installed.'
+        }
+      } else { throw 'Unsupported new-item type.' }
+    }
+    default { throw 'Unsupported file-navigation command.' }
+  }
+} catch {
+  [Console]::Error.WriteLine($_.Exception.Message)
+  exit 1
+}
+""".replace("__PAYLOAD__", payload_data)
+        encoded = base64.b64encode(script.encode("utf-16le")).decode("ascii")
+        try:
+            result = subprocess.run(
+                ["powershell.exe", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-EncodedCommand", encoded],
+                capture_output=True, text=True, timeout=7.0,
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+            )
+        except FileNotFoundError:
+            return False, "PowerShell was not found; File Explorer voice navigation is unavailable."
+        except subprocess.TimeoutExpired:
+            return False, "File Explorer did not respond to the voice command in time."
+        if result.returncode == 0:
+            message = (result.stdout or "").strip().splitlines()
+            return True, message[-1] if message else "File Explorer command completed."
+        # PowerShell diagnostics can include source excerpts and invocation text.
+        # Never send raw stderr to TTS: report a short, user-facing failure instead.
+        return False, "I couldn't complete that file command. Check the item name and make sure File Explorer is open to the correct folder."
+
+    def execute_navigation_voice_command(self, command):
+        """Execute a parsed, explicit file/folder navigation command."""
+        action = command.get("action")
+        if action == "create_item" and not sys.platform.startswith("win"):
+            if command.get("kind") == "folder" and self._voice_hotkey("ctrl", "shift", "n"):
+                self.status = "Creating a new folder in the active file manager."
+                self.tts.speak(self.status)
+                return True
+            self.status = "Creating text files and PowerPoint presentations by voice is currently supported through Windows File Explorer."
+            self.tts.speak(self.status)
+            return False
+        if action == "navigate_drive":
+            if not sys.platform.startswith("win"):
+                self.status = "Drive-letter navigation is available on Windows only."
+                self.tts.speak(self.status)
+                return False
+            drive = str(command.get("drive", "C")).upper()
+            drive_path = f"{drive}:\\"
+            if not re.fullmatch(r"[A-Z]", drive) or not os.path.isdir(drive_path):
+                self.status = f"The {drive}: drive is not available."
+                self.tts.speak(self.status)
+                return False
+            try:
+                subprocess.Popen(["explorer.exe", drive_path])
+                self.status = f"Opening the {drive}: drive."
+                self.tts.speak(self.status)
+                return True
+            except Exception as exc:
+                self.status = f"Could not open the {drive}: drive: {exc}"
+                return False
+
+        if sys.platform.startswith("win"):
+            success, message = self._run_windows_explorer_navigation(command)
+        elif sys.platform == "darwin":
+            success, message = self._run_macos_finder_navigation(command)
+        else:
+            success, message = self._run_linux_file_manager_navigation(command)
+        self.status = message
+        if message:
+            self.tts.speak(message)
+        return success
+
+    def _run_macos_finder_navigation(self, command):
+        """Use Finder AppleScript for item selection and opening."""
+        action = command.get("action")
+        try:
+            if action == "select_all_kind":
+                kind = command.get("kind")
+                if kind == "folder":
+                    expression = "every folder of front window"
+                elif kind == "file":
+                    expression = "every file of front window"
+                else:
+                    expression = "every item of front window"
+                script = f'tell application "Finder" to set selection to {expression}'
+                subprocess.run(["osascript", "-e", script], check=True, timeout=4,
+                               stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True)
+                return True, "Selected items in Finder."
+            if action == "select_items":
+                names = command.get("names", [])
+            else:
+                names = [command.get("name", "")]
+            def apple_string(value):
+                return '"' + str(value).replace("\\", "\\\\").replace('"', '\\"') + '"'
+            if action in {"select_items", "open_item", "navigate_item"}:
+                if action == "select_items":
+                    exprs = [f'(every item of front window whose name is {apple_string(n)})' for n in names]
+                    script = 'tell application "Finder"\n set picked to {}\n' + ''.join(f' set picked to picked & {expr}\n' for expr in exprs) + ' set selection to picked\nend tell'
+                else:
+                    name = str(names[0])
+                    expr = f'(first item of front window whose name is {apple_string(name)})'
+                    script = f'tell application "Finder" to open {expr}'
+                subprocess.run(["osascript", "-e", script], check=True, timeout=4,
+                               stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True)
+                return True, "Finder command completed."
+        except Exception:
+            return False, "Finder could not find or select that item."
+        return False, "That navigation command is not supported in Finder."
+
+    def _run_linux_file_manager_navigation(self, command):
+        """Use conservative X11 type-ahead actions on desktop file managers."""
+        if not shutil.which("xdotool") or not self.last_external_window_id:
+            return False, "Named file selection on Linux requires an active X11 file manager and xdotool."
+        try:
+            subprocess.run(["xdotool", "windowactivate", "--sync", str(self.last_external_window_id)],
+                           check=True, timeout=0.75, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            action = command.get("action")
+            if action == "select_all_kind":
+                if command.get("kind") == "all":
+                    subprocess.run(["xdotool", "key", "--clearmodifiers", "ctrl+a"], check=True, timeout=1)
+                    return True, "Selected all items in the active file manager."
+                return False, "Filtering selection to files or folders needs file-manager-specific accessibility support on Linux."
+            names = command.get("names", []) if action == "select_items" else [command.get("name", "")]
+            if len(names) != 1:
+                return False, "Selecting multiple named items is supported directly in Windows File Explorer; this Linux file manager needs an accessibility adapter."
+            name = str(names[0])
+            subprocess.run(["xdotool", "key", "--clearmodifiers", "Escape"], timeout=0.5)
+            subprocess.run(["xdotool", "type", "--clearmodifiers", "--delay", "15", name], check=True, timeout=2)
+            if action in {"open_item", "navigate_item"}:
+                subprocess.run(["xdotool", "key", "Return"], check=True, timeout=1)
+                return True, f"Opening {name}."
+            if action == "select_items":
+                return True, f"Requested selection of {name} in the active file manager."
+        except Exception:
+            return False, "The active Linux file manager did not accept the voice command."
+        return False, "That file-manager command is not supported on Linux."
+
     def execute_pc_voice_command(self, action):
         """Run a matched deterministic desktop command; no shell text is interpreted."""
         self._clear_heard_popup()
@@ -5697,6 +5987,16 @@ class SpatialDesktop(QWidget):
             if self._voice_hotkey("ctrl", key):
                 self.status = {"select_all": "Selected all.", "undo": "Undo.", "redo": "Redo."}[action]
             return True
+        if action in ("create_new_text_file", "create_new_powerpoint"):
+            kind = "text" if action == "create_new_text_file" else "powerpoint"
+            self.execute_navigation_voice_command({"action": "create_item", "kind": kind})
+            return True
+        if action == "new_folder":
+            if sys.platform.startswith("win"):
+                self.execute_navigation_voice_command({"action": "create_item", "kind": "folder"})
+            elif not self._voice_hotkey("ctrl", "shift", "n"):
+                self.status = "Folder creation shortcut was not accepted by the active file manager."
+            return True
         if action.startswith("media_") or action.startswith("volume_"):
             if self._media_key(action):
                 labels = {"media_play_pause": "Playback toggled.", "media_next": "Next track.",
@@ -5712,6 +6012,19 @@ class SpatialDesktop(QWidget):
             self._open_known_folder(folders[action]); return True
         if action == "open_file_explorer":
             self.open_user_folder(); return True
+        if action == "open_my_computer":
+            try:
+                if sys.platform.startswith("win"):
+                    subprocess.Popen(["explorer.exe", "shell:MyComputerFolder"])
+                elif sys.platform == "darwin":
+                    subprocess.Popen(["open", "/"])
+                else:
+                    subprocess.Popen(["xdg-open", "/"])
+                self.status = "Opening this computer's drives and locations."
+                self.tts.speak("Opening my computer.")
+            except Exception as exc:
+                self.status = f"Could not open the computer view: {exc}"
+            return True
         if action in ("open_notepad", "open_calculator"):
             try:
                 if sys.platform.startswith("win"):
@@ -5755,7 +6068,7 @@ class SpatialDesktop(QWidget):
         shortcuts = {
             "switch_window": ("alt", "tab"), "show_desktop": ("win", "d"),
             "snap_left": ("win", "left"), "snap_right": ("win", "right"),
-            "new_folder": ("ctrl", "shift", "n"), "new_tab": ("ctrl", "t"), "close_tab": ("ctrl", "w"),
+            "new_tab": ("ctrl", "t"), "close_tab": ("ctrl", "w"),
             "go_back": ("alt", "left"), "go_forward": ("alt", "right"), "go_up": ("alt", "up"),
             "refresh_window": ("ctrl", "r"), "rename_selected": ("f2",), "delete_selected": ("delete",),
         }
@@ -5996,11 +6309,26 @@ class SpatialDesktop(QWidget):
         if pc_action:
             self.execute_pc_voice_command(pc_action)
             return
+        navigation_command = parse_navigation_command(text)
+        if navigation_command:
+            self.execute_navigation_voice_command(navigation_command)
+            return
+        # A phrase that clearly asks to select/open a file, folder, or drive must
+        # never be sent to the generative assistant. That fallback can speak model
+        # output verbatim (including code) when speech recognition mangles a name.
+        if is_navigation_intent(text):
+            self._clear_heard_popup()
+            self.status = "I couldn't identify that file or folder. Try ‘select the llama.cpp folder’ or ‘open the Agents folder’."
+            return
         # d1 interprets less exact natural phrasing; its output is restricted to
         # supported action IDs and falls through on uncertainty.
         try:
             pc_action = classify_voice_command(text, aliases_for_help())
         except Exception:
+            pc_action = None
+        if pc_action in {"new_folder", "create_new_text_file", "create_new_powerpoint"} and not has_explicit_create_prefix(text):
+            # Do not let a fuzzy classifier turn a selected item named "new folder 2"
+            # (or a truncated STT phrase "new folder") into a file-creation action.
             pc_action = None
         if pc_action:
             self.execute_pc_voice_command(pc_action)
@@ -6063,8 +6391,14 @@ class SpatialDesktop(QWidget):
             self.tts.speak("Voice input is off.")
         elif low in ("what can you do", "help", "voice help"):
             self.status = "Voice commands: pause/resume tracking, search bar, copy this/copy text, paste here/paste this, show running apps, start text selection, copy image, media playback/volume, window management, file navigation, close window, open folders, stop listening"
-            self.tts.speak("You can say pause tracking, resume tracking, begin dictation, end dictation, show menu, show context, search bar, start text selection, copy this, copy text, copy image, paste here, paste this, show running apps, switch window, play pause, next track, previous track, volume up, volume down, mute, unmute, minimize window, maximize window, show desktop, open downloads, new folder, select all, undo, redo, close window, or open user folder.")
+            self.tts.speak("You can say pause tracking, resume tracking, begin dictation, end dictation, show menu, show context, search bar, start text selection, copy this, copy text, copy image, paste here, paste this, show running apps, switch window, play pause, next track, previous track, volume up, volume down, mute, unmute, minimize window, maximize window, show desktop, open downloads, create new folder, create new text file, create new powerpoint, select all, undo, redo, close window, or open user folder.")
         else:
+            # If speech recognition drops the verb and only hears an unprefixed
+            # creation phrase, never infer a destructive/creating action from it.
+            unprefixed_create = re.fullmatch(r"new (?:folder(?: \d+)?|text file|power ?point(?: presentation)?)", low)
+            if unprefixed_create:
+                self.status = "To create an item, start the command with 'create', for example 'create new folder'."
+                return
             # General conversational questions are answered by the local D1 model.
             # Do not steal ordinary dictation, search terms, or unrecognised commands.
             question_start = re.match(r"^(what|why|how|who|when|where|which|can you|could you|do you|is it|are you|tell me|explain|define)\b", low)
@@ -11014,6 +11348,34 @@ class SpatialDesktop(QWidget):
                 painter.setFont(self._ui_font(max(8, int(10*scale)), QFont.DemiBold))
                 painter.drawText(close_banner, Qt.AlignCenter, "CLOSE")
 
+                # EXIT sits at the top of the main menu and intentionally mirrors
+                # the Close button's red gradient, border, and responsive red glow.
+                exit_banner = self._main_menu_exit_rect(cx, cy, scale)
+                exit_hovered = any(
+                    point is not None and exit_banner.contains(point)
+                    for point in self.side_cursor_positions.values()
+                )
+                exit_gradient = QLinearGradient(exit_banner.topLeft(), exit_banner.bottomRight())
+                if exit_hovered:
+                    for expansion, alpha in ((7*scale, 45), (3.5*scale, 90)):
+                        painter.setPen(QPen(QColor(255, 90, 90, alpha), 3*scale))
+                        painter.setBrush(Qt.NoBrush)
+                        painter.drawRoundedRect(exit_banner.adjusted(-expansion, -expansion,
+                                                                      expansion, expansion),
+                                                12*scale+expansion, 12*scale+expansion)
+                    exit_gradient.setColorAt(0.0, QColor(255, 105, 100, 245))
+                    exit_gradient.setColorAt(1.0, QColor(215, 30, 40, 250))
+                    painter.setPen(QPen(QColor(255, 215, 210, 250), 2.0*scale))
+                else:
+                    exit_gradient.setColorAt(0.0, QColor(200, 55, 60, 215))
+                    exit_gradient.setColorAt(1.0, QColor(95, 12, 22, 235))
+                    painter.setPen(QPen(QColor(255, 150, 150, 210), 1.5*scale))
+                painter.setBrush(QBrush(exit_gradient))
+                painter.drawRoundedRect(exit_banner, 12*scale, 12*scale)
+                painter.setPen(QColor(240, 255, 255))
+                painter.setFont(self._ui_font(max(8, int(10*scale)), QFont.DemiBold))
+                painter.drawText(exit_banner, Qt.AlignCenter, "EXIT")
+
                 labels = [
                     (("OS DESKTOP" if self.desktop_mode == "virtual" else "VIRTUAL DESKTOP"), cx-116*scale, cy-101*scale, "▣"),
                     ("GESTURE MAP", cx, cy-101*scale, "✋"),
@@ -11206,7 +11568,8 @@ class SpatialDesktop(QWidget):
                             ("mute · unmute", False),
                             ("", False),
                             ("FILE / APP NAVIGATION", True),
-                            ("new folder · new tab · close tab", False),
+                            ("create new folder · create new text file", False),
+                            ("create new powerpoint · new tab · close tab", False),
                             ("go back · go forward · go up", False),
                             ("refresh · rename selected", False),
                             ("delete selected", False),
@@ -12055,6 +12418,7 @@ class SpatialDesktop(QWidget):
             press_rects = []
             if not self.settings_open:
                 press_rects.append(self._main_menu_close_rect(pcx, pcy, pscale))
+                press_rects.append(self._main_menu_exit_rect(pcx, pcy, pscale))
                 press_rects.extend([QRectF(pcx-166*pscale, pcy-145*pscale, 100*pscale, 88*pscale),
                     QRectF(pcx-50*pscale, pcy-145*pscale, 100*pscale, 88*pscale),
                     QRectF(pcx+66*pscale, pcy-145*pscale, 100*pscale, 88*pscale),

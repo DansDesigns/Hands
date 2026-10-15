@@ -50,6 +50,7 @@ _ALIASES = {
 
     # File manager / application navigation
     "open_file_explorer": ("open file explorer", "open explorer", "open files", "open file browser"),
+    "open_my_computer": ("open my computer", "show my computer", "open this pc", "show this pc", "open computer", "go to my computer", "go to this pc"),
     "open_downloads": ("open downloads", "open downloads folder"),
     "open_documents": ("open documents", "open documents folder", "open my documents", "show documents", "show my documents", "show my documents folder", "open the documents folder", "open my documents folder"),
     "open_desktop_folder": ("open desktop folder", "open desktop files"),
@@ -58,7 +59,13 @@ _ALIASES = {
     "open_music_folder": ("open music folder", "open music files"),
     "open_notepad": ("open notepad", "launch notepad"),
     "open_calculator": ("open calculator", "launch calculator"),
-    "new_folder": ("new folder", "create folder", "make folder"),
+    # Creating files/folders must be explicit: a selection name like "new folder 2"
+    # must never be misclassified as a request to create a folder.
+    "new_folder": ("create folder", "create new folder", "create a folder", "create a new folder"),
+    "create_new_text_file": ("create new text file", "create text file", "create a new text file"),
+    "create_new_powerpoint": ("create new powerpoint", "create powerpoint", "create a new powerpoint",
+                              "create new powerpoint presentation", "create powerpoint presentation",
+                              "create a new powerpoint presentation"),
     "new_tab": ("new tab", "open new tab"),
     "close_tab": ("close tab", "close this tab"),
     "go_back": ("go back", "back in folder", "back page"),
@@ -85,3 +92,156 @@ def match_pc_command(text: str) -> str | None:
 
 def aliases_for_help() -> dict[str, tuple[str, ...]]:
     return dict(_ALIASES)
+
+
+def _strip_polite_navigation_prefix(text: str) -> str:
+    """Remove common spoken politeness without changing the requested item name."""
+    result = (text or "").strip()
+    prefixes = r"(?:(?:please|could you|can you|would you|will you|hey freehand|freehand)\s+)+"
+    # Repeat because speech commonly produces variants such as "could you please select".
+    while True:
+        cleaned = re.sub(r"^" + prefixes, "", result, flags=re.IGNORECASE).strip()
+        if cleaned == result:
+            return result
+        result = cleaned
+
+
+def has_explicit_create_prefix(text: str) -> bool:
+    """Creation intents must literally start with "create" after polite prefixes."""
+    cleaned = _strip_polite_navigation_prefix(text)
+    return bool(re.match(r"^create\b", cleaned, re.IGNORECASE))
+
+
+def is_navigation_intent(text: str) -> bool:
+    """Identify file/folder/creation requests that must not reach generative TTS."""
+    raw = _strip_polite_navigation_prefix(text)
+    cleaned = normalize_transcript(raw)
+    if not cleaned:
+        return False
+
+    # Creation is always opt-in with the word "create". This guard also catches
+    # malformed/partial create requests so they cannot fall through to the AI.
+    if re.match(r"^create\b", cleaned) and re.search(
+            r"\b(?:folder|directory|file|text|powerpoint|presentation)\b", cleaned):
+        return True
+
+    if not re.match(r"^(?:select|choose|open|go to|navigate to|find)\b", cleaned):
+        return False
+    if re.search(r"\b(?:folder|directory|file|files|drive|document|documents|item|items|all)\b", cleaned):
+        return True
+
+    # File extensions and literal filename separators are reliable navigation
+    # signals even when the speaker omits punctuation such as '_' or '-'.
+    if re.search(r"(?i)\.[a-z0-9]{1,12}(?:\s|$)", raw) or re.search(r"[_-]", raw):
+        return True
+
+    # Generic one/two-word names (e.g. "select ponder") should be resolved in
+    # the active file manager, not sent to the generative assistant. Keep a few
+    # text-selection phrases out of this classification.
+    remainder = re.sub(r"^(?:select|choose|open|go to|navigate to|find)\s+", "", cleaned).strip()
+    if cleaned.startswith(("select ", "choose ")) and remainder not in {
+            "text", "text with hand", "all", "everything", "this", "that"}:
+        return bool(remainder)
+    return False
+
+
+def parse_navigation_command(text: str) -> dict | None:
+    """Parse parameterised file-manager commands while preserving item names verbatim."""
+    raw = _strip_polite_navigation_prefix(text)
+    clean = normalize_transcript(raw)
+    if not clean:
+        return None
+
+    creator = re.fullmatch(
+        r"create\s+(?:a\s+)?(?:(?:new)\s+)?(folder|directory|text\s+file|plain\s+text\s+file|"
+        r"power\s*point(?:\s+presentation)?|powerpoint(?:\s+presentation)?|presentation)",
+        clean, re.IGNORECASE)
+    if creator:
+        requested = re.sub(r"\s+", " ", creator.group(1).lower())
+        kind = "folder" if requested in {"folder", "directory"} else (
+            "text" if "text" in requested else "powerpoint")
+        return {"action": "create_item", "kind": kind}
+
+    drive = re.fullmatch(r"(?:go to|navigate to|open) ([a-z])(?: drive)?", clean)
+    if drive:
+        return {"action": "navigate_drive", "drive": drive.group(1).upper()}
+
+    if clean in {"select all files", "select every file", "select all the files"}:
+        return {"action": "select_all_kind", "kind": "file"}
+    if clean in {"select all folders", "select all directories", "select every folder", "select all the folders"}:
+        return {"action": "select_all_kind", "kind": "folder"}
+    if clean in {"select all files and folders", "select all files and directories", "select everything in this folder"}:
+        return {"action": "select_all_kind", "kind": "all"}
+
+    verb_match = re.match(r"^\s*(select|choose|open|go to|navigate to)\s+(.+?)\s*$", raw, re.IGNORECASE)
+    if not verb_match:
+        return None
+    verb = verb_match.group(1).lower()
+    remainder = verb_match.group(2).strip()
+    if not remainder:
+        return None
+
+    # Handle explicit spoken constructions like "select a folder called llama.cpp".
+    # Keep punctuation in the captured item name; dots are common in folder names.
+    named_kind = re.match(
+        r"^(?:(?:the|a|an)\s+)?(folder|directory|file|document)\s+(?:called|named)\s+(.+?)\s*[.!?]?$",
+        remainder, re.IGNORECASE)
+    if named_kind:
+        kind = "folder" if named_kind.group(1).lower() in {"folder", "directory"} else "file"
+        name = named_kind.group(2).strip().strip("\"'“”‘’")
+        if not name:
+            return None
+        if verb in {"go to", "navigate to"}:
+            return {"action": "navigate_item", "name": name, "kind": "folder"}
+        if verb == "open":
+            return {"action": "open_item", "name": name, "kind": kind}
+        return {"action": "select_items", "names": [name], "kind": kind}
+
+    # Also allow "select the folder llama.cpp" / "select folder llama.cpp".
+    leading_kind = re.match(
+        r"^(?:(?:the|a|an)\s+)?(folder|directory|file|document)\s+(.+?)\s*[.!?]?$",
+        remainder, re.IGNORECASE)
+    if leading_kind and not re.match(r"^(?:called|named)\b", leading_kind.group(2), re.IGNORECASE):
+        kind = "folder" if leading_kind.group(1).lower() in {"folder", "directory"} else "file"
+        name_part = leading_kind.group(2).strip()
+        if name_part:
+            if verb in {"go to", "navigate to"}:
+                return {"action": "navigate_item", "name": name_part.strip("\"'“”‘’"), "kind": "folder"}
+            if verb == "open":
+                return {"action": "open_item", "name": name_part.strip("\"'“”‘’"), "kind": kind}
+            return {"action": "select_items", "names": [name_part.strip("\"'“”‘’")], "kind": kind}
+
+    # Quoted names take priority, allowing multiple explicit names without splitting
+    # punctuation (or the word "and" inside a file/folder name).
+    quoted_names = re.findall(r"[\"'“‘](.+?)[\"'”’]", remainder)
+    if verb in {"select", "choose"} and len(quoted_names) >= 2:
+        names = [name.strip() for name in quoted_names if name.strip()]
+    elif verb in {"select", "choose"} and re.search(r"\s+and\s+", remainder, re.IGNORECASE) and not quoted_names:
+        names = [part.strip().strip("\"'“‘’") for part in re.split(r"\s+and\s+", remainder, flags=re.IGNORECASE) if part.strip()]
+    elif len(quoted_names) == 1:
+        names = [quoted_names[0].strip()]
+    else:
+        names = [re.sub(r"^(?:the|a|an)\s+", "", remainder.strip().strip("\"'“‘’"), flags=re.IGNORECASE)]
+
+    names = [name.strip() for name in names if name and name.strip()]
+    if not names:
+        return None
+
+    kind_hint = None
+    trailing_kind = re.search(r"\b(folder|directory|file|document)$", remainder, flags=re.IGNORECASE)
+    if trailing_kind:
+        suffix_kind = trailing_kind.group(1).lower()
+        kind_hint = "folder" if suffix_kind in {"folder", "directory"} else "file"
+
+    if not quoted_names:
+        names = [re.sub(r"\s+(?:folder|directory|file|document)$", "", name, flags=re.IGNORECASE).strip()
+                 for name in names]
+        names = [re.sub(r"^(?:the|a|an)\s+", "", name, flags=re.IGNORECASE).strip() for name in names]
+
+    if verb in {"select", "choose"}:
+        return {"action": "select_items", "names": names, "kind": kind_hint}
+    if len(names) != 1:
+        return None
+    action = "navigate_item" if verb in {"go to", "navigate to"} else "open_item"
+    return {"action": action, "name": names[0],
+            "kind": kind_hint or ("folder" if action == "navigate_item" else None)}

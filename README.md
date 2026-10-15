@@ -212,11 +212,13 @@ Windows uses media virtual keys. Linux uses `playerctl` for media when available
 ### File browser and navigation commands
 
 - `open file explorer`, `open downloads`, `open documents`, `open desktop folder`, `open pictures`, `open videos`, `open music folder`
-- `new folder`, `new tab`, `close tab`, `go back`, `go forward`, `go up`, `refresh`
+- `create new folder`, `create new text file`, `create new powerpoint`, `new tab`, `close tab`, `go back`, `go forward`, `go up`, `refresh`
 - `rename selected`, `delete selected` (standard Delete key; in Windows Explorer this normally moves the item to the Recycle Bin)
 - `open notepad`, `open calculator`, `open user folder`
 
-Some navigation shortcuts depend on the active application; e.g. `new tab` is useful in browsers and Explorer, while `new folder` is intended for a file manager. Always verify the selected target before saying `delete selected`.
+Creation commands must start with **create** so a file/folder name beginning with “new folder” is not mistaken for a creation request. Say `create new folder`, `create new text file`, or `create new powerpoint`. On Windows, text files and blank PowerPoint presentations are created in the active File Explorer folder; PowerPoint creation requires Microsoft PowerPoint to be installed.
+
+Some navigation shortcuts depend on the active application; e.g. `new tab` is useful in browsers and Explorer, while `create new folder` is intended for a file manager. Always verify the selected target before saying `delete selected`.
 
 ### Selection safety
 
@@ -237,7 +239,7 @@ The PC voice-command router is local and rule-based; it does not use a language 
 
 **Window management:** `minimize window`, `maximize window`, `restore window`, `switch window`, `show desktop`, `snap window left`, `snap window right`, `close window`.
 
-**File manager/navigation:** `open file explorer`, `open downloads`, `open documents`, `open desktop folder`, `open pictures`, `open videos`, `open music folder`, `new folder`, `new tab`, `close tab`, `go back`, `go forward`, `go up`, `refresh`, `rename selected`, `delete selected`, `open notepad`, `open calculator`, and `open user folder`.
+**File manager/navigation:** `open file explorer`, `open downloads`, `open documents`, `open desktop folder`, `open pictures`, `open videos`, `open music folder`, `create new folder`, `create new text file`, `create new powerpoint`, `new tab`, `close tab`, `go back`, `go forward`, `go up`, `refresh`, `rename selected`, `delete selected`, `open notepad`, `open calculator`, and `open user folder`.
 
 Text selection uses the app's normal mouse-drag selection, so the source application decides what text is selected. Image lasso captures the rectangular pixels between two TLI positions to the local system clipboard. `paste here` clicks the TLI location first; use it over a text insertion point or an app that accepts pasted images. Lasso and TLI paste require OS Desktop mode. Unknown phrases are not treated as commands, and a command is not sent if Windows/Linux can't safely identify an external target window.
 
