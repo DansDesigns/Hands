@@ -94,7 +94,7 @@ class V56HandOnboardingTests(unittest.TestCase):
         self.assertIn("self._collect_hand_calibration_frame(hands_by_side)", self.main)
         self.assertIn("def set_hand_overlay(self, hands, tli_points):", self.main)
         self.assertIn("def _update_tli_calibration_live_overlay", self.main)
-        self.assertIn("exact scaled/calibrated TLI point against the outlined target area", self.main)
+        self.assertIn("exact scaled/calibrated TPI point against the outlined target area", self.main)
 
     def test_proximity_and_mesh_scale_use_calibrated_palm_references(self):
         self.assertIn("proximity_thresholds(", self.main)

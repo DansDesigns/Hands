@@ -24,5 +24,6 @@ llama-server*
 *.bin
 local_search_index.sqlite3*
 tli_calibration.json
+tpi_screen_calibration.json
 hand_calibration.json
 custom_gestures.json

@@ -23,7 +23,7 @@ class TliDiameterDefaultTests(unittest.TestCase):
         self.assertIn('float(getattr(self, "tli_diameter", 30.0))', self.main)
 
     def test_settings_range_and_documentation_agree_on_30px_default(self):
-        self.assertIn('("tli_diameter", 64, self.tli_diameter, 12.0, 96.0, "TLI DIAMETER")', self.main)
+        self.assertIn('("tli_diameter", self.tli_diameter, 12.0, 96.0, "TPI DIAMETER")', self.main)
         self.assertIn('diameter=12–96px (default 30px)', self.gestures)
         self.assertIn('defaults to 30px', self.readme)
 

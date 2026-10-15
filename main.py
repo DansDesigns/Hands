@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Spatial Desktop — hand input, offline voice, local search and optional face welcome (v61).
 
-The webcam supplies hand landmarks. TLI calibration is hand-relative (not camera-depth
+The webcam supplies hand landmarks. TPI calibration is hand-relative (not camera-depth
 calibration): it stores a pinch point in a palm-local coordinate frame. Clicks, drag/scroll,
 right-click, and menu toggle are recognised by pose transitions and timed holds.
 """
@@ -85,6 +85,14 @@ from d1_decision import (classify_voice_command, start_loading as start_d1_loadi
 from search_launcher import SearchLauncherDialog
 from face_welcome import FaceWelcomeService
 from tli_calibration import encode_relative_tli, resolve_relative_tli, mean_relative_tli
+from tpi_screen_calibration import (
+    TARGET_COUNT as TPI_CALIBRATION_TARGET_COUNT, TARGET_NAMES as TPI_CALIBRATION_TARGET_NAMES,
+    TARGET_FRACTIONS as TPI_CALIBRATION_TARGET_FRACTIONS,
+    load_calibrations as load_tpi_screen_calibrations,
+    save_calibrations as save_tpi_screen_calibrations,
+    calibration_from_samples as make_tpi_screen_calibration,
+    map_point as map_tpi_screen_point,
+)
 from updater import VERSION_FILE, compare_versions, read_version, fetch_remote_version, download_update, install_update
 from windows_virtual_desktop import pin_window_on_all_virtual_desktops
 from hand_calibration import (
@@ -130,7 +138,8 @@ HAND_URL = "https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand
 VOSK_MODEL = MODELS / "vosk-model-small-en-us-0.15"
 GESTURES_FILE = ROOT / "gestures.txt"
 UI_SETTINGS_FILE = ROOT / "ui_settings.json"
-TLI_CALIBRATION_FILE = ROOT / "tli_calibration.json"
+TLI_CALIBRATION_FILE = ROOT / "tli_calibration.json"  # Legacy palm-local TLI anchor calibration
+TPI_SCREEN_CALIBRATION_FILE = ROOT / "tpi_screen_calibration.json"
 HAND_CALIBRATION_FILE = ROOT / "hand_calibration.json"
 CUSTOM_GESTURES_FILE = ROOT / "custom_gestures.json"
 NOTIFICATION_POSITIONS = ("top-left", "top-center", "top-right", "bottom-left", "bottom-center", "bottom-right")
@@ -207,7 +216,7 @@ def save_ui_preferences(values: dict) -> None:
 
 
 def load_tli_calibrations() -> dict:
-    """Load optional palm-relative TLI coordinates for each physical hand."""
+    """Load optional palm-relative TPI coordinates for each physical hand."""
     result = {"left": None, "right": None}
     try:
         supplied = json.loads(TLI_CALIBRATION_FILE.read_text(encoding="utf-8"))
@@ -251,7 +260,7 @@ def save_tli_calibrations(values: dict) -> bool:
             temporary.unlink(missing_ok=True)
         except OSError:
             pass
-        print("Could not save TLI calibration:", exc)
+        print("Could not save TPI calibration:", exc)
         return False
 
 
@@ -278,35 +287,35 @@ def save_gesture_settings(values: dict) -> None:
         "# Settings panel changes are saved here automatically; restart to apply manual edits.",
         "#",
         "# ACTIVE GESTURES — no depth calibration or forward-push activation is used.",
-        "# POINTER/TLI: saved palm-relative calibration point when calibrated; otherwise thumb/index fingertip midpoint.",
-        "# QUICK CLICK: quick fist/grip -> open OR quick thumb/index pinch -> release clicks at the starting TLI point.",
+        "# POINTER/TPI: saved palm-relative calibration point when calibrated; otherwise thumb/index fingertip midpoint.",
+        "# QUICK CLICK: quick fist/grip -> open OR quick thumb/index pinch -> release clicks at the starting TPI point.",
         "# LEFT MODIFIER: hold LEFT fist; quick RIGHT pinch/release = right-click/context menu; held RIGHT grip = drag a native window (OS) or virtual canvas/app (3D).",
         "# Modifier gestures suppress the regular Pinch Menu timer; open RIGHT hand to release a modifier drag.",
         "# DOUBLE-CLICK: two quick thumb/index pinches near the same point are snapped to one target for a native double-click.",
         "# PINCH MENU: hold thumb/index pinch continuously for pinch_buffer_seconds (default 0.8s); then the circle fills for the hold timer.",
         "# PINCH MENU: while open, a fresh pinch/grab outside the popup closes it without clicking through.",
         "# TWO-HAND PINCH ZOOM: pinch thumb to middle fingertip with BOTH hands and hold through pinch_buffer_seconds; move hands apart/together to zoom app content with Ctrl/Command+wheel.",
-        "# WINDOW RESIZE: begin the same two-hand pinch with TLIs at opposite diagonal corners of one application window; keep pinching and move the corners to resize it.",
+        "# WINDOW RESIZE: begin the same two-hand pinch with TPIs at opposite diagonal corners of one application window; keep pinching and move the corners to resize it.",
         "# FIST MOVEMENT: a moving RIGHT-only fist starts smooth vertical page scrolling without a fist timer; left fist remains the modifier, and two-fist window drag remains available.",
         "# TIMERS: Pinch Menu, two-hand thumb-middle pinch zoom, and peace-sign gestures show countdowns. Right-fist scrolling has no circle timer.",
         "# A release before 0.8s cancels that timer sequence. Quick/double pinches start a fresh buffer; after confirmation only held-pinch time counts.",
         "# A fist/grip has priority over pinch recognition; a fist alone cannot start the Pinch Menu timer.",
-        "# PEACE SIGN: hold an index+middle V-sign for 1.5 seconds to detach/reattach that hand from native OS mouse movement; glass and Pinch Menu gestures and live TLI tracking remain active.",
+        "# PEACE SIGN: hold an index+middle V-sign for 1.5 seconds to detach/reattach that hand from native OS mouse movement; glass and Pinch Menu gestures and live TPI tracking remain active.",
         "# A detached hand cannot drag-scroll; reattach it to scroll with a fist.",
         "# FIST: fingers closed AND thumb tucked in. With the thumb sticking out it is not a fist (thumbs up/down are free for custom gestures).",
-        "# TLI OVERLAP: bring both TLIs together and hold for the gesture hold time to toggle the glass menu.",
+        "# TPI OVERLAP: bring both TPIs together and hold for the gesture hold time to toggle the glass menu.",
         "# MODES: select Right-click or Scroll Window in the Pinch Menu; a timed pinch while a mode is active returns to normal.",
         "# FIST: a quick fist-open clicks. A RIGHT-only fist starts scrolling when moved vertically over page content; make both fists for the separate two-hand window drag.",
         "# SCROLL: RIGHT-only fist + deliberate vertical movement over page content starts gentle scrolling immediately; there is no right-fist circle timer.",
         "# EDGE INPUT: gesture recognition is slightly more tolerant near screen edges; skeleton joints are not individually clamped.",
         "# RELEASE COOLDOWN: one-hand fist scrolling requires a clear open hand for 0.48 seconds; other active drag/scroll actions retain the 0.20-second release. Timed pinches need a continuous 0.8-second confirmation hold.",
-        "# SLIDER SNAP: fist OR thumb/index pinch near a settings slider snaps the TLI to its knob and starts dragging; no hold timer.",
+        "# SLIDER SNAP: fist OR thumb/index pinch near a settings slider snaps the TPI to its knob and starts dragging; no hold timer.",
         "# SLIDER STABILITY: isolated large cursor jumps are ignored; a new slider cursor position must persist for three frames.",
         "# HAND DETECTION: conservative MediaPipe confidence, three consistent detections, no cached-landmark display; side-on geometry requires high confidence and depth support.",
         "# PHYSICAL SIDES: camera handedness labels are normalized at the tracker boundary before cursor priority and colour assignment.",
         "# GLASS UI: menu and Settings panels use stronger Gaussian backdrop blur, a darker frosted tint, and soft halo edges.",
         "# PINCH MENU ITEMS: RIGHT-CLICK MODE, SCROLL WINDOW, and GLASS MENU. Grab or pinch an item to activate it.",
-        "# RIGHT-CLICK MODE makes quick fist-open grabs right-click at the original TLI point.",
+        "# RIGHT-CLICK MODE makes quick fist-open grabs right-click at the original TPI point.",
         "# DRAG WINDOW: left fist + right grip drags a native window in OS mode or the virtual canvas/app in 3D mode; open the right hand to release.",
         "# NORMAL TWO-HAND DRAG: make both hands fists; keep one still and move the other. Opening either releases.",
         "# SCROLL WINDOW mode makes a held fist scroll vertically inside the target window. A timed pinch exits the mode.",
@@ -314,7 +323,7 @@ def save_gesture_settings(values: dict) -> None:
         "# All gesture recognition uses hand shape and time. Relative camera depth is not used for activation.",
         "#",
         "# SETTINGS",
-        "# hand_visual_scale: skeleton/TLI scale, 0.1 to 1.0.",
+        "# hand_visual_scale: skeleton/TPI scale, 0.1 to 1.0.",
         "# hand_contact_band_ratio: palm attraction distance beyond touch, in palm widths; 0.0 to 0.9; default 0.02.",
         "# palm_attract_acceleration: speed multiplier for the virtual hands blending toward shared contact alignment; 0.2 to 5.0x; default 0.33x.",
         "# skin_tone_darkness: 0 to 100 percent extra warm darkening of the skin-like hand mesh.",
@@ -322,8 +331,8 @@ def save_gesture_settings(values: dict) -> None:
         "# palm_width_scale: palm contour width multiplier, 0.65 to 1.80; default 1.26.",
         "# hand_render_style: skeleton (lines), flat (painted 2D hand) or 3d (rigged 3D hand mesh).",
         "# hand_skin_effect: kept for older versions; true unless hand_render_style is skeleton.",
-        "# TLI calibration: Hand Settings -> Calibrate Left/Right TLI; the live hand and transformed TLI are redrawn above the target and hit-tested at the same point.",
-        "# Each TLI calibration stores the pinch midpoint in normalized palm-local 3D coordinates in tli_calibration.json.",
+        "# TPI calibration: Hand Settings -> Calibrate Left/Right TPI; the live hand and transformed TPI are redrawn above the target and hit-tested at the same point.",
+        "# Each TPI calibration stores the pinch midpoint in normalized palm-local 3D coordinates in tli_calibration.json.",
         "# HAND ONBOARDING: on first run, extend an arm and touch below the camera, then capture a palm-facing pose and a two-hand contact pose.",
         "# Hand scale/proximity calibration is saved in hand_calibration.json and can be repeated from Settings -> Hands.",
         "# Scroll input is injected as native wheel input at the live cursor so Explorer/Office controls receive it, not a posted event to the wrong top-level window.",
@@ -336,10 +345,10 @@ def save_gesture_settings(values: dict) -> None:
         "# scroll_deadzone: grip/fist scroll dead zone around the grab point, 4 to 120 pixels; default 70.",
         "# scroll_acceleration: scroll-rate increase with distance from the drag anchor, 0.5 to 10.0x; default 0.33x.",
         "# cursor_smoothing: adaptive jitter damping, 0.0 to 0.95; default 0.90.",
-        "# tli_glow_intensity: TLI halo intensity multiplier, 0.0 to 2.5.",
-        "# tli_colour_shift_degrees: hue shift applied to both TLI colours, 0 to 360 degrees.",
-        "# tli_border_thickness: TLI outline thickness, 1.5 to 8.0 pixels.",
-        "# tli_diameter: TLI outer diameter, 12 to 96 pixels; default 30 pixels.",
+        "# tli_glow_intensity: TPI halo intensity multiplier, 0.0 to 2.5.",
+        "# tli_colour_shift_degrees: hue shift applied to both TPI colours, 0 to 360 degrees.",
+        "# tli_border_thickness: TPI outline thickness, 1.5 to 8.0 pixels.",
+        "# tli_diameter: TPI outer diameter, 12 to 96 pixels; default 30 pixels.",
         "# skeleton_line_thickness: skeleton stroke multiplier, 0.5 to 4.0; default 1.5.",
         "# click_debounce_seconds: minimum fist duration accepted as a click, 0.04 to 0.25 seconds.",
         "# default_gesture_hold_seconds: shared activation duration for peace sign, thumbs up, and Pinch Menu, 0.5 to 5.0 seconds; default 0.5.",
@@ -348,7 +357,7 @@ def save_gesture_settings(values: dict) -> None:
         "# cursor_lock_priority: right or left; selected physical hand gets first refusal for new gestures when both are visible.",
         "# Quick pinch clicks require a discrete short pulse before the 0.8s timer buffer; two quick pinches at one point form a native double-click.",
         "# Settings slider drag uses a reduced gain (0.42x) for finer control; initial pickup preserves the value.",
-        "# Default TLI colours: LEFT red, RIGHT blue. Swatches can still cycle independently.",
+        "# Default TPI colours: LEFT red, RIGHT blue. Swatches can still cycle independently.",
         f"hand_visual_scale={clamped('hand_visual_scale', 0.1, 1.0, 0.3):.2f}",
         f"hand_recognition_threshold={clamped('hand_recognition_threshold', 0.30, 0.90, 0.60):.2f}",
         f"hand_contact_band_ratio={clamped('hand_contact_band_ratio', 0.0, 0.9, 0.02):.2f}",
@@ -929,7 +938,7 @@ class UpdateCheckSignals(QObject):
 
 
 class SearchHandOverlay(QWidget):
-    """Click-through overlay that keeps hands/TLI visible above the search launcher."""
+    """Click-through overlay that keeps hands/TPI visible above the search launcher."""
     def __init__(self, owner):
         super().__init__(None)
         self.owner = owner
@@ -1249,7 +1258,7 @@ class SearchHandOverlay(QWidget):
 
 
 class TliCalibrationWindow(QWidget):
-    """Dedicated blank target for TLI calibration; gesture input is modal at the app level."""
+    """Fullscreen, nine-point TPI calibration target; hand input is modal at app level."""
     cancel_requested = Signal()
 
     def __init__(self, side):
@@ -1257,23 +1266,41 @@ class TliCalibrationWindow(QWidget):
         self.side = side
         self.progress = 0
         self.sample_count = 12
+        self.target_index = 0
         self.phase_text = "Release the pinch used to open this window"
-        self.setWindowTitle(f"{side.title()} TLI Calibration")
+        self.setWindowTitle(f"{side.title()} TPI Calibration")
         self.setWindowFlags(Qt.Window | Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint | Qt.Tool)
         self.setAttribute(Qt.WA_TranslucentBackground, True)
         self.setFocusPolicy(Qt.StrongFocus)
         self.live_overlay = {"hands": [], "tli": []}
-        self.setFixedSize(440, 330)
         screen = QApplication.primaryScreen()
-        available = screen.availableGeometry() if screen is not None else QRectF(0, 0, 1280, 800).toRect()
-        self.move(available.center().x()-self.width()//2,
-                  available.center().y()-self.height()//2)
+        geometry = screen.geometry() if screen is not None else QRectF(0, 0, 1280, 800).toRect()
+        self.setGeometry(geometry)
+        self.target_positions = [QPointF(x, y) for x, y in
+                                 ((fx * max(1, self.width()-1), fy * max(1, self.height()-1))
+                                  for fx, fy in TPI_CALIBRATION_TARGET_FRACTIONS)]
+
+    def target_local_position(self):
+        """Current target centre in fullscreen-window-local screen pixel coordinates."""
+        index = min(TPI_CALIBRATION_TARGET_COUNT-1, max(0, int(self.target_index)))
+        return QPointF(self.target_positions[index])
+
+    def target_name(self):
+        return TPI_CALIBRATION_TARGET_NAMES[min(TPI_CALIBRATION_TARGET_COUNT-1,
+                                                max(0, int(self.target_index)))]
+
+    def set_target_index(self, index):
+        self.target_index = min(TPI_CALIBRATION_TARGET_COUNT-1, max(0, int(index)))
+        self.progress = 0
+        self.update()
 
     def pinch_area_global_rect(self):
-        """The large, empty interior area that the thumb/index pinch must occupy."""
-        area = QRectF(26.0, 76.0, self.width()-52.0, self.height()-116.0)
-        top_left = self.mapToGlobal(QPoint(round(area.left()), round(area.top())))
-        return QRectF(float(top_left.x()), float(top_left.y()), area.width(), area.height())
+        """A forgiving target hit area centred on the currently highlighted point."""
+        centre = self.target_local_position()
+        radius = max(38.0, min(62.0, min(self.width(), self.height()) * 0.055))
+        global_centre = self.mapToGlobal(QPoint(round(centre.x()), round(centre.y())))
+        return QRectF(float(global_centre.x()-radius), float(global_centre.y()-radius),
+                      radius*2.0, radius*2.0)
 
     def set_phase(self, text, progress=None):
         self.phase_text = str(text)
@@ -1282,18 +1309,12 @@ class TliCalibrationWindow(QWidget):
         self.update()
 
     def set_hand_overlay(self, hands, tli_points):
-        """Paint live tracked hands above this separate topmost calibration window."""
+        """Paint live tracked hand and TPI above the calibration target."""
         self.live_overlay = {"hands": list(hands or []), "tli": list(tli_points or [])}
         self.update()
 
     def paintEvent(self, event):
-        """Paint one frame; the painter is always released, even if drawing fails.
-
-        If an exception escaped mid-frame, the QPainter stayed active on the window,
-        and every later repaint then failed ("Painter not active" / "one painter at
-        a time"), leaving stale frames stacked on screen. Re-entrant paints (possible
-        while native windows are being moved) are skipped for the same reason.
-        """
+        """Paint the fullscreen 3x3 target mesh and the live hand overlay safely."""
         if getattr(self, "_in_paint_event", False):
             return
         self._in_paint_event = True
@@ -1304,7 +1325,7 @@ class TliCalibrationWindow(QWidget):
             if not getattr(self, "_paint_error_reported", False):
                 self._paint_error_reported = True
                 import traceback
-                print("Spatial Desktop: a frame failed to paint (later failures are not repeated):")
+                print("Freehand: a calibration frame failed to paint (later failures are not repeated):")
                 traceback.print_exc()
         finally:
             painter = self._frame_painter
@@ -1314,9 +1335,6 @@ class TliCalibrationWindow(QWidget):
             self._in_paint_event = False
 
     def _paint_frame(self, _event):
-        # Native video windows can temporarily invalidate the transparent overlay surface
-        # while Windows is moving/resizing them. Skip that frame instead of issuing
-        # follow-on drawing calls against an inactive painter.
         if not self.isVisible() or self.width() <= 0 or self.height() <= 0:
             return
         painter = QPainter()
@@ -1324,46 +1342,53 @@ class TliCalibrationWindow(QWidget):
         if not painter.begin(self):
             return
         painter.setRenderHint(QPainter.Antialiasing, True)
-        whole = QRectF(self.rect()).adjusted(2, 2, -2, -2)
-        # Draw only the outline plus compact header/footer plates. The target interior
-        # stays transparent, allowing the live skeleton/skin hand overlay beneath this
-        # topmost window to remain visible while the user positions the pinch inside it.
-        painter.setPen(QPen(QColor(90, 235, 255, 245), 3.0))
-        painter.setBrush(Qt.NoBrush)
-        painter.drawRoundedRect(whole, 22, 22)
-        painter.setPen(QPen(QColor(105, 240, 255, 170), 1.0))
-        painter.setBrush(QBrush(QColor(4, 15, 31, 216)))
-        painter.drawRoundedRect(QRectF(4, 4, self.width()-8, 67), 17, 17)
-        painter.setPen(Qt.NoPen)
-        painter.setBrush(QBrush(QColor(4, 15, 31, 216)))
-        painter.drawRoundedRect(QRectF(4, self.height()-42, self.width()-8, 38), 13, 13)
-
+        active = min(TPI_CALIBRATION_TARGET_COUNT-1, max(0, int(self.target_index)))
+        # Small unobtrusive HUD plates leave the screen, app window, and hand visible.
+        hud = QRectF(self.width()*0.5-280.0, 18.0, 560.0, 76.0)
+        footer = QRectF(self.width()*0.5-280.0, self.height()-56.0, 560.0, 42.0)
+        painter.setPen(QPen(QColor(90, 235, 255, 215), 1.5))
+        painter.setBrush(QBrush(QColor(3, 14, 27, 212)))
+        painter.drawRoundedRect(hud, 18, 18)
+        painter.drawRoundedRect(footer, 14, 14)
         painter.setPen(QColor(235, 252, 255, 250))
         painter.setFont(QFont("Sans", 14, QFont.Bold))
-        painter.drawText(QRectF(24, 17, self.width()-48, 27), Qt.AlignCenter,
-                         f"{self.side.upper()} TLI CALIBRATION")
-        painter.setPen(QColor(170, 220, 235, 235))
+        painter.drawText(QRectF(hud.left()+14, hud.top()+7, hud.width()-28, 27), Qt.AlignCenter,
+                         f"{self.side.upper()} TPI CALIBRATION  ·  POINT {active+1}/9")
+        painter.setPen(QColor(180, 223, 236, 245))
         painter.setFont(QFont("Sans", 9))
-        painter.drawText(QRectF(20, 45, self.width()-40, 23), Qt.AlignCenter,
-                         "Pinch thumb + index together inside this window")
+        painter.drawText(QRectF(hud.left()+14, hud.top()+35, hud.width()-28, 25), Qt.AlignCenter,
+                         "Move the TPI onto the highlighted target, then pinch and hold steady")
 
-        # Leave the majority of the window visually blank to provide a clear target,
-        # without extra controls that can accidentally be activated by hand gestures.
-        area = QRectF(26, 76, self.width()-52, self.height()-116)
-        painter.setPen(QPen(QColor(80, 225, 245, 205), 1.8, Qt.DashLine))
+        # Show all nine positions faintly; the current target is large and unambiguous.
+        for index, point in enumerate(self.target_positions):
+            if index == active:
+                continue
+            painter.setPen(QPen(QColor(100, 232, 247, 105), 1.5))
+            painter.setBrush(QBrush(QColor(5, 30, 44, 70)))
+            painter.drawEllipse(point, 8.0, 8.0)
+        centre = self.target_local_position()
+        radius = max(38.0, min(62.0, min(self.width(), self.height()) * 0.055))
+        painter.setPen(QPen(QColor(255, 255, 255, 225), 1.6))
+        painter.setBrush(QBrush(QColor(245, 255, 255, 24)))
+        painter.drawEllipse(centre, radius, radius)
+        painter.setPen(QPen(QColor(30, 240, 255, 245), 3.0))
         painter.setBrush(Qt.NoBrush)
-        painter.drawRoundedRect(area, 14, 14)
-        # A faint target crosshair gives a visual centre without obscuring the hand.
-        target_centre = area.center()
-        painter.setPen(QPen(QColor(100, 240, 245, 105), 1.0, Qt.DotLine))
-        painter.drawLine(QPointF(target_centre.x()-17, target_centre.y()),
-                         QPointF(target_centre.x()+17, target_centre.y()))
-        painter.drawLine(QPointF(target_centre.x(), target_centre.y()-17),
-                         QPointF(target_centre.x(), target_centre.y()+17))
+        painter.drawEllipse(centre, 26.0, 26.0)
+        painter.setPen(QPen(QColor(255, 255, 255, 250), 2.0))
+        painter.drawLine(QPointF(centre.x()-13, centre.y()), QPointF(centre.x()+13, centre.y()))
+        painter.drawLine(QPointF(centre.x(), centre.y()-13), QPointF(centre.x(), centre.y()+13))
+        # Name the active point without hiding targets near the lower edge.
+        label_y = centre.y()+radius+9.0
+        if label_y+32.0 > self.height()-62.0:
+            label_y = centre.y()-radius-39.0
+        label = QRectF(centre.x()-95.0, label_y, 190.0, 30.0)
+        painter.setPen(QPen(QColor(30, 220, 242, 205), 1.0))
+        painter.setBrush(QBrush(QColor(3, 18, 32, 220)))
+        painter.drawRoundedRect(label, 10, 10)
+        painter.setPen(QColor(230, 252, 255, 250))
+        painter.setFont(QFont("Sans", 9, QFont.Bold))
+        painter.drawText(label, Qt.AlignCenter, self.target_name())
 
-        # The target is a separate topmost window, so explicitly redraw the current
-        # tracked hand inside it. This avoids the hand/TLI being hidden beneath the target
-        # border on platforms that do not composite sibling translucent windows together.
         edges = ((0,1),(1,2),(2,3),(3,4),(0,5),(5,6),(6,7),(7,8),
                  (5,9),(9,10),(10,11),(11,12),(9,13),(13,14),(14,15),(15,16),
                  (13,17),(17,18),(18,19),(19,20),(0,17),(5,9),(9,13),(13,17))
@@ -1392,9 +1417,9 @@ class TliCalibrationWindow(QWidget):
 
         painter.setPen(QColor(192, 222, 232, 230))
         painter.setFont(QFont("Sans", 8))
-        painter.drawText(QRectF(20, self.height()-33, self.width()-40, 15), Qt.AlignCenter,
+        painter.drawText(QRectF(footer.left()+10, footer.top()+2, footer.width()-20, 17), Qt.AlignCenter,
                          self.phase_text)
-        track = QRectF(82, self.height()-14, self.width()-164, 5)
+        track = QRectF(footer.left()+42, footer.top()+27, footer.width()-84, 5)
         painter.setPen(Qt.NoPen)
         painter.setBrush(QBrush(QColor(45, 82, 101, 240)))
         painter.drawRoundedRect(track, 2.5, 2.5)
@@ -1856,8 +1881,9 @@ class SpatialDesktop(QWidget):
         self.settings_page_pending = None
 
         self.hand_positions = {"left": [], "right": []}
-        self.tli_calibrations = load_tli_calibrations()
-        self.tli_calibration_persisted = {side: self.tli_calibrations.get(side) is not None
+        self.tli_calibrations = load_tli_calibrations()  # Legacy palm-local anchor calibration
+        self.tpi_screen_calibrations = load_tpi_screen_calibrations(TPI_SCREEN_CALIBRATION_FILE)
+        self.tli_calibration_persisted = {side: self.tpi_screen_calibrations.get(side) is not None
                                           for side in ("left", "right")}
         self.hand_calibration = load_hand_calibration(HAND_CALIBRATION_FILE)
         self.hand_calibration_active = False
@@ -1869,7 +1895,8 @@ class SpatialDesktop(QWidget):
         self.hand_calibration_draft = default_calibration()
         self.tli_calibration_pending = {"left": False, "right": False}
         self.tli_calibration_wait_release = {"left": False, "right": False}
-        self.tli_calibration_samples = {"left": [], "right": []}
+        self.tli_calibration_samples = {"left": [], "right": []}  # Samples for the current screen target
+        self.tpi_calibration_draft_points = {"left": [], "right": []}
         self.tli_calibration_sample_count = 12
         self.tli_calibration_active_side = None
         self.tli_calibration_window = None
@@ -2270,7 +2297,7 @@ class SpatialDesktop(QWidget):
                       350.0*scale, 36.0*scale)
 
     def _tli_calibration_button_rects(self, cx=None, cy=None, scale=None):
-        """Left/right TLI calibration buttons, taken from the shared Hands-page layout."""
+        """Left/right TPI calibration buttons, taken from the shared Hands-page layout."""
         rects = self._settings_control_rects(cx, cy, scale, page="hands")
         return {"left": rects["calibrate_left"], "right": rects["calibrate_right"]}
 
@@ -2758,10 +2785,10 @@ class SpatialDesktop(QWidget):
             ]
         if page == "tli":
             return [
-                ("tli_glow_intensity", self.tli_glow_intensity, 0.0, 2.5, "TLI GLOW INTENSITY"),
-                ("tli_colour_shift_degrees", self.tli_colour_shift_degrees, 0.0, 360.0, "TLI COLOUR / HUE"),
-                ("tli_border_thickness", self.tli_border_thickness, 1.5, 8.0, "TLI BORDER THICKNESS"),
-                ("tli_diameter", self.tli_diameter, 12.0, 96.0, "TLI DIAMETER"),
+                ("tli_glow_intensity", self.tli_glow_intensity, 0.0, 2.5, "TPI GLOW INTENSITY"),
+                ("tli_colour_shift_degrees", self.tli_colour_shift_degrees, 0.0, 360.0, "TPI COLOUR / HUE"),
+                ("tli_border_thickness", self.tli_border_thickness, 1.5, 8.0, "TPI BORDER THICKNESS"),
+                ("tli_diameter", self.tli_diameter, 12.0, 96.0, "TPI DIAMETER"),
             ]
         if page == "notifications":
             return [("detached_notice_opacity", self.detached_notice_opacity, 0.0, 100.0,
@@ -3966,7 +3993,7 @@ class SpatialDesktop(QWidget):
         rect = self._native_window_rect(hwnd) if hwnd else None
         if rect is None:
             self.fist_action[side] = None
-            self.status = "No movable window under the starting TLI"
+            self.status = "No movable window under the starting TPI"
             return
         if sys.platform.startswith("win"):
             try:
@@ -4005,7 +4032,7 @@ class SpatialDesktop(QWidget):
         self.update()
 
     def _window_has_horizontal_scrollbar(self, active, cursor=None):
-        """Best-effort check for a native horizontal scroll range under the TLI."""
+        """Best-effort check for a native horizontal scroll range under the TPI."""
         if not sys.platform.startswith("win"):
             return False
         point = cursor or active.get("last_cursor") or active.get("origin")
@@ -4091,7 +4118,7 @@ class SpatialDesktop(QWidget):
         multiplied by 120, so normal scrolling was 1/120th the intended speed.
 
         Attached scrolling follows physical-mouse behaviour: move the pointer to the
-        tracked TLI and inject a wheel event. Detached hands keep their native pointer
+        tracked TPI and inject a wheel event. Detached hands keep their native pointer
         position; on Windows, route WM_MOUSEWHEEL to the window under the tracked point
         instead. Platforms without targeted wheel-message support still scroll at the
         current OS pointer, but never reposition it from this detached gesture.
@@ -4207,7 +4234,7 @@ class SpatialDesktop(QWidget):
                 self._activate_canvas_right_click(target, side, now)
             else:
                 self._activate_canvas_right_click(QPointF(cursor), side, now)
-            self.status = "Right-click sent at the Pinch Menu selection point (original TLI)"
+            self.status = "Right-click sent at the Pinch Menu selection point (original TPI)"
         elif action == "scroll_window":
             self.right_click_mode_enabled = False
             self.scroll_mode_enabled = True
@@ -4455,14 +4482,14 @@ class SpatialDesktop(QWidget):
                 # crowded Hands-page recognition threshold and calibration controls.
                 if pressed("swatch_left"):
                     self._cycle_hand_colour("left")
-                    self.status = "Left TLI colour changed"
+                    self.status = "Left TPI colour changed"
                 elif pressed("swatch_right"):
                     self._cycle_hand_colour("right")
-                    self.status = "Right TLI colour changed"
+                    self.status = "Right TPI colour changed"
                 elif pressed("glow_toggle"):
                     self.tli_glow_enabled = not self.tli_glow_enabled
                     self.schedule_gesture_settings_save()
-                    self.status = "TLI glow enabled" if self.tli_glow_enabled else "TLI glow disabled"
+                    self.status = "TPI glow enabled" if self.tli_glow_enabled else "TPI glow disabled"
                 return
 
             if self.settings_page == "gestures":
@@ -4631,7 +4658,7 @@ class SpatialDesktop(QWidget):
         self._activate_canvas_click(click_point, side, now)
 
     def _activate_canvas_right_click(self, point, side, now):
-        """Send a right-click at the captured TLI point (used by Right-click Mode)."""
+        """Send a right-click at the captured TPI point (used by Right-click Mode)."""
         if point is None or self._canvas_menu_panel_contains(point):
             return
         if self.menu_open and self.hub_visible:
@@ -4807,7 +4834,7 @@ class SpatialDesktop(QWidget):
                     self.fist_action.get(side) in ("slider", "menu_drag", "canvas_drag"))
 
     def _cancel_side_interactions_for_tracking_pause(self, side):
-        """Stop every interaction for a disabled hand but keep its last TLI position frozen."""
+        """Stop every interaction for a disabled hand but keep its last TPI position frozen."""
         self._end_pinch_drag(side, status=False)
         self._release_fist_mouse(side)
         self._reset_fist_gesture(side, release_mouse=False)
@@ -5412,7 +5439,7 @@ class SpatialDesktop(QWidget):
         self.update()
 
     def _current_tli_global_position(self):
-        """Return the active TLI's global screen position, falling back to the OS cursor."""
+        """Return the active TPI's global screen position, falling back to the OS cursor."""
         side = self.pointer_side
         if side not in ("left", "right") or self.side_cursor_positions.get(side) is None:
             side = "right" if self.side_cursor_positions.get("right") is not None else "left"
@@ -5535,7 +5562,7 @@ class SpatialDesktop(QWidget):
 
     def _begin_voice_text_selection(self):
         if self.hand_tracking_paused:
-            self.status = "Resume hand tracking before starting a TLI text selection."
+            self.status = "Resume hand tracking before starting a TPI text selection."
             self.tts.speak(self.status)
             return False
         if self.desktop_mode != "os":
@@ -5652,7 +5679,7 @@ class SpatialDesktop(QWidget):
     def _paste_at_tli(self):
         point = self._current_tli_global_position()
         if self.desktop_mode != "os":
-            self.status = "Switch to OS Desktop mode to paste at the TLI position."
+            self.status = "Switch to OS Desktop mode to paste at the TPI position."
             self.tts.speak(self.status)
             return False
         if self.voice_selection_mode is not None:
@@ -5667,7 +5694,7 @@ class SpatialDesktop(QWidget):
             pyautogui.click(point.x(), point.y(), clicks=1, interval=0, _pause=False)
             time.sleep(0.045)
             pyautogui.hotkey("ctrl", "v", interval=0.02, _pause=False)
-            self.status = "Pasted clipboard contents at the TLI position."
+            self.status = "Pasted clipboard contents at the TPI position."
             self.tts.speak("Pasted here.")
             return True
         except Exception as exc:
@@ -6588,17 +6615,22 @@ try {
             self.tli_calibration_pending[tracked_side] = False
             self.tli_calibration_wait_release[tracked_side] = False
             self.tli_calibration_samples[tracked_side] = []
+            self.tpi_calibration_draft_points[tracked_side] = []
         self.tli_calibration_active_side = side
         self.tli_calibration_pending[side] = True
         self.tli_calibration_wait_release[side] = True
         self.tli_calibration_samples[side] = []
-        self.status = (f"{side.title()} TLI calibration — release the selecting pinch, then pinch "
-                       "inside the calibration window")
+        self.tpi_calibration_draft_points[side] = []
+        self.smoothed_side_cursor_positions[side] = None
+        self.cursor_updated_at[side] = 0.0
+        self.status = (f"{side.title()} TPI calibration — release the selecting pinch, then "
+                       "move the TPI to point 1 of 9 and pinch-hold")
 
         window = TliCalibrationWindow(side)
         window.cancel_requested.connect(self._cancel_tli_calibration)
         self.tli_calibration_window = window
-        window.set_phase("Release the pinch used to open this window")
+        window.set_target_index(0)
+        window.set_phase("Release the selecting pinch, then pinch-hold on target 1/9")
         window.show()
         window.raise_()
         window.activateWindow()
@@ -6849,6 +6881,7 @@ try {
             self.tli_calibration_pending[side] = False
             self.tli_calibration_wait_release[side] = False
             self.tli_calibration_samples[side] = []
+            self.tpi_calibration_draft_points[side] = []
         self.tli_calibration_active_side = None
         window = self.tli_calibration_window
         self.tli_calibration_window = None
@@ -6861,11 +6894,11 @@ try {
             self.action_stop_wait_open[tracked_side] = True
             self.action_stop_open_since[tracked_side] = None
         if announce:
-            self.status = "TLI calibration cancelled"
+            self.status = "TPI calibration cancelled"
         self.update()
 
     def _calibration_pinch_inside_window(self, landmarks):
-        """Test the exact scaled/calibrated TLI point against the outlined target area."""
+        """Test the exact scaled/calibrated TPI point against the outlined target area."""
         window = self.tli_calibration_window
         side = self.tli_calibration_active_side
         if window is None or not window.isVisible() or landmarks is None or len(landmarks) < 21:
@@ -6877,7 +6910,7 @@ try {
         return window.pinch_area_global_rect().contains(QPointF(float(global_point.x()), float(global_point.y())))
 
     def _update_tli_calibration_live_overlay(self, side, landmarks, cursor):
-        """Draw the currently transformed hand and TLI above the target window itself."""
+        """Draw the currently transformed hand and TPI above the target window itself."""
         window = self.tli_calibration_window
         if window is None or not window.isVisible():
             return
@@ -6899,80 +6932,121 @@ try {
         window.set_hand_overlay([(mapped_points, color)], [(local_tli, color)] if local_tli is not None else [])
 
     def _process_tli_calibration_frame(self, side, landmarks, is_pinch):
-        """Consume calibration gestures and sample only pinches physically inside the target."""
+        """Collect nine independent screen targets for one hand's TPI correction mesh."""
         active_side = self.tli_calibration_active_side
         if active_side is None:
             return False
-        # Calibration is modal: even the other hand is prevented from clicking or moving OS input.
+        # Calibration is modal: even the other hand cannot move the OS pointer or click.
         if side != active_side:
             return True
         if not self.tli_calibration_pending.get(side, False):
             return True
         window = self.tli_calibration_window
+        saved_points = self.tpi_calibration_draft_points[side]
+        target_index = len(saved_points)
         if self.tli_calibration_wait_release.get(side, False):
             if not is_pinch:
                 self.tli_calibration_wait_release[side] = False
                 self.tli_calibration_samples[side] = []
-                self.status = f"{side.title()} TLI calibration ready — pinch inside the outlined area"
                 if window is not None:
-                    window.set_phase("Pinch thumb + index together inside the outlined area")
+                    window.set_phase(
+                        f"Point {target_index+1}/9 · {TPI_CALIBRATION_TARGET_NAMES[target_index]} — move TPI to target and pinch-hold")
             elif window is not None:
-                window.set_phase("Release the pinch used to open this window")
+                phase = ("Release the selecting pinch" if target_index == 0 else
+                         f"Point {target_index}/9 saved — release, then move to the next target")
+                window.set_phase(phase, 0)
             return True
         if not is_pinch:
-            # Calibration must be one continuous, deliberate pinch, not pooled pulses.
+            # Each target needs one continuous, deliberate hold; don't pool separate pulses.
             self.tli_calibration_samples[side] = []
             if window is not None:
-                window.set_phase("Pinch and hold inside the outlined area", 0)
+                window.set_phase(f"Point {target_index+1}/9 · pinch and hold on the target", 0)
             return True
         if not self._calibration_pinch_inside_window(landmarks):
             self.tli_calibration_samples[side] = []
             if window is not None:
-                window.set_phase("Move the pinch point inside the outlined area", 0)
+                window.set_phase(f"Point {target_index+1}/9 · move the TPI into the target ring", 0)
             return True
-        sample = encode_relative_tli(landmarks)
-        if sample is None:
+        # Store raw (pre-grid-correction) TLI pixels. The active hand bypasses its old
+        # screen grid inside _scale_hand_tli_point(), making recalibration deterministic.
+        raw_anchor = self.interactive_hand_anchor(landmarks, side)
+        raw_screen = self._scale_hand_tli_point(
+            raw_anchor,
+            [(float(lm.x), float(lm.y), float(getattr(lm, "z", 0.0))) for lm in landmarks],
+            side,
+        )
+        if raw_screen is None or not all(math.isfinite(v) for v in (raw_screen.x(), raw_screen.y())):
             self.tli_calibration_samples[side] = []
             if window is not None:
-                window.set_phase("Landmarks unstable — hold the pinch steady", 0)
+                window.set_phase("Unstable TPI position — hold steady", 0)
             return True
         samples = self.tli_calibration_samples[side]
-        samples.append(sample)
+        samples.append({"x": float(raw_screen.x()), "y": float(raw_screen.y())})
         if window is not None:
             window.set_phase(
-                f"Hold steady — sampling {len(samples)}/{self.tli_calibration_sample_count}",
+                f"Point {target_index+1}/9 · sampling {len(samples)}/{self.tli_calibration_sample_count}",
                 len(samples),
             )
-        if len(samples) >= self.tli_calibration_sample_count:
-            calibration = mean_relative_tli(samples)
-            if calibration is not None:
-                self.tli_calibrations[side] = calibration
-                persisted = save_tli_calibrations(self.tli_calibrations)
-                self.tli_calibration_persisted[side] = persisted
-                self.tli_calibration_pending[side] = False
-                self.tli_calibration_wait_release[side] = False
-                self.tli_calibration_samples[side] = []
-                self.tli_calibration_active_side = None
-                self.status = (f"{side.title()} TLI calibrated and saved — palm-relative point registered"
-                               if persisted else f"{side.title()} TLI calibrated for this session, but saving failed")
-                self._cancel_tli_calibration(announce=False)
-                # _cancel_tli_calibration only closes the temporary UI; restore success status.
-                self.status = (f"{side.title()} TLI calibrated and saved — palm-relative point registered"
-                               if persisted else f"{side.title()} TLI calibrated for this session, but saving failed")
-            else:
-                self.tli_calibration_samples[side] = []
-                if window is not None:
-                    window.set_phase("Unstable sample — pinch and hold again")
-        else:
-            self.status = (f"{side.title()} TLI calibration sampling "
-                           f"{len(samples)}/{self.tli_calibration_sample_count} — keep pinching inside")
+        if len(samples) < self.tli_calibration_sample_count:
+            return True
+
+        observed = {
+            "x": sum(float(row["x"]) for row in samples) / len(samples),
+            "y": sum(float(row["y"]) for row in samples) / len(samples),
+        }
+        saved_points.append(observed)
+        self.tli_calibration_samples[side] = []
+        if len(saved_points) < TPI_CALIBRATION_TARGET_COUNT:
+            next_index = len(saved_points)
+            self.tli_calibration_wait_release[side] = True
             if window is not None:
-                window.set_phase(f"Sampling {len(samples)}/{self.tli_calibration_sample_count} — keep pinching",
-                                 len(samples))
+                window.set_target_index(next_index)
+                window.set_phase(
+                    f"Point {len(saved_points)}/9 saved — release pinch, then move to {TPI_CALIBRATION_TARGET_NAMES[next_index]}",
+                    self.tli_calibration_sample_count,
+                )
+            self.status = (f"{side.title()} TPI calibration: point {len(saved_points)}/9 saved; "
+                           f"next {TPI_CALIBRATION_TARGET_NAMES[next_index].lower()}")
+            return True
+
+        screen = QApplication.primaryScreen()
+        geometry = screen.geometry() if screen is not None else None
+        width = geometry.width() if geometry is not None else self.width()
+        height = geometry.height() if geometry is not None else self.height()
+        calibration = make_tpi_screen_calibration(saved_points, width, height)
+        if calibration is not None:
+            prior = self.tpi_screen_calibrations.get(side)
+            self.tpi_screen_calibrations[side] = calibration
+            persisted = save_tpi_screen_calibrations(
+                TPI_SCREEN_CALIBRATION_FILE, self.tpi_screen_calibrations)
+            self.tli_calibration_persisted[side] = persisted or prior is not None
+            if not persisted and prior is not None:
+                # Preserve the last valid mesh if writing the new one failed.
+                self.tpi_screen_calibrations[side] = prior
+            status = (f"{side.title()} TPI nine-point calibration saved" if persisted else
+                      f"{side.title()} TPI calibrated for this session; saving failed")
+            if not persisted and prior is not None:
+                status = f"{side.title()} TPI calibration save failed; previous calibration restored"
+            self.status = status
+            self.tli_calibration_pending[side] = False
+            self.tli_calibration_wait_release[side] = False
+            self.tpi_calibration_draft_points[side] = []
+            self.tli_calibration_active_side = None
+            self._cancel_tli_calibration(announce=False)
+            self.status = status
+        else:
+            # Do not overwrite the last good calibration with a collapsed/invalid mesh.
+            self.tpi_calibration_draft_points[side] = []
+            self.tli_calibration_samples[side] = []
+            self.tli_calibration_wait_release[side] = True
+            if window is not None:
+                window.set_target_index(0)
+                window.set_phase("Calibration mesh was unstable; start again at point 1/9", 0)
+            self.status = f"{side.title()} TPI calibration failed validation; please repeat"
         return True
 
     def raw_hand_anchor(self, landmarks, side=None):
-        """Return the calibrated palm-relative TLI or the live fingertip midpoint fallback."""
+        """Return the calibrated palm-relative TPI or the live fingertip midpoint fallback."""
         calibration = self.tli_calibrations.get(side) if side in ("left", "right") else None
         calibrated = resolve_relative_tli(landmarks, calibration)
         if calibrated is not None:
@@ -7023,7 +7097,7 @@ try {
         return QPointF(nx*max(1, screen_width-1), ny*max(1, screen_height-1))
 
     def interactive_hand_anchor(self, landmarks, side=None):
-        """Map the calibrated palm-relative TLI before the common hand-scale transform."""
+        """Map the calibrated palm-relative TPI before the common hand-scale transform."""
         return self.interactive_visual_point(*self.raw_hand_anchor(landmarks, side))
 
     # ------------------------------------------------------------------
@@ -7182,7 +7256,7 @@ try {
         self.custom_gesture_message = self.status
 
     def _custom_gesture_mouse_button(self, action, side):
-        """Press a mouse button at the gesture's TLI (midway between TLIs for overlap).
+        """Press a mouse button at the gesture's TPI (midway between TPIs for overlap).
 
         Follows the same rule as pinch clicks: a detached hand never moves or clicks the
         native pointer, and presses over the glass panel are ignored.
@@ -7240,7 +7314,7 @@ try {
             return False
 
     def _process_custom_gestures(self, hands_by_side, cursor_points, poses, now):
-        """Recognise recorded poses per hand and the two-TLI overlap; fire after a hold."""
+        """Recognise recorded poses per hand and the two-TPI overlap; fire after a hold."""
         if self.custom_gesture_recording is not None:
             self._update_custom_gesture_recording(hands_by_side, now)
             self._reset_custom_gesture_triggers()
@@ -7270,7 +7344,7 @@ try {
             if fired is not None:
                 self._run_custom_gesture_action(fired, side)
 
-        # Built-in: overlapping both TLIs (open hands, nothing else in progress) and
+        # Built-in: overlapping both TPIs (open hands, nothing else in progress) and
         # holding for the gesture hold time toggles the glass menu. A ring shows progress.
         overlapping = False
         left_point, right_point = cursor_points.get("left"), cursor_points.get("right")
@@ -7288,7 +7362,7 @@ try {
             rings["overlap"] = ("GLASS MENU", progress, max(0.0, hold*(1.0-progress)))
         if fired is not None:
             self._toggle_glass_menu_from_voice()
-            self.status = "TLI overlap → glass menu " + ("shown" if self.menu_open and self.hub_visible else "hidden")
+            self.status = "TPI overlap → glass menu " + ("shown" if self.menu_open and self.hub_visible else "hidden")
         self.custom_gesture_live = live
         self.custom_gesture_rings = rings
 
@@ -7498,7 +7572,7 @@ try {
         painter.drawRoundedRect(layout["overlap"], 9*scale, 9*scale)
         painter.setPen(QColor(195, 235, 242))
         self._draw_fitted_button_label(painter, layout["overlap"],
-                                       "BUILT-IN: OVERLAP BOTH TLIs AND HOLD → GLASS MENU",
+                                       "BUILT-IN: OVERLAP BOTH TPIs AND HOLD → GLASS MENU",
                                        base_size=max(6, int(7*scale)), min_size=6, inset=8*scale)
 
         if self.custom_gesture_message:
@@ -7869,7 +7943,7 @@ try {
             displays[side] = (points, adjusted)
 
     def _hand_visual_transform(self, points, side=None):
-        """Return one consistent fixed-scale transform for landmarks and the TLI.
+        """Return one consistent fixed-scale transform for landmarks and the TPI.
 
         The user-selected scale never changes with hand proximity. When the two hands
         are touching, both share one pivot (see _update_hand_scale_origins).
@@ -7900,11 +7974,20 @@ try {
         geometry = screen.geometry() if screen is not None else None
         width = geometry.width() if geometry is not None else self.width()
         height = geometry.height() if geometry is not None else self.height()
-        return QPointF(min(max(0.0, x), max(1.0, width-1.0)),
-                       min(max(0.0, y), max(1.0, height-1.0)))
+        clamped = QPointF(min(max(0.0, x), max(1.0, width-1.0)),
+                          min(max(0.0, y), max(1.0, height-1.0)))
+        # While recalibrating this hand, deliberately expose its uncorrected TLI so the
+        # new mesh is sampled against raw positions, not its previous correction grid.
+        if (side in ("left", "right") and
+                getattr(self, "tli_calibration_active_side", None) != side):
+            calibration = getattr(self, "tpi_screen_calibrations", {}).get(side)
+            corrected = map_tpi_screen_point(clamped, calibration, width, height)
+            if corrected is not None:
+                return QPointF(float(corrected[0]), float(corrected[1]))
+        return clamped
 
     def _visual_tli_position(self, side, cursor, points=None):
-        """Return the already-transformed TLI; only slider reticles override its position."""
+        """Return the already-transformed TPI; only slider reticles override its position."""
         if cursor is None:
             return None
         override = self.tli_overrides.get(side)
@@ -8489,7 +8572,7 @@ try {
         painter.drawImage(QPointF(left, top), layer)
 
     def _paint_tli(self, painter, cursor, side, engaged=False):
-        """Paint a bright, large TLI; its centre is exactly the interaction point."""
+        """Paint a bright, large TPI; its centre is exactly the interaction point."""
         if cursor is None:
             return
         color = QColor(self.left_click_color if side == "left" else self.right_click_color)
@@ -8713,7 +8796,7 @@ try {
         painter.restore()
 
     def _smooth_cursor(self, side, target, now):
-        """Smooth the already hand-scaled screen point used by the TLI and OS pointer."""
+        """Smooth the already hand-scaled screen point used by the TPI and OS pointer."""
         previous = self.smoothed_side_cursor_positions.get(side)
         last_time = self.cursor_updated_at.get(side, 0.0)
         h = max(1.0, float(self.height()))
@@ -8968,11 +9051,11 @@ try {
             self.action_stop_open_since["right"] = None
             self.gesture_owner = "right"
             self.canvas_active_side = "right"
-            self.status = "3D context menu opened at the TLI — hover an option and pinch or grip to select"
+            self.status = "3D context menu opened at the TPI — hover an option and pinch or grip to select"
             self.update()
             return
         self._activate_canvas_right_click(point, "right", now)
-        self.status = "Modifier right-click sent at the starting TLI"
+        self.status = "Modifier right-click sent at the starting TPI"
 
     def _start_modifier_window_drag(self, origin, cursor, now):
         """Start a native window drag in OS mode or a canvas/app drag in 3D mode."""
@@ -9014,14 +9097,14 @@ try {
 
         if self._canvas_menu_panel_contains(origin):
             self.modifier_click_armed["right"] = False
-            self.status = "Move the TLI onto a desktop window before using grip-drag"
+            self.status = "Move the TPI onto a desktop window before using grip-drag"
             return False
 
         hwnd = self._find_native_window_at(origin)
         rect = self._native_window_rect(hwnd) if hwnd else None
         if not hwnd or rect is None:
             self.modifier_click_armed["right"] = False
-            self.status = "No movable window under the right-hand TLI"
+            self.status = "No movable window under the right-hand TPI"
             return False
 
         self._reset_fist_gesture("right")
@@ -9748,7 +9831,7 @@ try {
             self.tli_calibration_samples[active_calibration_side] = []
             window = self.tli_calibration_window
             if window is not None:
-                window.set_phase("Hand not detected — show the hand and pinch inside the area", 0)
+                window.set_phase("Hand not detected — show the hand and pinch on the highlighted target", 0)
                 window.set_hand_overlay([], [])
 
         # Pointer and TLI share one transformed anchor: the calibrated palm-relative point
@@ -10452,7 +10535,7 @@ try {
                     if now-active["open_since"] >= release_delay:
                         if mode == "right_click":
                             self._activate_canvas_right_click(active.get("origin"), side, now)
-                            self.status = "Right-click sent at the mode's starting TLI"
+                            self.status = "Right-click sent at the mode's starting TPI"
                         else:
                             self.status = f"{mode.replace('_', ' ').title()} finished — normal gestures restored"
                         self.active_action[side] = None
@@ -11689,7 +11772,7 @@ try {
                 painter.setFont(self._ui_font(10, QFont.DemiBold))
                 painter.drawText(back, Qt.AlignCenter, "← BACK")
 
-                tab_labels = {"interaction": "INTERACTION", "hands": "HANDS", "tli": "TLI",
+                tab_labels = {"interaction": "INTERACTION", "hands": "HANDS", "tli": "TPI",
                               "notifications": "NOTIFY", "gestures": "GESTURES", "voice": "VOICE",
                               "d1": "ENGINE", "update": "UPDATE"}
                 info_pages = ("gesture_map", "speech_commands")
@@ -11710,7 +11793,7 @@ try {
                     columns = [
                         [
                             ("POINTER & QUICK ACTIONS", True),
-                            ("Move the TLI with your palm anchor.", False),
+                            ("Move the TPI with your palm anchor.", False),
                             ("Quick pinch → release: left click.", False),
                             ("Quick grip → open: left click.", False),
                             ("Clicks use the gesture start point.", False),
@@ -11718,7 +11801,7 @@ try {
                             ("LEFT-HAND MODIFIER", True),
                             ("Hold LEFT fist to enable the modifier.", False),
                             ("RIGHT pinch → release: right-click.", False),
-                            ("RIGHT grip: grab the window under TLI.", False),
+                            ("RIGHT grip: grab the window under TPI.", False),
                             ("Move RIGHT hand; open it to release.", False),
                             ("Open LEFT fist to leave modifier mode.", False),
                             ("", False),
@@ -11751,7 +11834,7 @@ try {
                             ("", False),
                             ("SETTINGS", True),
                             ("Pinch/grip near a slider to adjust it.", False),
-                            ("TLI is biased slightly toward the thumb.", False),
+                            ("TPI is biased slightly toward the thumb.", False),
                             ("", False),
                             ("VOICE CONTROL", True),
                             ("Say 'show menu' or 'show context'.", False),
@@ -11848,11 +11931,11 @@ try {
                         painter.setPen(QPen(QColor(155, 245, 180, 220) if self.tli_glow_enabled else QColor(155, 162, 172, 200), 1.5*scale))
                         painter.drawRoundedRect(glow_toggle, 10*scale, 10*scale)
                         painter.setPen(QColor(225, 250, 250))
-                        self._draw_fitted_button_label(painter, glow_toggle, "TLI GLOW  ·  "+("ON" if self.tli_glow_enabled else "OFF"), base_size=label_size, min_size=6, inset=12*scale)
+                        self._draw_fitted_button_label(painter, glow_toggle, "TPI GLOW  ·  "+("ON" if self.tli_glow_enabled else "OFF"), base_size=label_size, min_size=6, inset=12*scale)
 
                         # Independent left/right TLI colour swatches are grouped here.
-                        for label, key, color in (("LEFT TLI", "swatch_left", self.left_click_color),
-                                                  ("RIGHT TLI", "swatch_right", self.right_click_color)):
+                        for label, key, color in (("LEFT TPI", "swatch_left", self.left_click_color),
+                                                  ("RIGHT TPI", "swatch_right", self.right_click_color)):
                             swatch = controls[key]
                             centre = QPointF(swatch.center().x(), swatch.top()+24*scale)
                             painter.setBrush(QBrush(color))
@@ -11907,23 +11990,24 @@ try {
                         # Each hand's independent calibration opens a temporary target window.
                         for calibration_side, rect in self._tli_calibration_button_rects(cx, cy, scale).items():
                             pending = self.tli_calibration_pending.get(calibration_side, False)
-                            calibrated = self.tli_calibrations.get(calibration_side) is not None
+                            calibrated = self.tpi_screen_calibrations.get(calibration_side) is not None
                             if pending:
                                 if self.tli_calibration_wait_release.get(calibration_side, False):
                                     label = f"{calibration_side.upper()} · RELEASE FIRST"
                                 else:
                                     count = len(self.tli_calibration_samples.get(calibration_side, []))
-                                    label = (f"{calibration_side.upper()} · PINCH IN WINDOW" if count == 0 else
-                                             f"{calibration_side.upper()} · {count}/{self.tli_calibration_sample_count}")
+                                    target_no = len(self.tpi_calibration_draft_points.get(calibration_side, [])) + 1
+                                    label = (f"{calibration_side.upper()} · TARGET {target_no}/9" if count == 0 else
+                                             f"{calibration_side.upper()} · {target_no}/9 · {count}/{self.tli_calibration_sample_count}")
                                 fill = QColor(100, 130, 45, 235)
                             elif calibrated and self.tli_calibration_persisted.get(calibration_side, False):
-                                label = f"{calibration_side.upper()} TLI · CALIBRATED"
+                                label = f"{calibration_side.upper()} TPI · CALIBRATED"
                                 fill = QColor(20, 104, 82, 225)
                             elif calibrated:
                                 label = f"{calibration_side.upper()} · SESSION ONLY"
                                 fill = QColor(125, 78, 28, 225)
                             else:
-                                label = f"CALIBRATE {calibration_side.upper()} TLI"
+                                label = f"CALIBRATE {calibration_side.upper()} TPI · 9 POINTS"
                                 fill = QColor(10, 47, 67, 225)
                             painter.setBrush(QBrush(fill))
                             painter.setPen(QPen(QColor(125, 235, 245, 210), 1.5*scale))
@@ -12138,7 +12222,7 @@ try {
                 painter.drawLine(QPointF(x, y-3), QPointF(x, y+3))
 
         # When Search is open, the dedicated topmost SearchHandOverlay is the single
-        # owner of hands/TLIs/timers/Pinch Menu. Painting the same layer here too causes
+        # owner of hands/TPIs/timers/Pinch Menu. Painting the same layer here too causes
         # offset duplicate/ghost hands, often noticed around the screen centre.
         search_overlay = getattr(self, "search_hand_overlay", None)
         search_dialog = getattr(self, "search_dialog", None)
@@ -12240,7 +12324,7 @@ try {
                                  f"{remaining:.1f}s")
 
             # Custom gestures with their circle timer on show a filling ring at the TLI
-            # (midway between both TLIs for the overlap gesture) until the gesture fires.
+            # (midway between both TPIs for the overlap gesture) until the gesture fires.
             for key, (label, progress, remaining) in list(getattr(self, "custom_gesture_rings", {}).items()):
                 if key == "overlap":
                     a, b = self.side_cursor_positions.get("left"), self.side_cursor_positions.get("right")

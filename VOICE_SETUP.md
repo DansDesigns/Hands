@@ -75,8 +75,8 @@ The PC command router is deterministic and offline. It handles exact phrase alia
 |---|---|
 | `pause tracking` / `resume tracking` | Stop or resume hand inference while keeping Vosk running |
 | `copy this` / `copy selection` | Copy the current native selection or selected object |
-| `paste here` | Click at the TLI and paste clipboard contents into the target |
-| `start text selection` | Mouse-down at the TLI; move hand to extend native text selection |
+| `paste here` | Click at the TPI and paste clipboard contents into the target |
+| `start text selection` | Mouse-down at the TPI; move hand to extend native text selection |
 | `finish selection` | Release the held selection drag |
 | `copy image` / `start image lasso` | Start a rectangular screen-image selection; move to the opposite corner then say `copy this` |
 | `cancel selection` | Release held mouse input and cancel lasso |
@@ -90,9 +90,9 @@ The PC command router is deterministic and offline. It handles exact phrase alia
 | `rename selected`, `delete selected` | Standard rename/delete actions in apps that support them |
 | `open notepad`, `open calculator`, `open user folder` | Launch app or open home folder |
 
-For **text selection**, say `start text selection`, move the TLI from the beginning to the end of the desired text, then say `copy this`. For a **picture or screen region**, say `copy image` while the TLI is at one corner, move to the opposite corner, then say `copy this`; this places a bitmap of that region on the clipboard. To paste, move the TLI to the destination text field or image-capable app and say `paste here`.
+For **text selection**, say `start text selection`, move the TPI from the beginning to the end of the desired text, then say `copy this`. For a **picture or screen region**, say `copy image` while the TPI is at one corner, move to the opposite corner, then say `copy this`; this places a bitmap of that region on the clipboard. To paste, move the TPI to the destination text field or image-capable app and say `paste here`.
 
-TLI paste and lasso operations require **OS Desktop** mode. `paste here` clicks at the TLI first, so aim at a text field or document insertion point rather than a button. `delete selected` sends the normal Delete key; confirm the selected item before using it. All matching is offline and rule-based; no generative model is involved.
+TPI paste and lasso operations require **OS Desktop** mode. `paste here` clicks at the TPI first, so aim at a text field or document insertion point rather than a button. `delete selected` sends the normal Delete key; confirm the selected item before using it. All matching is offline and rule-based; no generative model is involved.
 
 ## Desktop voice command reference (v32)
 
@@ -100,13 +100,13 @@ The command router is deterministic and offline. It is evaluated before search d
 
 - **Clipboard:** `open clipboard` / `show clipboard`, `close clipboard` / `hide clipboard`, `copy this`, `copy selection`, `cut this`, `paste`, `paste here`, `select all`, `undo`, `redo`.
 - **Text lasso:** say `start text selection`, move your hand to extend the native selection, then say `copy this` or `finish selection`. Say `cancel selection` to release the mouse and cancel.
-- **Image lasso:** say `copy image` or `start image lasso` at the first corner, move the TLI to the opposite corner, then say `copy this` or `finish lasso`. A screen crop goes to the clipboard as an image.
+- **Image lasso:** say `copy image` or `start image lasso` at the first corner, move the TPI to the opposite corner, then say `copy this` or `finish lasso`. A screen crop goes to the clipboard as an image.
 - **Media:** `play pause`, `next track`, `previous track`, `volume up`, `volume down`, `mute`, `unmute`.
 - **Windows:** `minimize window`, `maximize window`, `restore window`, `switch window`, `show desktop`, `snap window left`, `snap window right`, `close window`.
 - **Folders/apps:** `open file explorer`, `open user folder`, `open downloads`, `open documents`, `open desktop folder`, `open pictures`, `open videos`, `open music folder`, `open notepad`, `open calculator`.
 - **Navigation:** `create new folder`, `create new text file`, `create new powerpoint`, `new tab`, `close tab`, `go back`, `go forward`, `go up`, `refresh`, `rename selected`, `delete selected`.
 
-`paste here` restores the last external application, clicks at the TLI and presses Paste. Use OS Desktop mode. Always inspect the target before saying `delete selected`; it sends the normal Delete key. On Linux, media controls use `playerctl` and `pactl` when installed. Voice commands execute locally without an LLM.
+`paste here` restores the last external application, clicks at the TPI and presses Paste. Use OS Desktop mode. Always inspect the target before saying `delete selected`; it sends the normal Delete key. On Linux, media controls use `playerctl` and `pactl` when installed. Voice commands execute locally without an LLM.
 
 
 ## v33 voice and overlay settings
@@ -115,9 +115,9 @@ In the glass menu open **Settings**, then choose **Interaction**, **Notification
 
 The Voice page lets you toggle local TTS, cycle installed StreamTTS voice IDs, adjust speech speed from `0.7x` to `1.5x`, play a test phrase, and enrol/manage Face Welcome. StreamTTS's ONNX engine begins loading in the background when the installed model files are available, reducing first-speech initialisation delay.
 
-Say **`show menu`** to toggle the glass menu, or **`show context`** to toggle the Pinch Menu near the current TLI/cursor. Say **`help`** for the command summary.
+Say **`show menu`** to toggle the glass menu, or **`show context`** to toggle the Pinch Menu near the current TPI/cursor. Say **`help`** for the command summary.
 
-The Interaction page's **Scroll · Normal/Inverted** button reverses vertical scroll direction and saves the choice in `gestures.txt`. When a fist-shake successfully arms a native window drag, cyan waves and small sparkles radiate from the TLI to indicate that move mode is engaged.
+The Interaction page's **Scroll · Normal/Inverted** button reverses vertical scroll direction and saves the choice in `gestures.txt`. When a fist-shake successfully arms a native window drag, cyan waves and small sparkles radiate from the TPI to indicate that move mode is engaged.
 
 
 ## v34 voice and interaction shortcuts
@@ -126,7 +126,7 @@ The Interaction page's **Scroll · Normal/Inverted** button reverses vertical sc
 - In the search launcher, use its Dictate control (or open it with `search bar`) to dictate into the search field specifically.
 - The Pinch Menu adds **Dictation** and **STT Voice Input** switches. Dictation toggles routing into the active search field/focused field; STT Voice Input starts or stops Vosk recognition.
 - The Pinch Menu hold defaults to a **1.0-second fill after a 0.8-second confirmation delay** (about 1.8 seconds total). Pinch recognition now allows natural index bending and tolerates brief landmark dropouts so the timer is less likely to restart.
-- With Search open, the skeleton, TLI, hold progress and Pinch Menu are drawn on a transparent, click-through layer above the launcher.
+- With Search open, the skeleton, TPI, hold progress and Pinch Menu are drawn on a transparent, click-through layer above the launcher.
 - Grab-scroll is progressive: short travel remains precise, and gain increases as accumulated vertical movement grows. `invert_scroll` still reverses direction.
 
 ## StreamTTS Config GUI

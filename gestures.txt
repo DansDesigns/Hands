@@ -108,7 +108,7 @@ tli_border_thickness=1.00
 tli_diameter=30.0
 skeleton_line_thickness=1.50
 
-# TLI appearance: diameter=12–96px (default 30px), border thickness=1–8px, colour shift=0–360 degrees.
+# TPI appearance: diameter=12–96px (default 30px), border thickness=1–8px, colour shift=0–360 degrees.
 # Skeleton line thickness: 0.5–4.0x, only applied when skeleton rendering is selected.
 # Glass and Pinch Menu panels use a lightly transparent background (15%).
 

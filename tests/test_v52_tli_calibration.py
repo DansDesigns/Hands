@@ -75,12 +75,13 @@ class V52TLICalibrationTests(unittest.TestCase):
 
     def test_calibration_has_settings_controls_and_is_used_by_activation_anchor(self):
         main = (ROOT / "main.py").read_text(encoding="utf-8")
-        self.assertIn('"CALIBRATE {calibration_side.upper()} TLI"', main)
+        self.assertIn('CALIBRATE {calibration_side.upper()} TPI · 9 POINTS', main)
         self.assertIn('self._process_tli_calibration_frame(', main)
         self.assertIn('resolve_relative_tli(landmarks, calibration)', main)
-        self.assertIn('save_tli_calibrations(self.tli_calibrations)', main)
+        self.assertIn('save_tpi_screen_calibrations(\n                TPI_SCREEN_CALIBRATION_FILE, self.tpi_screen_calibrations)', main)
         self.assertIn('self.interactive_hand_anchor(landmarks, side)', main)
         self.assertIn('tli_calibration.json', main)
+        self.assertIn('tpi_screen_calibration.json', main)
 
 
 if __name__ == "__main__":
