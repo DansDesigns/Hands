@@ -75,6 +75,7 @@ from search_launcher import SearchLauncherDialog
 from face_welcome import FaceWelcomeService
 from tli_calibration import encode_relative_tli, resolve_relative_tli, mean_relative_tli
 from updater import VERSION_FILE, compare_versions, read_version, fetch_remote_version, download_update, install_update
+from windows_virtual_desktop import pin_window_on_all_virtual_desktops
 from hand_calibration import (
     load_hand_calibration, save_hand_calibration, palm_measurements,
     fingertip_contact_ratio, mean_finite, median_finite, screen_touch_offset,
@@ -898,7 +899,12 @@ class SearchHandOverlay(QWidget):
         super().__init__(None)
         self.owner = owner
         self.setWindowTitle("Spatial Desktop Hand Indicators")
-        self.setWindowFlags(Qt.Tool | Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint |
+        # On Windows this is a real, independent top-level window rather than a Qt.Tool.
+        # The shell's virtual-desktop pinning service needs a stable native window view;
+        # Keep Windows as a regular top-level view for virtual-desktop pinning and
+        # Task View integration; Linux keeps the established Qt.Tool behaviour unchanged.
+        overlay_kind = Qt.Window if sys.platform.startswith("win") else Qt.Tool
+        self.setWindowFlags(overlay_kind | Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint |
                             Qt.WindowDoesNotAcceptFocus | Qt.NoDropShadowWindowHint)
         self.setAttribute(Qt.WA_TranslucentBackground, True)
         self.setAttribute(Qt.WA_TransparentForMouseEvents, True)
@@ -907,6 +913,10 @@ class SearchHandOverlay(QWidget):
         self._last_raise = 0.0
         self._last_native_raise = 0.0
         self._native_style_ready = False
+        self._global_hand_layer_active = False
+        self._windows_virtual_desktop_pinned = False
+        self._windows_virtual_desktop_pin_last_attempt = 0.0
+        self._windows_virtual_desktop_pin_warning_reported = False
         self.sync_timer = QTimer(self)
         self.sync_timer.setInterval(24)
         self.sync_timer.timeout.connect(self.sync_to_launcher)
@@ -915,11 +925,23 @@ class SearchHandOverlay(QWidget):
     def sync_to_launcher(self):
         owner = self.owner
         dialog = owner.search_dialog
-        should_show = bool(dialog is not None and dialog.isVisible() and
-                           not owner.hand_tracking_paused)
-        # Poll slowly while Search is closed; the launcher also triggers an immediate
-        # sync when it opens, so the fast cadence resumes without a visible delay.
-        wanted_interval = 24 if should_show else 150
+        search_visible = bool(dialog is not None and dialog.isVisible() and
+                              not owner.hand_tracking_paused)
+        # Windows needs a separate transparent hand layer which stays pinned across
+        # virtual desktops. A QCursor position follows the active desktop on its own,
+        # but hands painted into the original fullscreen window do not reliably follow
+        # Win+Tab/Task View. This independent layer is click-through and owns the hands
+        # on Windows; Linux keeps the original Search-only overlay behaviour.
+        windows_global_layer = bool(
+            sys.platform.startswith("win") and not owner.hand_tracking_paused and
+            not getattr(owner, "hand_calibration_active", False) and
+            getattr(owner, "tli_calibration_active_side", None) is None
+        )
+        self._global_hand_layer_active = windows_global_layer
+        should_show = bool(search_visible or windows_global_layer)
+        # Poll slowly while hidden; keep the active visual layer aligned to the app's
+        # scene cadence instead of forcing extra high-frequency repaints on Windows.
+        wanted_interval = 40 if windows_global_layer else (24 if search_visible else 150)
         if self.sync_timer.interval() != wanted_interval:
             self.sync_timer.setInterval(wanted_interval)
         if not should_show:
@@ -932,9 +954,57 @@ class SearchHandOverlay(QWidget):
         if not self.isVisible():
             self.show()
         now = time.monotonic()
-        # Qt's topmost dialogs can be raised after this transparent Tool window. Reassert
-        # z-order frequently without activating the overlay, so the skeleton/TLI/menu stay
-        # visible over the search launcher while all input still passes through to it.
+        if sys.platform.startswith("win"):
+            # Pin this actual hand-rendering HWND as well as the main fullscreen owner.
+            # Retry until Explorer confirms pinning; the Windows shell API is private
+            # and may be unavailable on some builds.
+            if (not self._windows_virtual_desktop_pinned and
+                    now-self._windows_virtual_desktop_pin_last_attempt >= 2.0):
+                self._windows_virtual_desktop_pin_last_attempt = now
+                try:
+                    pinned = pin_window_on_all_virtual_desktops(int(self.winId()))
+                    if pinned:
+                        self._windows_virtual_desktop_pinned = True
+                    elif not self._windows_virtual_desktop_pin_warning_reported:
+                        print("Spatial Desktop: Windows could not pin the hand-visual overlay to all virtual desktops; retrying.")
+                        self._windows_virtual_desktop_pin_warning_reported = True
+                except Exception as exc:
+                    if not self._windows_virtual_desktop_pin_warning_reported:
+                        print("Spatial Desktop: hand-visual virtual-desktop pinning unavailable:", exc)
+                        self._windows_virtual_desktop_pin_warning_reported = True
+            if not self._native_style_ready:
+                try:
+                    hwnd = wintypes.HWND(int(self.winId()))
+                    user32 = ctypes.windll.user32
+                    # HWND is pointer-sized on 64-bit Windows. Explicit signatures prevent
+                    # ctypes from truncating it through its default 32-bit integer ABI.
+                    get_long = getattr(user32, "GetWindowLongPtrW", user32.GetWindowLongW)
+                    set_long = getattr(user32, "SetWindowLongPtrW", user32.SetWindowLongW)
+                    get_long.argtypes = [wintypes.HWND, ctypes.c_int]
+                    get_long.restype = ctypes.c_ssize_t
+                    set_long.argtypes = [wintypes.HWND, ctypes.c_int, ctypes.c_ssize_t]
+                    set_long.restype = ctypes.c_ssize_t
+                    style = int(get_long(hwnd, -20))
+                    # Transparent input, layered composition, and no activation. Keep this
+                    # as a normal top-level view: WS_EX_TOOLWINDOW explicitly excludes it
+                    # from Task View/Alt+Tab and can interfere with Explorer's virtual-
+                    # desktop view association. The overlay is still click-through and
+                    # does not accept focus.
+                    style |= 0x00000020 | 0x00080000 | 0x08000000
+                    set_long(hwnd, -20, style)
+                    self._native_style_ready = True
+                    user32.SetWindowPos.argtypes = [wintypes.HWND, wintypes.HWND,
+                                                    ctypes.c_int, ctypes.c_int,
+                                                    ctypes.c_int, ctypes.c_int, wintypes.UINT]
+                    user32.SetWindowPos.restype = wintypes.BOOL
+                    # SWP_NOSIZE|SWP_NOMOVE|SWP_NOACTIVATE|SWP_SHOWWINDOW|SWP_FRAMECHANGED.
+                    user32.SetWindowPos(hwnd, wintypes.HWND(-1), 0, 0, 0, 0,
+                                        0x0001 | 0x0002 | 0x0010 | 0x0040 | 0x0020)
+                except Exception:
+                    pass
+        # Reassert the topmost position without activation. This orders the overlay
+        # above ordinary desktop windows; immersive Windows shell surfaces such as
+        # Task View may still be in a higher system z-order band.
         if now-self._last_raise > 0.12:
             self.raise_()
             self._last_raise = now
@@ -942,12 +1012,7 @@ class SearchHandOverlay(QWidget):
             try:
                 hwnd = int(self.winId())
                 user32 = ctypes.windll.user32
-                if not self._native_style_ready:
-                    style = user32.GetWindowLongW(hwnd, -20)
-                    style |= 0x00000020 | 0x00080000 | 0x00000080 | 0x08000000  # transparent/layered/tool/noactivate
-                    user32.SetWindowLongW(hwnd, -20, style)
-                    self._native_style_ready = True
-                # HWND_TOPMOST (-1), SWP_NOSIZE|SWP_NOMOVE|SWP_NOACTIVATE|SWP_SHOWWINDOW.
+                # HWND_TOPMOST, SWP_NOSIZE|SWP_NOMOVE|SWP_NOACTIVATE|SWP_SHOWWINDOW.
                 user32.SetWindowPos(wintypes.HWND(hwnd), wintypes.HWND(-1), 0, 0, 0, 0,
                                     0x0001 | 0x0002 | 0x0010 | 0x0040)
                 self._last_native_raise = now
@@ -984,7 +1049,8 @@ class SearchHandOverlay(QWidget):
 
     def _paint_frame(self, _event):
         owner = self.owner
-        if not (owner.search_dialog is not None and owner.search_dialog.isVisible()):
+        search_visible = bool(owner.search_dialog is not None and owner.search_dialog.isVisible())
+        if not (search_visible or getattr(self, "_global_hand_layer_active", False)):
             return
         # Native video windows can temporarily invalidate the transparent overlay surface
         # while Windows is moving/resizing them. Skip that frame instead of issuing
@@ -1059,6 +1125,67 @@ class SearchHandOverlay(QWidget):
                 painter.setFont(QFont("Sans", 8, QFont.DemiBold))
                 painter.drawText(QRectF(cursor.x()-22, cursor.y()+23, 44, 16), Qt.AlignCenter,
                                  f"{remaining:.1f}s")
+
+        # Keep the thumbs-up tracking-toggle countdown visible in this dedicated layer.
+        # The main window does not paint hands while this overlay owns the Windows hand
+        # layer, so its confirmation ring must be reproduced here alongside custom rings.
+        # For a hand whose tracking is currently disabled, use the same visual anchor
+        # fallback as the main window so the ring still teaches how to re-enable it.
+        for side in ("left", "right"):
+            thumbs_started = getattr(owner, "thumbs_up_hold_started", {}).get(side)
+            if (thumbs_started is None or
+                    getattr(owner, "thumbs_up_toggle_latched", {}).get(side, False)):
+                continue
+            points = owner.hand_positions.get(side, [])
+            cursor = owner.side_cursor_positions.get(side)
+            if cursor is None:
+                if not points:
+                    continue
+                cursor = owner._scale_hand_tli_point(
+                    owner.interactive_hand_anchor(points, side), points, side)
+            cursor = owner._visual_tli_position(side, cursor, points)
+            elapsed = max(0.0, now-thumbs_started)
+            duration = max(0.01, owner.gesture_tracking_toggle_hold_seconds)
+            progress = min(1.0, elapsed/duration)
+            remaining = max(0.0, duration-elapsed)
+            ring = QRectF(cursor.x()-38, cursor.y()-38, 76, 76)
+            painter.setBrush(Qt.NoBrush)
+            painter.setPen(QPen(QColor(105, 240, 255, 95), 3))
+            painter.drawEllipse(ring)
+            painter.setPen(QPen(QColor(105, 240, 255, 245), 4))
+            painter.drawArc(ring, 90*16, -int(progress*360*16))
+            painter.setPen(QColor(220, 255, 255, 245))
+            painter.setFont(owner._ui_font(8, QFont.DemiBold))
+            painter.drawText(QRectF(cursor.x()-24, cursor.y()+27, 48, 16), Qt.AlignCenter,
+                             f"{remaining:.1f}s")
+
+        # The main window suppresses its hand layer while this dedicated overlay owns
+        # rendering. Keep recorded custom-gesture countdown rings in this layer too;
+        # otherwise they disappear whenever the Windows overlay is active.
+        for key, (label, progress, remaining) in list(getattr(owner, "custom_gesture_rings", {}).items()):
+            if key == "overlap":
+                a = owner.side_cursor_positions.get("left")
+                b = owner.side_cursor_positions.get("right")
+                if a is None or b is None:
+                    continue
+                cursor = QPointF((a.x()+b.x())*0.5, (a.y()+b.y())*0.5)
+            else:
+                cursor = owner.side_cursor_positions.get(key)
+                if cursor is None:
+                    continue
+                cursor = owner._visual_tli_position(key, cursor, owner.hand_positions.get(key, []))
+            ring = QRectF(cursor.x()-41, cursor.y()-41, 82, 82)
+            painter.setBrush(Qt.NoBrush)
+            painter.setPen(QPen(QColor(110, 255, 170, 85), 3))
+            painter.drawEllipse(ring)
+            painter.setPen(QPen(QColor(110, 255, 170, 245), 4))
+            painter.drawArc(ring, 90*16, -int(progress*360*16))
+            painter.setPen(QColor(235, 255, 240, 245))
+            painter.setFont(owner._ui_font(8, QFont.DemiBold))
+            painter.drawText(QRectF(cursor.x()-50, cursor.y()-60, 100, 16), Qt.AlignCenter, label)
+            painter.drawText(QRectF(cursor.x()-22, cursor.y()+23, 44, 16), Qt.AlignCenter,
+                             f"{remaining:.1f}s")
+
         # Repaint the TLI last so it remains visible over both launcher and menu buttons.
         for side in ("right", "left"):
             points = owner.hand_positions.get(side, [])
@@ -1634,6 +1761,9 @@ class SpatialDesktop(QWidget):
         self._applied_desktop_mode = None
         self._applied_menu_state = None
         self._last_native_topmost_reassert = 0.0
+        self._windows_virtual_desktop_pinned = False
+        self._windows_virtual_desktop_pin_last_attempt = 0.0
+        self._windows_virtual_desktop_pin_warning_reported = False
         self._linux_x11_lib = None
         self._linux_x11_display = None
         self.menu_open = True
@@ -7718,23 +7848,43 @@ class SpatialDesktop(QWidget):
             return
         search_dialog = getattr(self, "search_dialog", None)
         search_overlay = getattr(self, "search_hand_overlay", None)
-        if search_dialog is not None and search_dialog.isVisible():
-            # SearchHandOverlay has its own faster z-order timer. When paused it may be
-            # hidden, but the main fullscreen surface must still stay behind the launcher.
-            if search_overlay is None or not search_overlay.isVisible():
-                return
-            target = search_overlay
-        elif (getattr(self, "tli_calibration_window", None) is not None and
-              self.tli_calibration_window.isVisible()):
+        if (getattr(self, "tli_calibration_window", None) is not None and
+                self.tli_calibration_window.isVisible()):
             target = self.tli_calibration_window
         elif (getattr(self, "hand_calibration_window", None) is not None and
               self.hand_calibration_window.isVisible()):
             target = self.hand_calibration_window
+        elif (search_overlay is not None and search_overlay.isVisible() and
+              (search_dialog is not None and search_dialog.isVisible() or
+               getattr(search_overlay, "_global_hand_layer_active", False))):
+            # The independent hand-visual window is raised without activation while
+            # ordinary apps or Windows 11 Task View switch the active desktop. The
+            # Windows shell may still composite Task View in a higher z-order band.
+            target = search_overlay
+        elif search_dialog is not None and search_dialog.isVisible():
+            # If hand overlay creation failed, don't raise the full-screen owner over Search.
+            return
         else:
             target = self
 
         if not target.isVisible():
             return
+        # Pin the main tracking overlay to every Windows virtual desktop. This is
+        # best-effort: the shell COM API is undocumented and may be unavailable.
+        if (not getattr(self, "_windows_virtual_desktop_pinned", False) and
+                now-float(getattr(self, "_windows_virtual_desktop_pin_last_attempt", 0.0)) >= 2.0):
+            self._windows_virtual_desktop_pin_last_attempt = now
+            try:
+                pinned = pin_window_on_all_virtual_desktops(int(self.winId()))
+                if pinned:
+                    self._windows_virtual_desktop_pinned = True
+                elif not getattr(self, "_windows_virtual_desktop_pin_warning_reported", False):
+                    print("Spatial Desktop: Windows could not pin the hand overlay to all virtual desktops; continuing normally.")
+                    self._windows_virtual_desktop_pin_warning_reported = True
+            except Exception as exc:
+                if not getattr(self, "_windows_virtual_desktop_pin_warning_reported", False):
+                    print("Spatial Desktop: virtual-desktop pinning unavailable:", exc)
+                    self._windows_virtual_desktop_pin_warning_reported = True
         try:
             user32 = ctypes.windll.user32
             hwnd = wintypes.HWND(int(target.winId()))
@@ -9974,8 +10124,11 @@ class SpatialDesktop(QWidget):
         search_overlay = getattr(self, "search_hand_overlay", None)
         search_dialog = getattr(self, "search_dialog", None)
         search_overlay_draws_hand_layer = bool(
-            search_overlay is not None and search_overlay.isVisible() and
-            search_dialog is not None and search_dialog.isVisible()
+            search_overlay is not None and search_overlay.isVisible() and (
+                (search_dialog is not None and search_dialog.isVisible()) or
+                (sys.platform.startswith("win") and
+                 getattr(search_overlay, "_global_hand_layer_active", False))
+            )
         )
         calibration_window_owns_hand_layer = (
             (self.tli_calibration_active_side is not None and
