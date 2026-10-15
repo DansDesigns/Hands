@@ -570,6 +570,25 @@ def should_start_right_fist_scroll(*, side, is_fist, left_fist_active, modifier_
     return abs(dy) >= threshold and abs(dy) >= max(6.0, abs(dx) * 0.9)
 
 
+def active_fist_scroll_release_confirmed(*, is_open, is_fist, is_pinch,
+                                         fingers_closed, open_duration,
+                                         release_seconds=0.48):
+    """Only release one-hand fist scrolling after a sustained, unambiguous open pose.
+
+    Hand landmark classifiers can briefly label a curled grip as open while the fist
+    anchor is moving. Requiring both an open hand and non-folded finger landmarks for
+    a short continuous interval preserves the active scroll through those flickers.
+    """
+    if not is_open or is_fist or is_pinch or fingers_closed:
+        return False
+    try:
+        elapsed = float(open_duration)
+        required = max(0.10, float(release_seconds))
+    except (TypeError, ValueError):
+        return False
+    return math.isfinite(elapsed) and math.isfinite(required) and elapsed >= required
+
+
 def progressive_scroll_gain(total_travel, *, slow_gain=0.40, ramp_distance=260.0, max_extra_gain=2.4):
     """Return a deliberately gentle, bounded gain for fist-controlled scrolling.
 

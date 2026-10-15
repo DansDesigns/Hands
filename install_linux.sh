@@ -9,7 +9,7 @@ cd "$APP_DIR"
 trap 'status=$?; if [ "$status" -ne 0 ]; then echo "ERROR: Installer failed (exit $status). See command output above." >&2; fi' 0
 
 echo '============================================================'
-echo 'Spatial Desktop Prototype - Linux installer'
+echo 'Freehand: Spatial Computing - Linux installer'
 echo "Project folder: $APP_DIR"
 echo '============================================================'
 
@@ -100,8 +100,8 @@ mkdir -p "$APPS_DIR"
 cat > "$APPS_DIR/spatial-desktop-prototype.desktop" <<DESKTOP
 [Desktop Entry]
 Type=Application
-Name=Spatial Desktop Prototype
-Comment=Camera-controlled spatial desktop and local search
+Name=Freehand: Spatial Computing
+Comment=Hands-free spatial computing and gesture control
 Exec="$APP_DIR/spatial_desktop_launcher.sh"
 TryExec="$APP_DIR/spatial_desktop_launcher.sh"
 $ICON_DESKTOP_ENTRY
@@ -117,7 +117,7 @@ printf 'Spatial Desktop launcher installed: %s\n' "$APPS_DIR/spatial-desktop-pro
 echo '============================================================'
 echo 'INSTALLATION COMPLETE'
 echo "Launcher: $APPS_DIR/spatial-desktop-prototype.desktop"
-echo 'Find Spatial Desktop Prototype in your app launcher.'
+echo 'Find Freehand: Spatial Computing in your app launcher.'
 echo 'Local search uses SQLite and remains available without d1. d1 is an optional local decision model.'
 echo 'StreamTTS runs offline when its runtime and voice files are installed.'
 echo 'Face Welcome is optional and local-only; enroll a user through Settings to enable it.'

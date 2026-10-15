@@ -3,7 +3,7 @@ setlocal EnableExtensions
 cd /d "%~dp0"
 
 echo ============================================================
-echo Spatial Desktop Prototype - Windows installer
+echo Freehand: Spatial Computing - Windows installer
 echo Working directory: %CD%
 echo ============================================================
 
@@ -107,14 +107,14 @@ powershell -NoProfile -ExecutionPolicy Bypass -Command "$ErrorActionPreference='
 if not exist "%ICON_ICO%" echo WARNING: Freehand_logo_small.png is missing or could not be converted; the shortcut will use the Windows default icon.
 set "STARTMENU=%APPDATA%\Microsoft\Windows\Start Menu\Programs"
 if not exist "%STARTMENU%" mkdir "%STARTMENU%"
-set "SHORTCUT=%STARTMENU%\Spatial Desktop Prototype.lnk"
-powershell -NoProfile -ExecutionPolicy Bypass -Command "$s=(New-Object -ComObject WScript.Shell).CreateShortcut('%SHORTCUT%'); $s.TargetPath='%VPY%'; $s.Arguments='""%CD%\main.py""'; $s.WorkingDirectory='%CD%'; $s.Description='Spatial Desktop Prototype'; if (Test-Path $env:ICON_ICO) { $s.IconLocation=$env:ICON_ICO + ',0' }; $s.Save()"
+rem Windows forbids an ASCII colon in file names. Use the visually equivalent fullwidth colon in the Start Menu shortcut name.
+powershell -NoProfile -ExecutionPolicy Bypass -Command "$name='Freehand'+[char]0xFF1A+' Spatial Computing'; $shortcut=Join-Path '%STARTMENU%' ($name+'.lnk'); $old=Join-Path '%STARTMENU%' 'Spatial Desktop Prototype.lnk'; $s=(New-Object -ComObject WScript.Shell).CreateShortcut($shortcut); $s.TargetPath='%VPY%'; $s.Arguments='""%CD%\main.py""'; $s.WorkingDirectory='%CD%'; $s.Description='Freehand: Spatial Computing'; if (Test-Path $env:ICON_ICO) { $s.IconLocation=$env:ICON_ICO + ',0' }; $s.Save(); if (Test-Path -LiteralPath $old) { Remove-Item -LiteralPath $old -Force }"
 if errorlevel 1 goto :shortcut_error
 
 echo.
 echo ============================================================
 echo INSTALLATION COMPLETE
-echo Start Menu shortcut: Spatial Desktop Prototype
+echo Start Menu shortcut: Freehand: Spatial Computing
 echo Project folder: %CD%
 echo Local search uses SQLite and remains available without d1. d1 is an optional local decision model.
 echo StreamTTS runs offline when its runtime and voice files are installed. d1 runs locally after its model is cached.

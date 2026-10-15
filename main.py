@@ -28,6 +28,7 @@ from gesture_rules import (
     should_dismiss_pinch_menu,
     detect_fist_shake,
     should_start_right_fist_scroll,
+    active_fist_scroll_release_confirmed,
     should_arm_shake_drag,
     progressive_scroll_gain,
     drag_scroll_rate_from_offset,
@@ -287,7 +288,7 @@ def save_gesture_settings(values: dict) -> None:
         "# FIST: a quick fist-open clicks. A RIGHT-only fist starts scrolling when moved vertically over page content; make both fists for the separate two-hand window drag.",
         "# SCROLL: RIGHT-only fist + deliberate vertical movement over page content starts gentle scrolling immediately; there is no right-fist circle timer.",
         "# EDGE INPUT: gesture recognition is slightly more tolerant near screen edges; skeleton joints are not individually clamped.",
-        "# RELEASE COOLDOWN: active drag/scroll stops after an open-hand pose remains stable for 0.20 seconds; timed pinches need a continuous 0.8-second confirmation hold.",
+        "# RELEASE COOLDOWN: one-hand fist scrolling requires a clear open hand for 0.48 seconds; other active drag/scroll actions retain the 0.20-second release. Timed pinches need a continuous 0.8-second confirmation hold.",
         "# SLIDER SNAP: fist OR thumb/index pinch near a settings slider snaps the TLI to its knob and starts dragging; no hold timer.",
         "# SLIDER STABILITY: isolated large cursor jumps are ignored; a new slider cursor position must persist for three frames.",
         "# HAND DETECTION: conservative MediaPipe confidence, three consistent detections, no cached-landmark display; side-on geometry requires high confidence and depth support.",
@@ -3255,6 +3256,7 @@ class SpatialDesktop(QWidget):
             "horizontal_scroll_supported": None,
             "scroll_nav_fired": False,
             "scroll_stage": 0,
+            "scroll_open_candidate_since": None,
         }
         if mode == "scroll_window":
             active["mode"] = "scroll_window"
@@ -8874,14 +8876,38 @@ class SpatialDesktop(QWidget):
             # opening the hand ends the manipulation and returns to normal clicks.
             active = self.active_action.get(side)
             if active is not None:
-                # While a right-fist scroll is active, MediaPipe can briefly label the
-                # closed grip as a pinch/ambiguous pose. Preserve fist priority for every
-                # non-open frame so scrolling neither pauses nor gets stolen by pinch
-                # recognition; only a clearly open hand may release the active scroll.
-                if active.get("mode") in ("drag_window", "scroll_window") and not is_open:
+                mode = active.get("mode")
+                one_hand_fist_scroll = (mode == "scroll_window" and
+                                        not active.get("two_hand_clutch", False))
+                if one_hand_fist_scroll:
+                    # A brief false-open classification makes the scroll anchor feel as
+                    # though it has been released. Keep scrolling through these frames;
+                    # only a sustained, clearly open hand with genuinely extended fingers
+                    # may release the right-fist scroll.
+                    clear_open_pose = (is_open and not is_fist and not is_pinch and
+                                       not bool(pose.get("fingers_closed", False)))
+                    if clear_open_pose:
+                        candidate_since = active.get("scroll_open_candidate_since")
+                        if candidate_since is None:
+                            candidate_since = now
+                            active["scroll_open_candidate_since"] = candidate_since
+                        open_duration = max(0.0, now - candidate_since)
+                        if not active_fist_scroll_release_confirmed(
+                                is_open=is_open, is_fist=is_fist, is_pinch=is_pinch,
+                                fingers_closed=bool(pose.get("fingers_closed", False)),
+                                open_duration=open_duration, release_seconds=0.48):
+                            is_fist, is_pinch, is_open = True, False, False
+                        else:
+                            # Reuse the candidate start as the release clock so the
+                            # ordinary cooldown does not add a second delay.
+                            active["open_since"] = candidate_since
+                    else:
+                        active["scroll_open_candidate_since"] = None
+                # While any drag/scroll is active, keep its held-grip interpretation for
+                # non-open frames so pinch/ambiguous classifications cannot steal it.
+                if mode in ("drag_window", "scroll_window") and not is_open:
                     is_fist, is_pinch = True, False
                 self.gesture_owner = side
-                mode = active.get("mode")
                 other_side = "left" if side == "right" else "right"
                 if ((mode == "drag_window" or active.get("two_hand_clutch")) and
                         other_side in poses and not poses[other_side].get("fist", False)):
@@ -8901,7 +8927,8 @@ class SpatialDesktop(QWidget):
                     # While waiting for a confirmed release, freeze movement and keep
                     # the anchor current so a false-open frame doesn't cause a jump.
                     active["last_cursor"] = QPointF(cursor)
-                    release_delay = 0.14 if active.get("modifier_drag") else self.active_release_cooldown_seconds
+                    release_delay = (0.14 if active.get("modifier_drag") else
+                                     (0.48 if one_hand_fist_scroll else self.active_release_cooldown_seconds))
                     if now-active["open_since"] >= release_delay:
                         if mode == "right_click":
                             self._activate_canvas_right_click(active.get("origin"), side, now)

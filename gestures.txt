@@ -40,7 +40,7 @@
 # The LEFT fist remains the modifier; a LEFT fist + RIGHT grip is still the dedicated drag action.
 # Two fists remain available for the separate intentional window-drag gesture.
 # Scrolling clamps tracking spikes, smooths each frame and ramps up only during sustained movement.
-# An open hand must remain stable for 0.20 seconds to release active drag/scroll; Pinch Menu confirmation requires a continuous 0.8-second pinch hold.
+# A clearly open hand must remain stable for 0.48 seconds to release active one-hand fist scrolling; brief false-open frames keep the scroll anchor active. Other active drag/scroll release behaviour is unchanged; Pinch Menu confirmation requires a continuous 0.8-second pinch hold.
 # Opening the hand stops active drag/scroll; a long gesture cannot also click on release.
 #
 # SETTINGS SLIDERS
