@@ -917,7 +917,7 @@ class Tracker:
         # Run inference at a modest active cadence and downshift further when no hands
         # are present. This substantially reduces sustained CPU use on software-rendered
         # Linux desktops while staying responsive enough for gesture interaction.
-        idle_frame_interval = 1.0 / 8.0
+        idle_frame_interval = 1.0 / 6.0
         # Paused hand tracking only needs occasional frames for the optional face welcome.
         paused_frame_interval = 1.0 / 2.0
         idle_after_seconds = 1.0
@@ -2988,28 +2988,63 @@ class SpatialDesktop(QWidget):
                 ball["x"] = min(1.0-ball["r"], max(ball["r"], ball["x"]))
                 ball["vx"] *= -0.68
             ball["vx"] *= max(0.0, 1.0 - dt*0.55)
-        # Bird flock: staggered silhouettes fly across the sky, then respawn off-screen.
-        if now - self._garden_bird_last_spawn > 2.8:
+        # Perspective bird traffic: some birds emerge at the horizon and grow as they
+        # approach the viewer; others enter high on the screen and shrink into the distance.
+        # Normalised endpoints make both flight paths scale correctly with the scene.
+        if now - self._garden_bird_last_spawn > 1.75 and len(self._garden_birds) < 9:
             self._garden_bird_last_spawn = now
             self._garden_bird_seed = (self._garden_bird_seed * 1.71 + 13.7) % 997.0
-            self._garden_birds.append({
-                "x": -0.06, "y": 0.20 + (self._garden_bird_seed % 100)/1000.0,
-                "speed": 0.10 + (self._garden_bird_seed % 55)/400.0,
-                "scale": 0.7 + (self._garden_bird_seed % 40)/100.0,
-                "phase": self._garden_bird_seed,
-            })
-        self._garden_birds = [b for b in self._garden_birds if b["x"] < 1.08]
+            seed = self._garden_bird_seed
+            if int(seed) % 3 != 0:
+                # Approach: start tiny near the vanishing point, then fan outward and grow.
+                side = -1.0 if int(seed * 7) % 2 == 0 else 1.0
+                end_x = 0.08 + (seed % 83.0) / 100.0
+                end_y = 0.34 + ((seed * 1.37) % 34.0) / 100.0
+                start_x = 0.5 + side * ((seed % 11.0) / 100.0)
+                start_y = 0.205 + ((seed * 0.71) % 45.0) / 1000.0
+                bird = {"mode": "approach", "x0": start_x, "y0": start_y,
+                        "x1": end_x, "y1": end_y, "t": 0.0,
+                        "duration": 4.8 + (seed % 24.0) / 10.0,
+                        "scale0": 0.12 + (seed % 8.0) / 100.0,
+                        "scale1": 0.8 + (seed % 45.0) / 100.0,
+                        "phase": seed}
+            else:
+                # Depart: enter from the upper foreground and converge toward the horizon.
+                start_x = 0.08 + (seed % 83.0) / 100.0
+                end_x = 0.43 + ((seed * 1.91) % 15.0) / 100.0
+                bird = {"mode": "depart", "x0": start_x, "y0": -0.015,
+                        "x1": end_x, "y1": 0.205 + ((seed * 0.61) % 45.0) / 1000.0,
+                        "t": 0.0, "duration": 3.0 + (seed % 18.0) / 10.0,
+                        "scale0": 0.72 + (seed % 35.0) / 100.0,
+                        "scale1": 0.09, "phase": seed}
+            self._garden_birds.append(bird)
+        for bird in self._garden_birds:
+            bird["t"] += dt / max(0.1, bird["duration"])
+        self._garden_birds = [b for b in self._garden_birds if b["t"] < 1.0]
         painter.save()
         painter.setRenderHint(QPainter.Antialiasing, True)
         for bird in self._garden_birds:
-            bird["x"] += bird["speed"] * dt
-            bx, by = bird["x"]*width, bird["y"]*height
-            span = height * 0.012 * bird["scale"]
-            flap = math.sin(now*8.0 + bird["phase"]) * span * 0.7
-            pen = QPen(QColor(43, 67, 65, 210 if scene["is_day"] else 170), max(1.2, height*0.0015), Qt.SolidLine, Qt.RoundCap)
+            # A gentle ease keeps distant birds subtle and makes their perspective clear.
+            t = min(1.0, max(0.0, bird["t"]))
+            eased = t * t * (3.0 - 2.0 * t)
+            bx = (bird["x0"] + (bird["x1"] - bird["x0"]) * eased) * width
+            by = (bird["y0"] + (bird["y1"] - bird["y0"]) * eased) * height
+            scale = bird["scale0"] + (bird["scale1"] - bird["scale0"]) * eased
+            # Orient the V-shaped silhouette along its flight path.
+            vx = (bird["x1"] - bird["x0"]) * width
+            vy = (bird["y1"] - bird["y0"]) * height
+            angle = math.degrees(math.atan2(vy, vx))
+            span = max(1.0, height * 0.012 * scale)
+            flap = math.sin(now * (7.5 + scale * 2.0) + bird["phase"]) * span * 0.65
+            pen = QPen(QColor(43, 67, 65, 210 if scene["is_day"] else 170),
+                       max(0.7, height * 0.0015 * max(0.45, scale)), Qt.SolidLine, Qt.RoundCap)
+            painter.save()
+            painter.translate(bx, by)
+            painter.rotate(angle)
             painter.setPen(pen)
-            painter.drawLine(QPointF(bx-span, by+flap), QPointF(bx, by))
-            painter.drawLine(QPointF(bx, by), QPointF(bx+span, by+flap))
+            painter.drawLine(QPointF(-span, flap), QPointF(0.0, 0.0))
+            painter.drawLine(QPointF(0.0, 0.0), QPointF(span, flap))
+            painter.restore()
         # Ball with a soft ground shadow, glossy red/orange surface.
         bx, by, br = ball["x"]*width, ball["y"]*height, ball["r"]*height
         painter.setPen(Qt.NoPen)
@@ -10450,7 +10485,7 @@ try {
                                         float(landmarks[4].y)-float(landmarks[2].y)) > 0.08
             # A true tracking-toggle thumbs-up must point nearly vertically upward,
             # not diagonally out to the side. Use aspect-corrected camera pixels.
-            thumb_vertical = thumb_axis_is_vertical_up(landmarks, max_angle_degrees=25.0)
+            thumb_vertical = thumb_axis_is_vertical_up(landmarks, max_angle_degrees=10.0)
             return thumb_up and fingers_folded and thumb_extended and thumb_vertical
         except (IndexError, AttributeError, TypeError, ValueError):
             return False
@@ -11032,9 +11067,11 @@ try {
         self.update()
 
     def _adjust_scene_timer_cadence(self, hand_present, now):
-        """Run Garden Mode at 60 Hz; otherwise use active/idle UI cadence."""
+        """Use a lower-cost 30 Hz Garden cadence; otherwise use active/idle UI cadence."""
         if getattr(self, "virtual_garden_mode", False):
-            desired_ms = 16
+            # The scene includes weather, grass and animated props. 30 Hz remains smooth
+            # while roughly halving the repaint workload versus the old 60 Hz cadence.
+            desired_ms = 33
         else:
             desired_ms = 50 if hand_present or not self._scene_is_idle(now) else 100
         timer = getattr(self, "timer", None)
