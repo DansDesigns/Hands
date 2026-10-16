@@ -116,7 +116,7 @@ except Exception as exc:
     raise SystemExit(1)
 
 from PySide6.QtCore import Qt, QTimer, QPoint, QPointF, QRect, QRectF, QObject, Signal, QMimeData, QBuffer, QIODevice
-from PySide6.QtGui import QPainter, QColor, QPen, QBrush, QFont, QFontMetricsF, QCursor, QLinearGradient, QImage, QPainterPath, QPainterPathStroker, QRadialGradient, QPolygonF, QDrag, QPixmap
+from PySide6.QtGui import QPainter, QColor, QPen, QBrush, QFont, QFontMetricsF, QCursor, QLinearGradient, QImage, QPainterPath, QPainterPathStroker, QRadialGradient, QGradient, QPolygonF, QDrag, QPixmap
 from PySide6.QtCore import QUrl
 from PySide6.QtWidgets import QApplication, QWidget, QMessageBox, QInputDialog
 
@@ -410,6 +410,7 @@ def load_ui_preferences() -> dict:
         "stt_indicator_position": "top-right",
         "ui_font_scale": 1.2,
         "show_gesture_disabled_indicator": True,
+        "garden_onboarding_completed": False,
         **{key: "None" for key, _label in SOUND_SETTING_ROWS},
     }
     try:
@@ -425,7 +426,7 @@ def load_ui_preferences() -> dict:
                     result[key] = min(1.4, max(0.7, float(value)))
                 except (TypeError, ValueError):
                     pass
-            elif key == "show_gesture_disabled_indicator":
+            elif key in ("show_gesture_disabled_indicator", "garden_onboarding_completed"):
                 if isinstance(value, bool):
                     result[key] = value
             elif key in dict(SOUND_SETTING_ROWS):
@@ -445,7 +446,7 @@ def save_ui_preferences(values: dict) -> None:
                 current[key] = min(1.4, max(0.7, float(value)))
             except (TypeError, ValueError):
                 pass
-        elif key == "show_gesture_disabled_indicator":
+        elif key in ("show_gesture_disabled_indicator", "garden_onboarding_completed"):
             if isinstance(value, bool):
                 current[key] = value
         elif key in dict(SOUND_SETTING_ROWS):
@@ -829,6 +830,19 @@ def is_open_hand_pose(landmarks, edge_tolerant=False):
     return sum(value >= threshold for value in straight) >= 3
 
 
+def is_fully_open_hand_pose(landmarks, edge_tolerant=False):
+    """Release a committed grip ONLY after all four fingers are straight.
+
+    Uses joint-chain distances (rotation invariant), not fingertip screen
+    directions. The ordinary three-finger open test remains unchanged for
+    clicks and non-grip gestures.
+    """
+    if landmarks is None or len(landmarks) < 21:
+        return False
+    threshold = 0.84 if edge_tolerant else 0.86
+    return all(value >= threshold for value in _finger_straightness_values(landmarks))
+
+
 def is_thumb_index_menu_pinch(landmarks, edge_tolerant=False):
     """Robust thumb/index pinch (index only) with at least two other fingers extended.
 
@@ -844,6 +858,11 @@ def is_thumb_index_menu_pinch(landmarks, edge_tolerant=False):
         return False
     palm = max(1e-5, distance3d(landmarks, 0, 9))
     pinch_gap = distance3d(landmarks, 4, 8) / palm
+    # The TPI is a visual pointer, NOT a pinch trigger. The older menu-pose
+    # tolerance (over half a palm length) accepted an index finger merely
+    # passing through the TPI. Require actual thumb/index fingertip proximity.
+    if pinch_gap > 0.29:
+        return False
     straight = _finger_straightness_values(landmarks)
     return should_recognize_menu_pinch(normalized_gap=pinch_gap,
                                        finger_straightness=straight,
@@ -1598,7 +1617,8 @@ class SearchHandOverlay(QWidget):
                     painter.drawLine(QPointF(original.x(), original.y()-6), QPointF(original.x(), original.y()+6))
                 # The common bright TLI remains the single visible/interactive cursor.
             engaged = side in owner.active_push_sides or (owner.click_side == side and now < owner.click_flash_until)
-            owner._paint_tli(painter, cursor, side, engaged)
+            if not owner._scroll_cursor_suppressed(side):
+                owner._paint_tli(painter, cursor, side, engaged)
         # Windows uses this layer in place of main-window hand rendering. Paint
         # peace timers AFTER all cursors so an off hand still gets its circle.
         for side in ("left", "right"):
@@ -2126,8 +2146,26 @@ class SpatialDesktop(QWidget):
         self.space_constellations = list(self.virtual_desktop_data.get("constellations", []))
         # Play-based onboarding is contextual, not a modal calibration wizard.
         self._scene_tutorial_steps = set()
+        # A replayable, non-modal Garden playground. Only its temporary fist
+        # exercises capture gestures; normal gesture handling is unchanged elsewhere.
+        self._onboarding_enabled = not self.ui_preferences.get("garden_onboarding_completed", False)
+        self._onboarding_celebrate_until = 0.0
+        self._onboarding_disabled_side = None
+        self._onboarding_practice_anchor = None
+        self._onboarding_practice_progress = 0.0
+        self._onboarding_last_practice_at = 0.0
+        self._onboarding_practice_cooldown_until = 0.0
+        self._onboarding_button_pinch_previous = {"left": False, "right": False}
+        self._onboarding_button_pinch_latched = {"left": False, "right": False}
         self._scene_arrow_pinch_previous = {"left": False, "right": False}
         self._scene_arrow_pinch_latched = {"left": False, "right": False}
+        # Right-fist scene navigation is independent of OS/window scrolling.
+        # Require an open hand between scene changes to avoid bouncing back.
+        self._virtual_scene_grip_anchor = None
+        self._virtual_scene_grip_last_seen = 0.0
+        self._virtual_scene_grip_latched = False
+        self._virtual_scene_grip_active = False
+        self._virtual_scene_grip_open_since = None
         self._scene_transition = None
         self._space_constellation_revision = 0
         self._garden_constellation_cache = None
@@ -2427,6 +2465,9 @@ class SpatialDesktop(QWidget):
         self.slider_last_good_cursor = {side: None for side in sides}
         self.slider_cursor_jump_candidate = {side: None for side in sides}
         self.fist_scroll_remainder = {side: 0.0 for side in sides}
+        # Win32 ShowCursor is paired exactly once at grip start/end. Never mutate
+        # the user's permanent mouse-detach preference for a temporary scroll.
+        self._native_scroll_cursor_hidden = False
         # Stationary origin marker for recognised fist-drag scrolling.
         self.fist_scroll_markers = {side: None for side in sides}
         self.fist_mouse_down = {side: False for side in sides}
@@ -2872,6 +2913,73 @@ class SpatialDesktop(QWidget):
             round(first.alpha() * (1.0 - amount) + second.alpha() * amount),
         )
 
+    def _paint_garden_clouds(self, painter, width, height, scene):
+        """Layer soft cumulus/cirrus clouds into the cached day/night Garden sky."""
+        amount = max(0.0, min(1.0, float(scene["cloudiness"])))
+        count = min(9, max(0, round(amount * 9)))
+        if count == 0:
+            return
+        is_day = bool(scene["is_day"])
+        unsettled = scene["kind"] in ("rain", "storm", "snow", "fog")
+        painter.save()
+        try:
+            painter.setPen(Qt.NoPen)
+            for index in range(count):
+                # Local seeded randomness: cloud shapes stay still between sky-cache
+                # refreshes, independent of the random physics and star generators.
+                rng = random.Random(44117 + index * 7927)
+                x = width * ((0.045 + index * 0.211 + rng.uniform(-0.035, 0.035)) % 1.06)
+                y = height * (0.12 + (index % 4) * 0.065 + rng.uniform(-0.018, 0.017))
+                span = width * (0.125 + rng.random() * 0.10) * (1.18 if unsettled else 1.0)
+                depth = height * (0.057 + rng.random() * 0.045)
+                opacity = min(215, int((58 + 148 * amount) * (0.77 + rng.random() * .23)))
+                if is_day:
+                    top_rgb = (250, 251, 253) if not unsettled else (205, 215, 227)
+                    base_rgb = (94, 119, 149) if not unsettled else (65, 83, 104)
+                else:
+                    top_rgb = (132, 148, 176) if not unsettled else (102, 116, 140)
+                    base_rgb = (20, 35, 61) if not unsettled else (11, 21, 43)
+
+                def soft_puff(cx, cy, rw, rh, rgb, strength):
+                    # ObjectBoundingMode scales the radial falloff to the oval,
+                    # keeping both vertical and horizontal edges feathered.
+                    gradient = QRadialGradient(0.47, 0.44, 0.57)
+                    gradient.setCoordinateMode(QGradient.ObjectBoundingMode)
+                    alpha = min(245, max(0, int(opacity * strength)))
+                    gradient.setColorAt(0.0, QColor(*rgb, alpha))
+                    gradient.setColorAt(0.52, QColor(*rgb, int(alpha * 0.78)))
+                    gradient.setColorAt(0.82, QColor(*rgb, int(alpha * 0.28)))
+                    gradient.setColorAt(1.0, QColor(*rgb, 0))
+                    painter.setBrush(QBrush(gradient))
+                    painter.drawEllipse(QRectF(cx-rw, cy-rh, 2*rw, 2*rh))
+
+                # Horizontal vapour and low, cool shadow tie the separate puffs
+                # together; soft edges let the actual sky show through the cloud.
+                soft_puff(x, y + depth * 0.23, span * .57, depth * .57,
+                          base_rgb, .60 if unsettled else .43)
+                soft_puff(x-span*.12, y+depth*.10, span*.44, depth*.43,
+                          base_rgb, .42)
+                # Each cluster gets a different irregular outline. The upper puffs
+                # are sunlit, while the lower portions blend with their shadow.
+                for j in range(11):
+                    u = (j + rng.uniform(-.17, .17)) / 10.0 - .5
+                    puff_x = x + u * span * 1.75
+                    puff_y = y - depth * (0.08 + .28 * (1.0-abs(u)*1.5))
+                    puff_y += depth * rng.uniform(-.27, .28)
+                    rw = span * rng.uniform(.15, .27)
+                    rh = depth * rng.uniform(.39, .86)
+                    soft_puff(puff_x + rw*.06, puff_y + rh*.23, rw*1.05, rh*.82,
+                              base_rgb, .36 if is_day else .44)
+                    soft_puff(puff_x - rw*.06, puff_y-rh*.18, rw, rh,
+                              top_rgb, .61 if is_day else .47)
+                # Thin detached veils evoke distant high cirrus rather than more
+                # identical rounded lumps; they share the same cached image.
+                if index % 3 == 0:
+                    soft_puff(x + span*.62, y-depth*.64, span*.65, depth*.20,
+                              top_rgb, .19)
+        finally:
+            painter.restore()
+
     def _paint_virtual_garden_background(self, painter, width, height, scene):
         """Render static sky, celestial objects, clouds and hills into a cached image."""
         width, height = float(width), float(height)
@@ -2953,34 +3061,10 @@ class SpatialDesktop(QWidget):
             painter.setPen(QPen(QColor(255, 241, 187, int(180*brightness)), max(1.0, height*0.001)))
             painter.drawEllipse(sun, sun_radius, sun_radius)
 
-        # Real-time cloud cover changes both the light and the visible cloud layer.
-        cloud_count = min(7, max(0, int(round(cloudiness * 7))))
-        for index in range(cloud_count):
-            cloud_x = ((index * 0.217 + 0.035) % 1.0) * width
-            cloud_y = height * (0.095 + ((index * 7) % 7) * 0.023)
-            cloud_w = height * (0.095 + ((index * 5) % 4) * 0.010)
-            cloud_h = height * (0.027 + ((index * 3) % 3) * 0.006)
-            if is_day:
-                cloud_colour = QColor(245, 249, 251, int(35 + cloudiness * 175))
-                cloud_shadow = QColor(93, 119, 142, int(10 + cloudiness * 60))
-            else:
-                cloud_colour = QColor(126, 145, 171, int(25 + cloudiness * 100))
-                cloud_shadow = QColor(15, 28, 49, int(25 + cloudiness * 70))
-            painter.setPen(Qt.NoPen)
-            painter.setBrush(cloud_shadow)
-            painter.drawEllipse(QRectF(cloud_x-cloud_w*0.34, cloud_y-cloud_h*0.02,
-                                       cloud_w*0.68, cloud_h*1.20))
-            painter.drawEllipse(QRectF(cloud_x-cloud_w*0.12, cloud_y-cloud_h*0.35,
-                                       cloud_w*0.45, cloud_h*1.15))
-            painter.drawEllipse(QRectF(cloud_x+cloud_w*0.10, cloud_y-cloud_h*0.10,
-                                       cloud_w*0.48, cloud_h*1.0))
-            painter.setBrush(cloud_colour)
-            painter.drawEllipse(QRectF(cloud_x-cloud_w*0.35, cloud_y-cloud_h*0.12,
-                                       cloud_w*0.66, cloud_h))
-            painter.drawEllipse(QRectF(cloud_x-cloud_w*0.10, cloud_y-cloud_h*0.44,
-                                       cloud_w*0.46, cloud_h*1.04))
-            painter.drawEllipse(QRectF(cloud_x+cloud_w*0.12, cloud_y-cloud_h*0.15,
-                                       cloud_w*0.45, cloud_h*0.98))
+        # Soft, irregular cloud banks are painted *once* into the cached sky.
+        # Varying puff sizes, diffuse edges, shaded bases and highlights avoids the
+        # cartoon three-ellipse silhouette without adding work to each hand frame.
+        self._paint_garden_clouds(painter, width, height, scene)
 
         # Rolling hills change to cooler, darker greens at night and in poor weather.
         if is_day:
@@ -3210,6 +3294,11 @@ class SpatialDesktop(QWidget):
 
     def mousePressEvent(self, event):
         if event.button() == Qt.LeftButton and self.desktop_mode == "virtual":
+            tutorial_action = self._onboarding_button_at(event.position())
+            if tutorial_action is not None:
+                self._onboarding_button_action(tutorial_action)
+                event.accept()
+                return
             if self._scene_transition is not None:
                 event.accept()
                 return
@@ -3241,8 +3330,9 @@ class SpatialDesktop(QWidget):
                 ball["offset_y"] = ball["y"] - point.y()/max(1., float(self.height()))
                 ball["last_drag_at"] = time.monotonic()
                 ball["vx"] = ball["vy"] = 0.0
+                ball["tutorial_origin"] = (ball["x"], ball["y"])
+                ball["tutorial_travel"] = 0.0
                 self.status = "Garden ball picked up"
-                self._scene_tutorial_steps.add("ball")
                 self.update()
                 event.accept()
                 return
@@ -3260,6 +3350,10 @@ class SpatialDesktop(QWidget):
             ball["vx"] = max(-1.8, min(1.8, (x-ball["x"])/dt))
             ball["vy"] = max(-1.8, min(1.8, (y-ball["y"])/dt))
             ball["x"], ball["y"] = x, y
+            origin = ball.get("tutorial_origin")
+            if origin is not None:
+                ball["tutorial_travel"] = max(ball.get("tutorial_travel", 0.0),
+                    math.hypot((x-origin[0])*width, (y-origin[1])*height))
             ball["last_drag_at"] = now
             self.update()
             event.accept()
@@ -3317,7 +3411,11 @@ class SpatialDesktop(QWidget):
             return False
         palm = max(1e-5, distance3d(landmarks, 0, 9))
         index_gap = distance3d(landmarks, 4, 8)/palm
-        if index_gap > (0.60 if held else 0.42):
+        # Scene objects, arrows and tutorial controls use the same real
+        # fingertip-contact requirement as the built-in pinch. Once a pinch
+        # starts, allow a small release margin to prevent jittery dropping.
+        # Cursor/TPI overlap alone must never initiate a pinch.
+        if index_gap > (0.36 if held else 0.29):
             return False
         # Reject a thumb-to-middle-finger pinch, but tolerate a naturally
         # folded middle finger when index and thumb are very close together.
@@ -3384,9 +3482,10 @@ class SpatialDesktop(QWidget):
             ball["offset_y"] = ball["y"] - float(cursor.y())/max(1.0, float(self.height()))
             ball["last_drag_at"] = now
             ball["vx"] = ball["vy"] = 0.0
+            ball["tutorial_origin"] = (ball["x"], ball["y"])
+            ball["tutorial_travel"] = 0.0
             self.gesture_owner = side
             self.status = "Garden ball picked up — move while pinching, release to drop"
-            self._scene_tutorial_steps.add("ball")
         if is_pinch:
             ball["release_since"] = None
             width, height = max(1.0, float(self.width())), max(1.0, float(self.height()))
@@ -3402,6 +3501,10 @@ class SpatialDesktop(QWidget):
                 ball["vy"] = 0.6*ball["vy"] + 0.4*target_vy
                 ball["last_drag_at"] = now
             ball["x"], ball["y"] = x, y
+            origin = ball.get("tutorial_origin")
+            if origin is not None:
+                ball["tutorial_travel"] = max(ball.get("tutorial_travel", 0.0),
+                    math.hypot((x-origin[0])*width, (y-origin[1])*height))
         else:
             # Allow a tiny dropout, but release normally when the pinch opens.
             if ball.get("release_since") is None:
@@ -3419,6 +3522,12 @@ class SpatialDesktop(QWidget):
         ball.pop("offset_x", None)
         ball.pop("offset_y", None)
         ball.pop("last_drag_at", None)
+        # The learning exercise finishes only after a genuine carry AND release,
+        # not on the first pinch frame. Ball physics are otherwise unchanged.
+        moved = ball.pop("tutorial_travel", 0.0) >= 40.0
+        ball.pop("tutorial_origin", None)
+        if moved:
+            self._onboarding_complete_step("ball")
         if self.gesture_owner == side:
             self.gesture_owner = None
         self.status = "Garden ball dropped"
@@ -3636,6 +3745,11 @@ class SpatialDesktop(QWidget):
         height = float(self.height() if height is None else height)
         if scene not in ("garden", "space"):
             return QRectF()
+        # During the two navigation lessons the user must actually pull with a
+        # right-hand fist, rather than skip the lesson by clicking either arrow.
+        if self._onboarding_enabled and (self._onboarding_stage() or (None,))[0] == (
+                "space" if scene == "garden" else "returned"):
+            return QRectF()
         y = 22.0 if scene == "garden" else max(8.0, height-95.0)
         return QRectF(max(8.0, (width-206.0)/2.0), y, min(206.0, width-16.0), 55.0)
 
@@ -3675,53 +3789,449 @@ class SpatialDesktop(QWidget):
         finally:
             painter.restore()
 
-    def _paint_scene_tutorial_hint(self, painter, width, height, scene, weather=None):
-        """Unintrusive play prompts, advanced by real interactions in each scene."""
-        steps = self._scene_tutorial_steps
-        if scene == "garden":
-            if self.space_constellations and "constellation" in steps:
-                hint = ("Look up! Your constellations shine in the night sky."
-                        if weather is not None and not weather.get("is_day", True)
-                        else "Your constellations will appear in this sky at night.")
-            elif "ball" not in steps:
-                hint = "TRY IT  ·  Pinch and carry the bouncing ball"
-            elif "sundial" not in steps:
-                hint = "TRY IT  ·  Tap the sundial to project the time"
-            elif "space" not in steps:
-                hint = "NEXT  ·  Select the up arrow to explore the stars"
-            else:
-                return
-        elif scene == "space":
-            hint = ("TRY IT  ·  Pinch a star, trace to others, then release"
-                    if "constellation" not in steps
-                    else "NEXT  ·  Use the down arrow to see your stars in Garden")
+    # The initial five activities teach discovery by playing with Garden and Space.
+    # Later lessons practise existing system gestures without synthesising OS input.
+    ONBOARDING_LESSONS = (
+        ("ball", "PICK UP & DROP", "Pinch the bouncing ball, move it around, then release."),
+        ("sundial", "TAP TO CLICK", "Tap or pinch-click the sundial to switch the sky clock on or off."),
+        ("space", "LOOK UP", "Make a RIGHT fist and PULL DOWN to lift the view into the stars."),
+        ("constellation", "DRAW IN SPACE", "Pinch a star, travel to other stars, then release."),
+        ("returned", "BACK TO EARTH", "Make a RIGHT fist and PULL UP to bring the Garden back into view."),
+        ("peace_disabled", "LOCK YOUR HAND", "Hold a peace sign until the timer circle finishes to disable a hand."),
+        ("peace_enabled", "UNLOCK YOUR HAND", "Hold the same peace sign until its timer finishes to re-enable it."),
+        ("pinch_menu", "OPEN THE PINCH MENU", "In an empty area, hold a thumb-index pinch until its timer finishes."),
+        ("right_click", "TRY RIGHT-CLICK", "Hold a LEFT fist and briefly pinch/release with RIGHT to open context actions."),
+        ("fist_scroll", "PRACTISE SCROLLING", "Close your RIGHT fist and move it up or down to fill the meter."),
+        ("two_fists", "PRACTISE WINDOW MOVING", "Hold your LEFT fist still; make a RIGHT fist and move it sideways."),
+        ("glass_menu", "TOGGLE THE GLASS MENU", "Open both hands and bring their coloured cursor circles together."),
+    )
+
+    def _onboarding_stage(self):
+        if not self._onboarding_enabled:
+            return None
+        for key, title, description in self.ONBOARDING_LESSONS:
+            if key not in self._scene_tutorial_steps:
+                return key, title, description
+        return None
+
+    def _onboarding_in_garden(self):
+        return bool(self._onboarding_enabled and self.desktop_mode == "virtual" and
+                    self.virtual_garden_mode and not self._gesture_ui_modal_open() and
+                    self._scene_transition is None)
+
+    def _onboarding_finish(self, show_celebration=True):
+        self._onboarding_enabled = False
+        self._onboarding_practice_anchor = None
+        self._onboarding_practice_progress = 0.0
+        self._onboarding_disabled_side = None
+        self._onboarding_button_pinch_latched = {"left": False, "right": False}
+        self._onboarding_celebrate_until = (time.monotonic()+10.0 if show_celebration else 0.0)
+        self.ui_preferences["garden_onboarding_completed"] = True
+        save_ui_preferences(self.ui_preferences)
+        self.update()
+
+    def _onboarding_complete_step(self, step):
+        if not self._onboarding_enabled or step in self._scene_tutorial_steps:
+            return
+        stage = self._onboarding_stage()
+        if stage is None or stage[0] != step:
+            return
+        self._scene_tutorial_steps.add(step)
+        self._onboarding_practice_anchor = None
+        self._onboarding_practice_progress = 0.0
+        if step == "glass_menu":
+            self._onboarding_finish()
         else:
+            self.update()
+
+    def _onboarding_replay(self):
+        self._onboarding_enabled = True
+        self._onboarding_celebrate_until = 0.0
+        self._onboarding_disabled_side = None
+        self._onboarding_practice_anchor = None
+        self._onboarding_practice_progress = 0.0
+        self._onboarding_last_practice_at = 0.0
+        self._onboarding_practice_cooldown_until = 0.0
+        self._virtual_scene_grip_anchor = None
+        self._virtual_scene_grip_latched = False
+        self._virtual_scene_grip_active = False
+        self._virtual_scene_grip_open_since = None
+        self._onboarding_button_pinch_latched = {"left": False, "right": False}
+        self._onboarding_button_pinch_previous = {"left": False, "right": False}
+        self._scene_transition = None
+        self._virtual_scene_grip_last_seen = 0.0
+        if self.virtual_scene != "garden":
+            self._set_virtual_scene("garden")
+        # _set_virtual_scene finalises active constellations, which can add an
+        # old lesson completion. Clear only *after* changing scenes.
+        self._scene_tutorial_steps.clear()
+        self._scene_arrow_pinch_previous = {"left": False, "right": False}
+        self._scene_arrow_pinch_latched = {"left": False, "right": False}
+        self.ui_preferences["garden_onboarding_completed"] = False
+        save_ui_preferences(self.ui_preferences)
+        self.status = "Garden lessons restarted — learn by playing"
+        self.update()
+
+    def _onboarding_open_gesture_map(self):
+        # Reuse the full-size reference from the Glass Menu, rather than adding
+        # a second image viewer or importing image assets into the renderer.
+        self._set_menu_open(True)
+        self._show_gesture_map_overlay()
+        self.update()
+
+    def _onboarding_controls(self, width=None, height=None):
+        width = float(self.width() if width is None else width)
+        height = float(self.height() if height is None else height)
+        chip = QRectF(18.0, 96.0, min(174.0, width-36.0), 35.0)
+        banner_w = min(max(220.0, width-28.0), 680.0)
+        banner_h = 158.0
+        banner = QRectF((width-banner_w)*0.5, (height-banner_h)*0.5, banner_w, banner_h)
+        return {
+            "chip": chip, "banner": banner,
+            "skip": QRectF(banner.right()-92.0, banner.top()+11.0, 76.0, 29.0),
+            "map": QRectF(banner.right()-146.0, banner.bottom()-39.0, 129.0, 29.0),
+        }
+
+    def _onboarding_button_at(self, point):
+        if (point is None or self.desktop_mode != "virtual" or
+                self.virtual_scene not in ("garden", "space") or
+                self._gesture_ui_modal_open() or self._scene_transition is not None):
+            return None
+        rects = self._onboarding_controls()
+        # Reset is reachable even mid-lesson and from Space, not just after
+        # completing/skipping the tutorial back in Garden.
+        if rects["chip"].contains(point):
+            return "replay"
+        if self._onboarding_enabled:
+            if rects["skip"].contains(point):
+                return "skip"
+            if rects["map"].contains(point):
+                return "map"
+        return None
+
+    def _onboarding_button_action(self, action):
+        if action == "skip":
+            self._onboarding_finish(show_celebration=False)
+        elif action == "replay":
+            self._onboarding_replay()
+        elif action == "map":
+            self._onboarding_open_gesture_map()
+
+    def _onboarding_handle_button_frame(self, side, cursor, landmarks, edge_tolerant=False):
+        """Pinch-click a lesson control once; hovering never arms the Pinch Menu."""
+        action = self._onboarding_button_at(cursor)
+        pinch = (not is_fist_or_grip_pose(landmarks, edge_tolerant=edge_tolerant) and
+                 self._garden_object_pinch(landmarks, held=self._onboarding_button_pinch_latched[side]))
+        previous = self._onboarding_button_pinch_previous[side]
+        self._onboarding_button_pinch_previous[side] = bool(pinch)
+        if self._onboarding_button_pinch_latched[side]:
+            self._clear_menu_pinch_sequence(side)
+            if not pinch:
+                self._onboarding_button_pinch_latched[side] = False
+            return True
+        if action is None:
+            return False
+        self._clear_menu_pinch_sequence(side)
+        self._reset_fist_gesture(side)
+        if pinch and not previous:
+            self._onboarding_button_pinch_latched[side] = True
+            self._onboarding_button_action(action)
+        return True
+
+    def _virtual_scene_grip_is_held(self, landmarks, now, edge_tolerant=False):
+        """Latch a recognised fist across rotation/partial-finger pose noise.
+
+        A clearly open four-finger hand held for 0.18 s is the only normal
+        release. Tracking loss and explicit tracking disable still cancel it.
+        """
+        if is_fist_or_grip_pose(landmarks, edge_tolerant=edge_tolerant):
+            self._virtual_scene_grip_active = True
+            self._virtual_scene_grip_open_since = None
+            return True
+        if not self._virtual_scene_grip_active:
+            return False
+        if is_fully_open_hand_pose(landmarks, edge_tolerant=edge_tolerant):
+            if self._virtual_scene_grip_open_since is None:
+                self._virtual_scene_grip_open_since = now
+            elif now-self._virtual_scene_grip_open_since >= 0.18:
+                self._virtual_scene_grip_active = False
+                self._virtual_scene_grip_open_since = None
+                return False
+        else:
+            self._virtual_scene_grip_open_since = None
+        return True
+
+    def _onboarding_space_scroll_frame(self, side, cursor, landmarks, now,
+                                       edge_tolerant=False, left_fist_active=False):
+        """Teach the two inverse pull directions using the real right-fist pose.
+
+        Garden -> Space: pull DOWN, which slides the scenery down.
+        Space -> Garden: pull UP, which slides the scenery up.
+        """
+        stage = self._onboarding_stage()
+        if (side != "right" or stage is None or not self._onboarding_enabled or
+                self.desktop_mode != "virtual" or self._scene_transition is not None or
+                self._gesture_ui_modal_open()):
+            return False
+        key = stage[0]
+        if not ((key == "space" and self.virtual_garden_mode) or
+                (key == "returned" and self.virtual_space_mode)):
+            return False
+        fist_held = self._virtual_scene_grip_is_held(landmarks, now, edge_tolerant)
+        if not fist_held or cursor is None:
+            if not fist_held:
+                self._virtual_scene_grip_latched = False
+            self._onboarding_practice_anchor = None
+            self._onboarding_practice_progress = 0.0
+            return False
+        # The lesson is consumed before OS scroll, native drag, and pinch menus.
+        self._clear_menu_pinch_sequence(side)
+        self._reset_fist_gesture(side)
+        if self._virtual_scene_grip_latched:
+            return True
+        if left_fist_active:
+            self._onboarding_practice_anchor = None
+            self._onboarding_practice_progress = 0.0
+            return True
+        kind = "ascend" if key == "space" else "descend"
+        if (self._onboarding_practice_anchor is None or
+                self._onboarding_practice_anchor[0] != kind or
+                now-self._onboarding_last_practice_at > 0.5):
+            self._onboarding_practice_anchor = (kind, QPointF(cursor))
+            self._onboarding_practice_progress = 0.0
+        self._onboarding_last_practice_at = now
+        origin = self._onboarding_practice_anchor[1]
+        pull = ((cursor.y()-origin.y()) if key == "space"
+                else (origin.y()-cursor.y()))
+        travel = max(0.0, pull)
+        sideways = abs(cursor.x()-origin.x())
+        distance_needed = max(72.0, self.height()*0.09)
+        self._onboarding_practice_progress = min(1.0, travel/distance_needed)
+        if travel >= distance_needed and travel > sideways*1.2:
+            if self._start_scene_slide(now):
+                # A single held fist must never immediately reverse the slide.
+                self._virtual_scene_grip_latched = True
+                self._onboarding_practice_anchor = None
+                self._onboarding_practice_progress = 0.0
+        return True
+
+    def _virtual_scene_grip_scroll_frame(self, side, cursor, landmarks, now,
+                                          edge_tolerant=False, left_fist_active=False):
+        """Allow right-fist vertical scene navigation outside guided lessons.
+
+        This is an in-app scene gesture and never posts OS scroll events.
+        """
+        if side != "right" or self.desktop_mode != "virtual" or self.virtual_scene not in ("garden", "space"):
+            return False
+        fist_held = self._virtual_scene_grip_is_held(landmarks, now, edge_tolerant)
+        if not fist_held:
+            # A full, sustained opening (not an upward/downward hand tilt)
+            # releases the grip and allows another scene change.
+            self._virtual_scene_grip_anchor = None
+            self._virtual_scene_grip_latched = False
+            return False
+        if self._scene_transition is not None:
+            self._clear_menu_pinch_sequence(side)
+            self._reset_fist_gesture(side)
+            return True
+        if self._gesture_ui_modal_open() or cursor is None:
+            self._virtual_scene_grip_anchor = None
+            return False
+        if self._virtual_scene_grip_latched:
+            self._clear_menu_pinch_sequence(side)
+            self._reset_fist_gesture(side)
+            return True
+        if left_fist_active:
+            # Two-fist dragging keeps its existing priority.
+            self._virtual_scene_grip_anchor = None
+            return False
+        if self._onboarding_enabled and self._onboarding_stage() is not None:
+            # The guided exercises handle their own fist gestures and progress.
+            # Do not allow normal navigation to skip an unrelated lesson.
+            self._virtual_scene_grip_anchor = None
+            return False
+        self._clear_menu_pinch_sequence(side)
+        self._reset_fist_gesture(side)
+        if (self._virtual_scene_grip_anchor is None or
+                now-self._virtual_scene_grip_last_seen > 0.5):
+            self._virtual_scene_grip_anchor = QPointF(cursor)
+        self._virtual_scene_grip_last_seen = now
+        origin = self._virtual_scene_grip_anchor
+        pull = ((cursor.y()-origin.y()) if self.virtual_scene == "garden"
+                else (origin.y()-cursor.y()))
+        sideways = abs(cursor.x()-origin.x())
+        threshold = max(72.0, self.height()*0.09)
+        if pull >= threshold and pull > sideways*1.2:
+            if self._start_scene_slide(now):
+                self._virtual_scene_grip_latched = True
+                self._virtual_scene_grip_anchor = None
+        return True
+
+    def _onboarding_practice_fist_frame(self, side, cursor, landmarks, hands_by_side, now,
+                                        edge_tolerant=False):
+        """Capture fist exercises ONLY in the Garden tutorial, never scroll OS windows."""
+        if not self._onboarding_in_garden():
+            return False
+        stage = self._onboarding_stage()
+        if stage is None:
+            return False
+        key = stage[0]
+        if key not in ("fist_scroll", "two_fists") and now >= self._onboarding_practice_cooldown_until:
+            return False
+        fist = (self._virtual_scene_grip_is_held(landmarks, now, edge_tolerant)
+                if side == "right" else
+                is_fist_or_grip_pose(landmarks, edge_tolerant=edge_tolerant))
+        if now < self._onboarding_practice_cooldown_until:
+            if fist:
+                self._reset_fist_gesture(side)
+                self._clear_menu_pinch_sequence(side)
+                return True
+            return False
+        if key not in ("fist_scroll", "two_fists"):
+            return False
+        if now-self._onboarding_last_practice_at > 0.5:
+            # A missing hand or a long processing stall should never finish a
+            # lesson from an old anchor when tracking resumes.
+            self._onboarding_practice_anchor = None
+            self._onboarding_practice_progress = 0.0
+        self._onboarding_last_practice_at = now
+        if not fist:
+            if side == "right":
+                self._onboarding_practice_anchor = None
+                self._onboarding_practice_progress = 0.0
+            return False
+        self._clear_menu_pinch_sequence(side)
+        self._reset_fist_gesture(side)
+        if key == "fist_scroll":
+            if side != "right" or ("left" in hands_by_side and
+                    is_fist_or_grip_pose(hands_by_side["left"][0])):
+                return True
+            if self._onboarding_practice_anchor is None:
+                self._onboarding_practice_anchor = ("scroll", QPointF(cursor))
+            kind, anchor = self._onboarding_practice_anchor
+            if kind != "scroll":
+                self._onboarding_practice_anchor = ("scroll", QPointF(cursor))
+                anchor = QPointF(cursor)
+            distance = abs(cursor.y()-anchor.y())
+            self._onboarding_practice_progress = min(1.0, distance / max(72.0, self.height()*0.09))
+            if self._onboarding_practice_progress >= 1.0:
+                self._onboarding_practice_cooldown_until = now+0.9
+                self._onboarding_complete_step("fist_scroll")
+            return True
+        # Two fists: the left anchors the clutch, the right does the moving.
+        left_entry, right_entry = hands_by_side.get("left"), hands_by_side.get("right")
+        if left_entry is None or right_entry is None or not (
+                self.gesture_tracking_enabled.get("left", True) and
+                self.gesture_tracking_enabled.get("right", True) and
+                is_fist_or_grip_pose(left_entry[0]) and
+                is_fist_or_grip_pose(right_entry[0])):
+            self._onboarding_practice_anchor = None
+            self._onboarding_practice_progress = 0.0
+            return True
+        left_point = self.side_cursor_positions.get("left")
+        right_point = self.side_cursor_positions.get("right")
+        if left_point is None or right_point is None:
+            return True
+        if self._onboarding_practice_anchor is None or self._onboarding_practice_anchor[0] != "window":
+            self._onboarding_practice_anchor = ("window", QPointF(left_point), QPointF(right_point))
+        _, origin_left, origin_right = self._onboarding_practice_anchor
+        if math.hypot(left_point.x()-origin_left.x(), left_point.y()-origin_left.y()) > 55.0:
+            self._onboarding_practice_anchor = ("window", QPointF(left_point), QPointF(right_point))
+            self._onboarding_practice_progress = 0.0
+            return True
+        right_distance = math.hypot(right_point.x()-origin_right.x(), right_point.y()-origin_right.y())
+        self._onboarding_practice_progress = min(1.0, right_distance/max(70.0, self.width()*0.045))
+        if self._onboarding_practice_progress >= 1.0:
+            self._onboarding_practice_cooldown_until = now+0.9
+            self._onboarding_complete_step("two_fists")
+        return True
+
+    def _paint_scene_tutorial_hint(self, painter, width, height, scene, weather=None):
+        """Contextual lessons plus a small replay control; no additional render timer."""
+        if scene not in ("garden", "space") or (self.menu_open and self.hub_visible):
             return
-        # Keep the instructions central and legible without blocking an open Glass
-        # Menu. The hints return automatically as soon as the menu is hidden.
-        if self.menu_open and self.hub_visible:
-            return
+        controls = self._onboarding_controls(width, height)
         painter.save()
         try:
             painter.setRenderHint(QPainter.Antialiasing, True)
-            painter.setFont(self._ui_font(13, QFont.DemiBold))
-            metrics = QFontMetricsF(painter.font())
-            available = max(170.0, float(width)-32.0)
-            banner_w = min(available, max(330.0, metrics.horizontalAdvance(hint)+56.0))
-            wrapped = metrics.boundingRect(
-                QRectF(0.0, 0.0, max(90.0, banner_w-28.0), 500.0),
-                Qt.AlignCenter | Qt.TextWordWrap, hint)
-            banner_h = max(56.0, wrapped.height()+22.0)
-            bubble = QRectF((width-banner_w)*0.5, (height-banner_h)*0.5,
-                            banner_w, banner_h)
-            # Semi-transparent dark glass keeps the garden/nebula visible behind
-            # the tutorial while a bright cyan-white label remains readable.
-            painter.setPen(QPen(QColor(164, 234, 255, 160), 1.5))
-            painter.setBrush(QColor(8, 21, 43, 112))
-            painter.drawRoundedRect(bubble, 15.0, 15.0)
-            label = bubble.adjusted(14.0, 6.0, -14.0, -6.0)
-            painter.setPen(QColor(255, 255, 255, 250))
-            painter.drawText(label, Qt.AlignCenter | Qt.TextWordWrap, hint)
+            painter.setPen(QPen(QColor(145, 225, 255, 170), 1.25))
+            painter.setBrush(QColor(8, 26, 50, 176))
+            painter.drawRoundedRect(controls["chip"], 12.0, 12.0)
+            painter.setPen(QColor(238, 251, 255))
+            painter.setFont(self._ui_font(8, QFont.DemiBold))
+            painter.drawText(controls["chip"], Qt.AlignCenter,
+                             "RESET TUTORIAL" if self._onboarding_enabled else "REPLAY TUTORIAL")
+            if (not self._onboarding_enabled and scene == "garden" and
+                    time.monotonic() < self._onboarding_celebrate_until):
+                message = "ALL SET!  Try more gestures in the Glass Menu's Gesture Map."
+                banner = controls["banner"]
+                painter.setBrush(QColor(9, 31, 56, 170))
+                painter.drawRoundedRect(banner, 18, 18)
+                painter.setFont(self._ui_font(12, QFont.DemiBold))
+                painter.drawText(banner.adjusted(24, 20, -24, -20),
+                                 Qt.AlignCenter | Qt.TextWordWrap, message)
+        finally:
+            painter.restore()
+        if not self._onboarding_enabled:
+            return
+        stage = self._onboarding_stage()
+        if stage is None:
+            return
+        key, title, description = stage
+        # Lessons tied to a specific world remind the user where to practise.
+        if scene == "space" and key not in ("constellation", "returned"):
+            title, description = "BACK TO THE GARDEN", "Make a RIGHT fist and PULL UP to return to the Garden."
+        elif scene == "garden" and key == "constellation":
+            title, description = "EXPLORE THE STARS", "Return to Space to draw your first constellation."
+        elif scene == "garden" and key == "returned":
+            title, description = "BRING YOUR STARS HOME", "Visit Space and pull your RIGHT fist UP to return."
+        elif key == "returned":
+            title, description = "BRING YOUR STARS HOME", "Make a RIGHT fist and PULL UP to reveal the Garden."
+        if key == "peace_enabled" and self._onboarding_disabled_side:
+            description = ("Show a 2-second peace sign with your " +
+                           self._onboarding_disabled_side.upper() + " hand to turn it back on.")
+        controls = self._onboarding_controls(width, height)
+        banner = controls["banner"]
+        completed = sum(step in self._scene_tutorial_steps for step, _, _ in self.ONBOARDING_LESSONS)
+        painter.save()
+        try:
+            painter.setRenderHint(QPainter.Antialiasing, True)
+            painter.setPen(QPen(QColor(163, 229, 255, 180), 1.4))
+            painter.setBrush(QColor(6, 24, 47, 154))
+            painter.drawRoundedRect(banner, 17.0, 17.0)
+            painter.setPen(QColor(135, 225, 253, 240))
+            painter.setFont(self._ui_font(8, QFont.DemiBold))
+            painter.drawText(banner.adjusted(22, 9, -100, -112), Qt.AlignLeft | Qt.AlignVCenter,
+                             f"LEARN BY PLAYING     {completed+1} / {len(self.ONBOARDING_LESSONS)}")
+            painter.setFont(self._ui_font(13, QFont.Bold))
+            painter.setPen(QColor(252, 254, 255))
+            painter.drawText(banner.adjusted(20, 44, -20, -73), Qt.AlignCenter | Qt.TextWordWrap, title)
+            painter.setFont(self._ui_font(10, QFont.DemiBold))
+            painter.setPen(QColor(232, 248, 255, 245))
+            painter.drawText(banner.adjusted(25, 84, -25, -34), Qt.AlignCenter | Qt.TextWordWrap, description)
+            # Progress is updated from real tracked practice gestures, not elapsed time.
+            if ((key in ("space", "fist_scroll", "two_fists") and scene == "garden") or
+                    (key == "returned" and scene == "space")):
+                track = QRectF(banner.x()+27, banner.bottom()-20, banner.width()-190, 6)
+                painter.setPen(Qt.NoPen)
+                painter.setBrush(QColor(109, 163, 194, 85))
+                painter.drawRoundedRect(track, 3, 3)
+                fill = QRectF(track.x(), track.y(), track.width()*self._onboarding_practice_progress, 6)
+                painter.setBrush(QColor(85, 238, 218, 230))
+                painter.drawRoundedRect(fill, 3, 3)
+                # The moving glow is a visible target for the fist exercise;
+                # it follows actual hand displacement, not an automatic timer.
+                painter.setBrush(QColor(199, 253, 241, 245))
+                painter.drawEllipse(QPointF(track.x()+track.width()*self._onboarding_practice_progress,
+                                            track.y()+3.0), 6.5, 6.5)
+            for name, text in (("skip", "SKIP"), ("map", "GESTURE MAP")):
+                rect = controls[name]
+                painter.setPen(QPen(QColor(143, 215, 247, 135), 1.1))
+                painter.setBrush(QColor(19, 55, 83, 176))
+                painter.drawRoundedRect(rect, 8, 8)
+                painter.setPen(QColor(239, 251, 255))
+                painter.setFont(self._ui_font(7, QFont.DemiBold))
+                painter.drawText(rect, Qt.AlignCenter, text)
         finally:
             painter.restore()
 
@@ -6674,8 +7184,13 @@ class SpatialDesktop(QWidget):
         wheel_steps = int(steps) if self.invert_scroll else -int(steps)
         side = active.get("side")
         message_id = 0x020E if horizontal else 0x020A  # WM_MOUSEHWHEEL / WM_MOUSEWHEEL
-        detached = bool(side in ("left", "right") and
-                        self.mouse_detached_by_side.get(side, False))
+        # A scroll-mode grip is ALWAYS temporarily detached from the native
+        # pointer. Previously only the persistent peace-sign detach flag was
+        # checked, so pyautogui.moveTo() kept warping the cursor every scroll tick.
+        detached = bool(
+            active.get("mode") == "scroll_window" or
+            (side in ("left", "right") and self.mouse_detached_by_side.get(side, False))
+        )
 
         # Windows supports targeting the control under the tracked point without moving
         # the actual cursor. This prevents detached drag-scroll from covertly moving it.
@@ -7416,6 +7931,61 @@ class SpatialDesktop(QWidget):
         self.last_os_cursor_pos = QPoint(global_pos)
         return True
 
+    def _os_fist_scroll_active(self):
+        """A native scroll owns hand motion, never the desktop mouse pointer."""
+        return any(
+            isinstance(active, dict) and active.get("mode") == "scroll_window"
+            for active in self.active_action.values()
+        )
+
+    def _os_scroll_pointer_detached(self):
+        """Temporarily detach, peace-toggle style, without changing saved hand settings.
+
+        Freeze the OS pointer as soon as a right-hand fist begins arming, before
+        movement crosses the scroll threshold. This also prevents the pointer
+        jumping when the thumb/index anchor changes shape as the fist closes.
+        Continue tracking the hand internally for scrolling and full-open release.
+        """
+        if self._os_fist_scroll_active():
+            return True
+        return bool(
+            self.desktop_mode == "os"
+            and self.fist_started_at.get("right") is not None
+            and self.fist_started_at.get("left") is None
+            and not self.left_click_modifier_active
+            and not (self.menu_open and self.hub_visible)
+        )
+
+    def _scroll_cursor_suppressed(self, side):
+        """Hide only a scrolling hand's TLI, not the hand or its gesture tracking."""
+        if isinstance(self.active_action.get(side), dict) and (
+                self.active_action[side].get("mode") == "scroll_window"):
+            return True
+        return bool(
+            side == "right" and self.desktop_mode == "virtual"
+            and self.virtual_scene in ("garden", "space")
+            and self._virtual_scene_grip_active
+        )
+
+    def _sync_scroll_cursor_visibility(self):
+        """Balance Windows cursor hide/show without affecting saved detach state."""
+        should_hide = bool(
+            sys.platform.startswith("win") and self.desktop_mode == "os"
+            and not self.hand_tracking_paused and self._os_fist_scroll_active()
+        )
+        if should_hide == self._native_scroll_cursor_hidden:
+            return
+        if not sys.platform.startswith("win"):
+            self._native_scroll_cursor_hidden = False
+            return
+        try:
+            ctypes.windll.user32.ShowCursor(not should_hide)
+        except Exception:
+            # TLI suppression and stopped mouse warping still work if Win32's
+            # optional global cursor visibility API cannot be called.
+            return
+        self._native_scroll_cursor_hidden = should_hide
+
     def _set_os_pointer(self, point):
         clipboard_interaction_active = any(
             state is not None for state in getattr(self, "floating_clipboard_drag_state", {}).values()
@@ -7423,7 +7993,8 @@ class SpatialDesktop(QWidget):
         # The floating clipboard is a glass UI, but once a hand has picked an entry up,
         # it must be allowed to move the native pointer out of the glass panel and into
         # another application even if the main Glass Menu remains visible behind it.
-        if point is None or (self._gesture_ui_modal_open() and not clipboard_interaction_active):
+        if (point is None or self._os_scroll_pointer_detached() or
+                (self._gesture_ui_modal_open() and not clipboard_interaction_active)):
             return
         global_pos = self._virtual_point_to_global(point)
         if global_pos is None:
@@ -7588,7 +8159,7 @@ class SpatialDesktop(QWidget):
             self._release_fist_mouse(side)
         marker = getattr(self, "fist_scroll_markers", {}).get(side)
         if marker is not None:
-            marker["until"] = time.monotonic() + 1.25
+            marker["until"] = time.monotonic() + 0.70
         self.fist_started_at[side] = None
         self.fist_release_candidate_since[side] = None
         self.fist_open_candidate_since[side] = None
@@ -9264,6 +9835,7 @@ try {
         """Configure a fullscreen overlay; OS mode passes physical mouse input through."""
         self._applied_desktop_mode = self.desktop_mode
         self._applied_menu_state = bool(self.menu_open and self.hub_visible)
+        self._sync_scroll_cursor_visibility()
         self.setCursor(Qt.ArrowCursor if self.desktop_mode == "os" else Qt.BlankCursor)
         if sys.platform.startswith("win"):
             try:
@@ -10080,7 +10652,12 @@ try {
             progress = trigger.progress(now, hold)
             rings["overlap"] = ("GLASS MENU", progress, max(0.0, hold*(1.0-progress)))
         if fired is not None:
+            was_garden = (self.desktop_mode == "virtual" and self.virtual_garden_mode)
+            lesson = self._onboarding_stage()
             self._toggle_glass_menu_from_voice()
+            if (was_garden and lesson is not None and lesson[0] == "glass_menu" and
+                    self.menu_open and self.hub_visible):
+                self._onboarding_complete_step("glass_menu")
             self.status = "TPI overlap → glass menu " + ("shown" if self.menu_open and self.hub_visible else "hidden")
         self.custom_gesture_live = live
         self.custom_gesture_rings = rings
@@ -11425,6 +12002,8 @@ try {
             else:
                 play_ui_sound(self.ui_preferences.get("sound_pinch_menu", "None"))
         self.fist_action_menu_open[side] = visible
+        if visible and timer_completed and self._onboarding_in_garden():
+            self._onboarding_complete_step("pinch_menu")
         self.pinch_menu_animation[side] = {
             "started_at": now,
             "from_alpha": 0.0 if visible else old_alpha,
@@ -11841,6 +12420,10 @@ try {
         """Right-click natively in OS mode or open the virtual 3D context menu."""
         if point is None:
             return
+        # Recognition already succeeded using the existing modifier handler.
+        # Complete the lesson before displaying the normal virtual context menu.
+        if self._onboarding_in_garden():
+            self._onboarding_complete_step("right_click")
         point = QPointF(point)
         if self.desktop_mode != "os":
             anchor = QPointF(min(max(18.0, point.x()), self.width()-18.0),
@@ -12625,6 +13208,7 @@ try {
         self._last_update_scene_time = now
         self._maintain_native_topmost(now)
         if self.hand_tracking_paused:
+            self._sync_scroll_cursor_visibility()
             # No hand cursor, skeleton, TLI, or gesture timers while paused. Vosk and camera
             # frames remain active so the user can say "resume tracking".
             self.hand_positions = {"left": [], "right": []}
@@ -12767,6 +13351,15 @@ try {
                     else:
                         self._refresh_hand_tracking_notice(now)
                     self.tts.speak(f"{side} {state}.")
+                    if self._onboarding_in_garden():
+                        lesson = self._onboarding_stage()
+                        if not enabled and lesson is not None and lesson[0] == "peace_disabled":
+                            self._onboarding_disabled_side = side
+                            self._onboarding_complete_step("peace_disabled")
+                        elif (enabled and lesson is not None and lesson[0] == "peace_enabled" and
+                              side == self._onboarding_disabled_side):
+                            self._onboarding_complete_step("peace_enabled")
+                            self._onboarding_disabled_side = None
                     self.menu_pinch_started[side] = None
                     self.fist_started_at[side] = None
                     self.action_stop_wait_open[side] = True
@@ -12792,6 +13385,11 @@ try {
             # Disabled hands retain visible landmarks and peace-sign recognition,
             # but must never drive the native pointer or other gestures.
             if not self.gesture_tracking_enabled.get(side, True):
+                if side == "right":
+                    self._virtual_scene_grip_anchor = None
+                    self._virtual_scene_grip_latched = False
+                    self._virtual_scene_grip_active = False
+                    self._virtual_scene_grip_open_since = None
                 self.side_cursor_positions[side] = None
                 self.smoothed_side_cursor_positions[side] = None
                 self.cursor_updated_at[side] = 0.0
@@ -12805,6 +13403,28 @@ try {
                     self._end_pinch_drag(side, status=False)
                 continue
 
+            # The optional tutorial owns its small buttons and fist lessons; during
+            # guided scene navigation a right-fist pull replaces each arrow.
+            if self.desktop_mode == "virtual" and not calibration_modal_frame and not peace:
+                left_entry = hands_by_side.get("left")
+                left_fist_active = bool(left_entry is not None and
+                    self.gesture_tracking_enabled.get("left", True) and
+                    is_fist_or_grip_pose(left_entry[0]))
+                if self.virtual_scene in ("garden", "space"):
+                    if self._onboarding_handle_button_frame(side, cursor, landmarks, edge_tolerant):
+                        continue
+                if self._onboarding_space_scroll_frame(
+                        side, cursor, landmarks, now, edge_tolerant, left_fist_active):
+                    continue
+                if self._onboarding_in_garden():
+                    if self._onboarding_practice_fist_frame(
+                            side, cursor, landmarks, hands_by_side, now, edge_tolerant):
+                        continue
+                # In normal Virtual Desktop use, grip-scroll changes scenes rather
+                # than accidentally scrolling a native Windows application.
+                if self._virtual_scene_grip_scroll_frame(
+                        side, cursor, landmarks, now, edge_tolerant, left_fist_active):
+                    continue
             # Explore Garden <-> Space before Garden props, fist scrolling, pinch
             # menus or constellation drawing. Hovering the arrow consumes gestures.
             if (self.desktop_mode == "virtual" and not calibration_modal_frame and not peace and
@@ -12922,6 +13542,7 @@ try {
                 "pinch": effective_pinch,
                 "fist": effective_fist,
                 "open": raw_open,
+                "full_open": is_fully_open_hand_pose(landmarks, edge_tolerant),
                 "clear_left_pinch": clear_left_pinch,
                 # Fingers folded with or without the thumb out: a thumbs-up counts.
                 "fingers_closed": fingers_closed_pose(landmarks, edge_tolerant),
@@ -12970,6 +13591,7 @@ try {
             self.active_push_sides.clear()
             self.depth += (self.target_depth-self.depth)*0.16
             self._request_scene_repaint(now)
+            self._sync_scroll_cursor_visibility()
             self._stop_inactive_timer_during_sounds()
             return
 
@@ -13032,6 +13654,11 @@ try {
             # its next appearance could skip the first intentional pinch-click.
             self._scene_arrow_pinch_previous[side] = False
             self._scene_arrow_pinch_latched[side] = False
+            if side == "right":
+                self._virtual_scene_grip_anchor = None
+                self._virtual_scene_grip_latched = False
+                self._virtual_scene_grip_active = False
+                self._virtual_scene_grip_open_since = None
             clipboard_was_active = self.floating_clipboard_drag_state.get(side) is not None
             if clipboard_was_active:
                 clipboard_state = self.floating_clipboard_drag_state.get(side) or {}
@@ -13372,8 +13999,8 @@ try {
                     # though it has been released. Keep scrolling through these frames;
                     # only a sustained, clearly open hand with genuinely extended fingers
                     # may release the right-fist scroll.
-                    clear_open_pose = (is_open and not is_fist and not is_pinch and
-                                       not bool(pose.get("fingers_closed", False)))
+                    clear_open_pose = (bool(pose.get("full_open", False)) and
+                                       not is_pinch and not bool(pose.get("fingers_closed", False)))
                     if clear_open_pose:
                         candidate_since = active.get("scroll_open_candidate_since")
                         if candidate_since is None:
@@ -13381,7 +14008,7 @@ try {
                             active["scroll_open_candidate_since"] = candidate_since
                         open_duration = max(0.0, now - candidate_since)
                         if not active_fist_scroll_release_confirmed(
-                                is_open=is_open, is_fist=is_fist, is_pinch=is_pinch,
+                                is_open=clear_open_pose, is_fist=False, is_pinch=is_pinch,
                                 fingers_closed=bool(pose.get("fingers_closed", False)),
                                 open_duration=open_duration, release_seconds=0.48):
                             is_fist, is_pinch, is_open = True, False, False
@@ -13389,8 +14016,10 @@ try {
                             # Reuse the candidate start as the release clock so the
                             # ordinary cooldown does not add a second delay.
                             active["open_since"] = candidate_since
+                            is_open, is_fist, is_pinch = True, False, False
                     else:
                         active["scroll_open_candidate_since"] = None
+                        is_open, is_fist, is_pinch = False, True, False
                 # While any drag/scroll is active, keep its held-grip interpretation for
                 # non-open frames so pinch/ambiguous classifications cannot steal it.
                 if mode in ("drag_window", "scroll_window") and not is_open:
@@ -14120,7 +14749,10 @@ try {
             self.pointer_side = None
         if self.pointer_side in cursor_points:
             self.canvas_active_side = self.pointer_side if self.canvas_active_side not in cursor_points else self.canvas_active_side
-        if self.desktop_mode == "os":
+        # An active fist scroll uses the tracked hand for scrolling, but must not
+        # move the OS cursor. Restore it immediately after full-hand release.
+        self._sync_scroll_cursor_visibility()
+        if self.desktop_mode == "os" and not self._os_scroll_pointer_detached():
             mouse_side = self.pointer_side
             if mouse_side not in cursor_points or self.mouse_detached_by_side.get(mouse_side, False):
                 alternate = "left" if mouse_side == "right" else "right"
@@ -14134,6 +14766,12 @@ try {
         self._request_scene_repaint(now)
 
     def closeEvent(self, event):
+        if self._native_scroll_cursor_hidden:
+            try:
+                ctypes.windll.user32.ShowCursor(True)
+            except Exception:
+                pass
+            self._native_scroll_cursor_hidden = False
         for key in list(self._timer_during_sound_stop_events):
             self._stop_timer_during_sound(key)
         if getattr(self, "virtual_pen_active_stroke", None) is not None:
@@ -14197,6 +14835,10 @@ try {
             ball["vx"] = max(-1.8, min(1.8, (x-ball["x"])/dt))
             ball["vy"] = max(-1.8, min(1.8, (y-ball["y"])/dt))
             ball["x"], ball["y"] = x, y
+            origin = ball.get("tutorial_origin")
+            if origin is not None:
+                ball["tutorial_travel"] = max(ball.get("tutorial_travel", 0.0),
+                    math.hypot((x-origin[0])*width, (y-origin[1])*height))
             ball["last_drag_at"] = now
             self.update()
         event.accept()
@@ -14489,7 +15131,7 @@ try {
             point = marker.get("point")
             if point is None:
                 continue
-            fade = 1.0 if scrolling else max(0.0, min(1.0, (float(marker.get("until", 0.0))-now)/1.25))
+            fade = 1.0 if scrolling else max(0.0, min(1.0, (float(marker.get("until", 0.0))-now)/0.70))
             deadzone_mark = max(4.0, float(self.scroll_deadzone))
             backdrop_radius = deadzone_mark + 72.0 * 2.0 + 24.0
             backdrop_alpha = int(255.0 * max(0.0, min(100.0, self.scroll_backdrop_opacity)) / 100.0 * fade)
@@ -15277,7 +15919,8 @@ try {
                         cursor = self._scale_hand_tli_point(self.interactive_hand_anchor(points, side), points, side)
                     cursor = self._visual_tli_position(side, cursor, points)
                     engaged = side in self.active_push_sides or (self.click_side == side and now < self.click_flash_until)
-                    self._paint_tli(painter, cursor, side, engaged)
+                    if not self._scroll_cursor_suppressed(side):
+                        self._paint_tli(painter, cursor, side, engaged)
 
             # One countdown renderer for both ON->OFF and OFF->ON, even though
             # OFF hands deliberately have no live TLI or side cursor.
@@ -15411,7 +16054,7 @@ try {
             point = marker.get("point")
             if point is None:
                 continue
-            fade = 1.0 if scrolling else max(0.0, min(1.0, (float(marker.get("until", 0.0))-now)/1.25))
+            fade = 1.0 if scrolling else max(0.0, min(1.0, (float(marker.get("until", 0.0))-now)/0.70))
             alpha = int(220 * fade)
             marker_color = QColor(105, 235, 255, alpha)
             painter.save()
