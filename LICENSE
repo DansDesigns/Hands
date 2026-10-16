@@ -1,0 +1,83 @@
+SPATIAL DESKTOP SOURCE-AVAILABLE PERSONAL USE LICENCE
+Version 1.0 — 12 October 2026
+
+Copyright (c) 2026 DansDesigns. All rights reserved.
+
+IMPORTANT: This is a custom, source-available licence, not an OSI-approved
+open-source licence. It is a practical starting point and is not legal advice.
+
+1. DEFINITIONS
+"Software" means the Spatial Desktop source code and accompanying materials
+made available by DansDesigns under this licence.
+"Owner" means DansDesigns and the copyright holder(s) authorised to license
+the Software.
+"You" means the individual or organisation using the Software.
+
+2. PERMITTED FREE USE
+Subject to this licence, the Owner grants You a limited, personal, non-exclusive,
+non-transferable, revocable licence to download the Software directly from the
+Owner's official GitHub repository, inspect it, run it, and modify a private copy
+for personal, non-commercial use.
+
+3. NO REDISTRIBUTION OR COMMERCIAL USE
+Except where the Owner gives You prior written permission, You may not:
+(a) redistribute, republish, mirror, sublicense, sell, rent, lease, or otherwise
+    make copies of the Software or modified versions available to third parties;
+(b) include the Software or a substantial portion of it in another product or
+    distribution;
+(c) use the Software for commercial, business, organisational, or revenue-
+    generating purposes, including offering it as part of a paid service; or
+(d) remove or alter copyright, attribution, or licence notices.
+
+The official GitHub repository is an authorised source for obtaining the
+Software. This does not grant You the right to redistribute copies obtained
+from that repository. Commercial use requires a separate written licence or
+purchase from the Owner.
+
+4. CONTRIBUTIONS
+Contributions may be proposed through the Owner's official repository in
+accordance with CONTRIBUTING.md and the Contributor License Agreement. A pull
+request does not have to be accepted. By contributing, You must confirm that
+You have the right to submit the contribution and agree to the terms of the
+Contributor License Agreement. Contributions are not automatically relicensed
+under this document unless the Owner expressly says so.
+
+5. OWNERSHIP
+The Software is licensed, not sold. Except for the limited permissions stated
+above, the Owner retains all rights, title, and interest in the Software.
+This licence does not transfer ownership of Your independent work or any third-
+party materials included with their own licence terms.
+
+6. THIRD-PARTY COMPONENTS
+Third-party libraries, models, and other materials may be subject to separate
+licences and terms. This licence does not replace or override those terms.
+You are responsible for complying with applicable third-party licences.
+
+7. NO WARRANTY
+TO THE MAXIMUM EXTENT PERMITTED BY LAW, THE SOFTWARE IS PROVIDED "AS IS" AND
+"AS AVAILABLE", WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE, AND
+NON-INFRINGEMENT. THE OWNER DOES NOT WARRANT THAT THE SOFTWARE WILL BE ERROR-
+FREE, SECURE, OR AVAILABLE WITHOUT INTERRUPTION.
+
+8. LIMITATION OF LIABILITY
+TO THE MAXIMUM EXTENT PERMITTED BY LAW, THE OWNER SHALL NOT BE LIABLE FOR ANY
+INDIRECT, INCIDENTAL, SPECIAL, CONSEQUENTIAL, EXEMPLARY, OR PUNITIVE DAMAGES,
+OR FOR LOSS OF DATA, PROFITS, REVENUE, GOODWILL, OR BUSINESS, ARISING FROM OR
+RELATED TO THE SOFTWARE OR THIS LICENCE. Nothing in this licence excludes or
+limits liability that cannot lawfully be excluded or limited.
+
+9. TERMINATION
+This licence terminates automatically if You materially breach its terms. On
+termination, You must stop using the Software and delete copies in Your control,
+except where applicable law requires retention. Sections that by their nature
+should survive termination remain in effect.
+
+10. GOVERNING LAW
+The governing law and jurisdiction for this licence should be specified by the
+Owner before public release. Nothing in this section removes rights that cannot
+lawfully be excluded under applicable law.
+
+For commercial licensing or written permission, contact the Owner through the
+contact details published on the official Spatial Desktop website or GitHub
+repository.

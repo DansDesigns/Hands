@@ -308,6 +308,18 @@ def play_ui_sound(filename):
 # Hand render styles, in the order shown by the Settings -> Hands switch.
 HAND_RENDER_STYLES = ("skeleton", "flat", "3d")
 HAND_RENDER_STYLE_LABELS = {"skeleton": "SKELETON", "flat": "FLAT", "3d": "3D"}
+
+def available_hand_models():
+    """Return selectable 3D hand model folders under assets/hands; root files are Default."""
+    folder = ROOT / "assets" / "hands"
+    found = []
+    try:
+        for child in sorted(folder.iterdir(), key=lambda item: item.name.casefold()):
+            if child.is_dir() and any(p.is_file() and p.suffix.lower() in {".glb", ".gltf"} for p in child.iterdir()):
+                found.append(child.name)
+    except OSError:
+        pass
+    return ["Default", *found]
 # Settings -> Notify rows: (ui preference key, label, default position).
 NOTIFICATION_SETTING_ROWS = (
     ("paused_notice_position", "GESTURE LEGEND LOCATION", "bottom-center"),
@@ -336,6 +348,7 @@ def load_ui_preferences() -> dict:
         "stt_indicator_position": "top-right",
         "ui_font_scale": 1.2,
         "show_gesture_disabled_indicator": True,
+        "hand_model_folder": "Default",
         **{key: "None" for key, _label in SOUND_SETTING_ROWS},
     }
     try:
@@ -353,6 +366,9 @@ def load_ui_preferences() -> dict:
                     pass
             elif key == "show_gesture_disabled_indicator":
                 if isinstance(value, bool):
+                    result[key] = value
+            elif key == "hand_model_folder":
+                if value in available_hand_models():
                     result[key] = value
             elif key in dict(SOUND_SETTING_ROWS):
                 allowed = {"None", *available_ui_sounds()}
@@ -373,6 +389,9 @@ def save_ui_preferences(values: dict) -> None:
                 pass
         elif key == "show_gesture_disabled_indicator":
             if isinstance(value, bool):
+                current[key] = value
+        elif key == "hand_model_folder":
+            if value in available_hand_models():
                 current[key] = value
         elif key in dict(SOUND_SETTING_ROWS):
             allowed = {"None", *available_ui_sounds()}
@@ -3567,6 +3586,7 @@ class SpatialDesktop(QWidget):
             stack("priority_toggle")
         elif page == "hands":
             stack("render_style")
+            stack("hand_model_folder")
             stack("skin_tint")
             stack("disabled_indicator_toggle")
             y += group
@@ -3582,9 +3602,13 @@ class SpatialDesktop(QWidget):
             buttons["swatch_right"] = (L+half+gap, y, half, 70.0)
             y += 70.0 + gap
         elif page == "sounds":
-            for key, _label in SOUND_SETTING_ROWS:
-                stack("sound:" + key, h=48.0, after=8.0)
-            texts["help"] = (L, y, W, 42.0)
+            row_h, row_gap = 42.0, 8.0
+            for index, (key, _label) in enumerate(SOUND_SETTING_ROWS):
+                row_y = index * (row_h + row_gap)
+                buttons["sound:" + key] = (L, row_y, W, row_h)
+                buttons["sound_select:" + key] = (R, row_y, W, row_h)
+            y = len(SOUND_SETTING_ROWS) * (row_h + row_gap)
+            texts["help"] = (L, y, 2*W+(R-(L+W)), 42.0)
             y += 42.0 + gap
         elif page == "notifications":
             for key, _label, _default in NOTIFICATION_SETTING_ROWS:
@@ -3712,7 +3736,7 @@ class SpatialDesktop(QWidget):
         key = self.sound_dropdown_key
         if key not in dict(SOUND_SETTING_ROWS):
             return {"panel": QRectF(), "items": []}
-        row_rect = self._settings_control_rects(cx, cy, scale, page="sounds").get("sound:" + key)
+        row_rect = self._settings_control_rects(cx, cy, scale, page="sounds").get("sound_select:" + key)
         if row_rect is None:
             return {"panel": QRectF(), "items": []}
         options = ["None", *available_ui_sounds()]
@@ -5860,7 +5884,23 @@ class SpatialDesktop(QWidget):
                         self.schedule_gesture_settings_save()
                     self.status = "Hand rendering: " + HAND_RENDER_STYLE_LABELS[style].lower()
                     return
+                if pressed("hand_model_folder"):
+                    options = available_hand_models()
+                    current = self.ui_preferences.get("hand_model_folder", "Default")
+                    try:
+                        index = options.index(current)
+                    except ValueError:
+                        index = 0
+                    selected = options[(index + 1) % len(options)]
+                    self.ui_preferences["hand_model_folder"] = selected
+                    save_ui_preferences(self.ui_preferences)
+                    self._hand_mesh_renderer = None
+                    self._hand_mesh_notice_shown = False
+                    self.status = "3D hand model: " + selected
+                    self.update()
+                    return
                 if pressed("skin_tint"):
+                    self.hand_skin_effect_enabled = self.hand_render_style != "skeleton"
                     self.skin_use_skeleton_color = not self.skin_use_skeleton_color
                     self.schedule_gesture_settings_save()
                     self.status = "Skin uses skeleton colour" if self.skin_use_skeleton_color else "Skin uses natural colour"
@@ -5884,7 +5924,7 @@ class SpatialDesktop(QWidget):
 
             if self.settings_page == "sounds":
                 for key, _label in SOUND_SETTING_ROWS:
-                    if pressed("sound:" + key):
+                    if pressed("sound_select:" + key):
                         self.sound_dropdown_key = key
                         self.update()
                         break
@@ -9683,7 +9723,8 @@ try {
         if self._hand_mesh_renderer is None:
             try:
                 from hand_mesh_3d import HandMeshRenderer
-                self._hand_mesh_renderer = HandMeshRenderer()
+                self._hand_mesh_renderer = HandMeshRenderer(
+                    model_folder=self.ui_preferences.get("hand_model_folder", "Default"))
             except Exception as exc:
                 self._report_hand_mesh_problem(f"3D hands unavailable: {exc}")
                 return False
@@ -12528,9 +12569,7 @@ try {
                 self.fist_open_candidate_since[side] = None
                 # Measure this specific fist hold for quick-click release and the separate
                 # two-hand drag clutch. Right-only scroll itself has no hold-time requirement.
-                if self.fist_action.get(side) != "slider" and not self.fist_start_controls.get(side):
-                    self._maybe_play_timer_during_sound(
-                        f"fist:{side}", self.fist_started_at[side], now)
+                # Fist grab/scroll is intentionally silent while held; no gesture-timer sound.
                 current_fist_held = now-self.fist_started_at[side]
                 origin = self.fist_origin_points[side] or cursor
                 dx_from_origin = cursor.x()-origin.x()
@@ -13601,6 +13640,16 @@ try {
                             painter.setPen(QColor(235, 255, 255))
                             self._draw_fitted_button_label(painter, rect, label, base_size=label_size, min_size=6, inset=12*scale)
 
+                        model_rect = controls.get("hand_model_folder")
+                        if model_rect is not None:
+                            painter.setBrush(QBrush(QColor(10, 47, 67, 225)))
+                            painter.setPen(QPen(QColor(140, 230, 240, 210), 1.5*scale))
+                            painter.drawRoundedRect(model_rect, 10*scale, 10*scale)
+                            model_name = self.ui_preferences.get("hand_model_folder", "Default")
+                            self._draw_fitted_button_label(
+                                painter, model_rect, f"3D HAND MODEL  ·  {model_name}  ▾",
+                                base_size=label_size, min_size=6, inset=12*scale)
+
                         hand_setup_rect = controls["hand_setup"]
                         painter.setBrush(QBrush(QColor(18, 80, 93, 235)))
                         painter.setPen(QPen(QColor(115, 242, 250, 220), 1.4*scale))
@@ -13610,28 +13659,35 @@ try {
                                                        base_size=label_size, min_size=6, inset=12*scale)
 
                     elif self.settings_page == "sounds":
-                        # Render every sound setting as a clearly visible, independent dropdown.
-                        # Keep the label and current selection together so the page remains
-                        # understandable even when assets/sounds contains no audio files yet.
+                        # Labels stay in the left column; every sound selector shares a
+                        # fixed right-hand column, making the list easy to scan.
                         for key, label in SOUND_SETTING_ROWS:
-                            rect = controls.get("sound:" + key)
-                            if rect is None:
+                            label_rect = controls.get("sound:" + key)
+                            select_rect = controls.get("sound_select:" + key)
+                            if label_rect is None or select_rect is None:
                                 continue
+                            painter.setBrush(QBrush(QColor(10, 47, 67, 205)))
+                            painter.setPen(QPen(QColor(75, 150, 166, 180), 1.2*scale))
+                            painter.drawRoundedRect(label_rect, 9*scale, 9*scale)
+                            painter.setPen(QColor(225, 246, 250))
+                            self._draw_fitted_button_label(
+                                painter, label_rect, label,
+                                base_size=max(7, int(8.5*scale)), min_size=6, inset=12*scale)
                             selected_sound = self.ui_preferences.get(key, "None") or "None"
                             painter.setBrush(QBrush(QColor(10, 47, 67, 242)))
                             painter.setPen(QPen(QColor(140, 230, 240, 235), 1.7*scale))
-                            painter.drawRoundedRect(rect, 10*scale, 10*scale)
+                            painter.drawRoundedRect(select_rect, 9*scale, 9*scale)
                             painter.setPen(QColor(237, 252, 255))
                             display_sound = selected_sound if selected_sound != "None" else "None (silent)"
                             self._draw_fitted_button_label(
-                                painter, rect, f"{label}     {display_sound}   ▾",
+                                painter, select_rect, f"{display_sound}   ▾",
                                 base_size=max(7, int(8.5*scale)), min_size=6, inset=12*scale)
                         help_rect = text_rects.get("help")
                         if help_rect is not None:
                             painter.setPen(QColor(205, 235, 242))
                             self._draw_wrapped_fitted_text(
                                 painter, help_rect,
-                                "Select a row to choose a sound from assets/sounds. Add WAV, OGG, MP3, FLAC or AIFF files to populate the lists. Changes save automatically.",
+                                "Choose a sound from the fixed list on the right. Add WAV, OGG, MP3, FLAC or AIFF files to assets/sounds. Changes save automatically.",
                                 base_size=max(7, int(8*scale)), min_size=6)
 
                     elif self.settings_page == "notifications":

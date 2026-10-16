@@ -1,9 +1,7 @@
-"""Real 3D hand rendering: skinned glTF hand meshes posed from MediaPipe landmarks.
+"""Real 3D hand rendering: rigged hands follow landmarks; unrigged meshes move as rigid props.
 
-The hand model is a rigged glTF/GLB mesh. Its joints are matched to MediaPipe's 21
-landmarks by name (WebXR hand-joint names, plus common Blender/Mixamo-style names), each
-bone is placed at its landmark and rotated to point at the next one, and the mesh is
-skinned on the GPU. Rendering happens offscreen through moderngl (OpenGL); the result is
+Rigged glTF/GLB meshes are posed from MediaPipe landmarks. Unrigged meshes are also
+accepted and follow the palm position, scale, and orientation as a rigid, fixed-pose model. Rendering happens offscreen through moderngl (OpenGL); the result is
 read back as a QImage and composited onto the transparent overlay by the caller.
 
 Everything here is optional: if moderngl or an OpenGL context is unavailable, the caller
@@ -11,10 +9,9 @@ falls back to the 2D "flat" renderer.
 
 Bundled models: assets/hands/generic-hand-{left,right}.glb from the W3C/Immersive Web
 WebXR Input Profiles project (MIT licence, see assets/hands/LICENSE-webxr-input-profiles.md).
-Custom models: put models/hands/custom-left.glb and/or custom-right.glb (git-ignored); if
-only one side is provided it is mirrored for the other hand. Bone names are matched
-automatically (WebXR, Blender and Mixamo-style names); otherwise add custom-right.joints.json
-mapping bone names to wrist / <finger>-meta / <finger>-1..4.
+Selectable models: create a folder inside assets/hands/ and put left/right GLB or glTF
+files in it. Files may be named left.glb/right.glb, hand-left.glb/hand-right.glb, or
+generic-hand-left.glb/generic-hand-right.glb. If only one side exists it is mirrored.
 """
 from __future__ import annotations
 
@@ -168,16 +165,28 @@ class HandModel:
     def __init__(self, path: Path, mirror: bool = False):
         gltf, buffers = _read_gltf(path)
         nodes = gltf["nodes"]
-        mesh_node = next(i for i, n in enumerate(nodes) if "mesh" in n and "skin" in n)
-        skin = gltf["skins"][nodes[mesh_node]["skin"]]
+        mesh_node = next((i for i, n in enumerate(nodes) if "mesh" in n and "skin" in n), None)
+        self.rigged = mesh_node is not None
+        if mesh_node is None:
+            mesh_node = next((i for i, n in enumerate(nodes) if "mesh" in n), None)
+            if mesh_node is None:
+                raise ValueError("GLB contains no mesh node")
         primitive = gltf["meshes"][nodes[mesh_node]["mesh"]]["primitives"][0]
         attributes = primitive["attributes"]
         positions = _accessor(gltf, buffers, attributes["POSITION"]).astype(np.float64)
         normals = (_accessor(gltf, buffers, attributes["NORMAL"]).astype(np.float64)
                    if "NORMAL" in attributes else None)
-        joints = _accessor(gltf, buffers, attributes["JOINTS_0"]).astype(np.int64)
-        weights = _accessor(gltf, buffers, attributes["WEIGHTS_0"]).astype(np.float64)
-        weights /= np.maximum(1e-9, weights.sum(axis=1, keepdims=True))
+        if self.rigged:
+            skin = gltf["skins"][nodes[mesh_node]["skin"]]
+            joints = _accessor(gltf, buffers, attributes["JOINTS_0"]).astype(np.int64)
+            weights = _accessor(gltf, buffers, attributes["WEIGHTS_0"]).astype(np.float64)
+            weights /= np.maximum(1e-9, weights.sum(axis=1, keepdims=True))
+        else:
+            # A static mesh has no skeleton. Give every vertex one synthetic influence
+            # so it can use the same GPU shader with a single rigid transform.
+            joints = np.zeros((len(positions), 4), dtype=np.int64)
+            weights = np.zeros((len(positions), 4), dtype=np.float64)
+            weights[:, 0] = 1.0
         if "indices" in primitive:
             indices = _accessor(gltf, buffers, primitive["indices"]).reshape(-1).astype(np.uint32)
         else:
@@ -196,16 +205,23 @@ class HandModel:
                 globals_[i] = global_matrix(parent[i]) @ local if i in parent else local
             return globals_[i]
 
-        joint_nodes = skin["joints"]
-        if "inverseBindMatrices" in skin:
-            ibm = _accessor(gltf, buffers, skin["inverseBindMatrices"]).astype(np.float64)
-            ibm = ibm.reshape(-1, 4, 4).transpose(0, 2, 1)
+        if self.rigged:
+            joint_nodes = skin["joints"]
+            if "inverseBindMatrices" in skin:
+                ibm = _accessor(gltf, buffers, skin["inverseBindMatrices"]).astype(np.float64)
+                ibm = ibm.reshape(-1, 4, 4).transpose(0, 2, 1)
+            else:
+                ibm = np.stack([np.eye(4)]*len(joint_nodes))
+            self.rest_joint_mats = np.stack([global_matrix(j) @ ibm[k] for k, j in enumerate(joint_nodes)])
+            heads = np.array([global_matrix(j)[:3, 3] for j in joint_nodes])
         else:
-            ibm = np.stack([np.eye(4)]*len(joint_nodes))
-        # Joint matrices for the rest pose: vertices skinned by these give the rest
-        # mesh in world space, whatever bind pose the file was exported with.
-        self.rest_joint_mats = np.stack([global_matrix(j) @ ibm[k] for k, j in enumerate(joint_nodes)])
-        heads = np.array([global_matrix(j)[:3, 3] for j in joint_nodes])
+            node_transform = global_matrix(mesh_node)
+            positions = (np.c_[positions, np.ones(len(positions))] @ node_transform.T)[:, :3]
+            if normals is not None:
+                normals = normals @ np.linalg.pinv(node_transform[:3, :3])
+                normals /= np.maximum(1e-9, np.linalg.norm(normals, axis=1, keepdims=True))
+            self.rest_joint_mats = np.eye(4, dtype=np.float64)[None, :, :]
+            heads = np.zeros((1, 3), dtype=np.float64)
 
         flip = np.diag([-1.0, 1.0, 1.0]) if mirror else np.eye(3)
         self.to_screen = self.TO_SCREEN @ flip
@@ -217,10 +233,29 @@ class HandModel:
         self.weights = weights.astype(np.float32)
         # Mirroring flips triangle winding; rendering is double-sided so it is harmless.
         self.indices = indices
-        self.joint_count = len(joint_nodes)
+        self.joint_count = len(self.rest_joint_mats)
         self.heads = heads @ self.to_screen.T          # rest joint heads, screen axes
-        self.names = [nodes[j].get("name", f"joint{k}") for k, j in enumerate(joint_nodes)]
-        self.canonical = [canonical_joint_name(name) for name in self.names]
+        if self.rigged:
+            self.names = [nodes[j].get("name", f"joint{k}") for k, j in enumerate(joint_nodes)]
+            self.canonical = [canonical_joint_name(name) for name in self.names]
+        else:
+            self.names = ["static-mesh"]
+            self.canonical = [None]
+            # Fixed-pose meshes use their vertical extent as an approximate palm length.
+            # Centering makes common Sketchfab exports (often far from the origin) usable.
+            self.static_center = (positions.min(axis=0) + positions.max(axis=0)) * 0.5
+            self.static_extent = np.maximum(positions.max(axis=0)-positions.min(axis=0), 1e-6)
+            self.static_height_axis = int(np.argmax(self.static_extent))
+            self.palm_length = float(self.static_extent[self.static_height_axis] * 0.58)
+            self.landmark_head = {0: np.array([0.0, self.palm_length, 0.0]),
+                                  5: np.array([-self.palm_length*0.25, 0.0, 0.0]),
+                                  9: np.array([0.0, 0.0, 0.0]),
+                                  17: np.array([self.palm_length*0.25, 0.0, 0.0])}
+            self.reach = float(np.linalg.norm(self.static_extent) * 0.5)
+            self.tip_cap = {}
+            self.joint_for = {}
+            self.fade = np.ones(len(self.positions), dtype=np.float32)
+            return
         # Optional <model>.joints.json: {"BoneName": "index-1", ...} for rigs whose bone
         # names aren't recognised. Values: wrist, <finger>-meta or <finger>-1..4, where
         # finger is thumb/index/middle/ring/pinky (1 = knuckle bone, 4 = tip).
@@ -543,9 +578,11 @@ void main() {
 class HandMeshRenderer:
     """Owns the OpenGL context and per-side GPU meshes; renders posed hands to images."""
 
-    def __init__(self, bundled_dir: Path = BUNDLED_HANDS_DIR, custom_dir: Path = CUSTOM_HANDS_DIR):
+    def __init__(self, bundled_dir: Path = BUNDLED_HANDS_DIR, custom_dir: Path = CUSTOM_HANDS_DIR,
+                 model_folder: str = "Default"):
         self.bundled_dir = Path(bundled_dir)
         self.custom_dir = Path(custom_dir)
+        self.model_folder = str(model_folder or "Default")
         self.error = ""
         self._ctx = None
         self._program = None
@@ -560,6 +597,25 @@ class HandMeshRenderer:
         return self._failed
 
     def _model_paths(self):
+        if self.model_folder != "Default":
+            folder = (self.bundled_dir / self.model_folder).resolve()
+            if folder.parent != self.bundled_dir.resolve() or not folder.is_dir():
+                raise FileNotFoundError(f"Hand model folder not found: {self.model_folder}")
+            candidates = {
+                side: [folder / f"{name}-{side}{ext}" for name in ("", "hand", "generic-hand", "model")
+                       for ext in (".glb", ".gltf")]
+                for side in ("left", "right")
+            }
+            # Also accept side.glb and side.gltf.
+            for side in ("left", "right"):
+                candidates[side] = [folder / f"{side}{ext}" for ext in (".glb", ".gltf")] + candidates[side]
+            found = {side: next((path for path in candidates[side] if path.is_file()), None)
+                     for side in ("left", "right")}
+            if not any(found.values()):
+                raise FileNotFoundError(f"No left/right GLB or glTF hand models found in {folder}")
+            return {side: ((found[side] or found["right"] or found["left"]),
+                           found[side] is None)
+                    for side in ("left", "right")}
         custom = {side: self.custom_dir / f"custom-{side}.glb" for side in ("left", "right")}
         bundled = {side: self.bundled_dir / f"generic-hand-{side}.glb" for side in ("left", "right")}
         if custom["left"].is_file() or custom["right"].is_file():
@@ -664,8 +720,18 @@ class HandMeshRenderer:
             previous_frame = previous[0] if previous and (time.monotonic()-previous[1]) < 0.35 else None
             target_frame = _palm_frame(target[0], target[5], target[9], target[17], previous=previous_frame)
             self._palm_frames[side] = (target_frame, time.monotonic())
-            mats = pose_joint_matrices(model, target, target_palm_frame=target_frame)
             palm_pixels = float(np.linalg.norm(target[9]-target[0]))
+            if model.rigged:
+                mats = pose_joint_matrices(model, target, target_palm_frame=target_frame)
+            else:
+                # Unrigged meshes cannot bend individual fingers. Keep their authored pose,
+                # but translate/scale/rotate the whole hand to follow the tracked palm.
+                scale = palm_pixels / max(1e-9, model.palm_length)
+                transform = np.eye(4, dtype=np.float64)
+                transform[:3, :3] = scale * target_frame @ model.to_screen
+                target_centre = (target[0] + target[5] + target[9] + target[17]) / 4.0
+                transform[:3, 3] = target_centre - transform[:3, :3] @ model.static_center
+                mats = transform[None, :, :]
             margin = self.model_reach(side, palm_pixels)*1.15 + 4.0
             left = math.floor(float(target[:, 0].min()) - margin)
             top = math.floor(float(target[:, 1].min()) - margin)
