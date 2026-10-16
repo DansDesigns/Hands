@@ -2118,9 +2118,9 @@ class SpatialDesktop(QWidget):
         self.virtual_desktop_data = load_virtual_desktop_data()
         virtual_bg = self.virtual_desktop_data["background"]
         self.virtual_grid_enabled = bool(virtual_bg["grid_enabled"])
-        self.virtual_scene = virtual_bg.get("scene", "garden" if virtual_bg.get("garden_mode") else "grid")
-        if self.virtual_scene not in VIRTUAL_SCENES:
-            self.virtual_scene = "grid"
+        # Always open the Virtual Desktop in Garden for the play-based tutorial.
+        # The other scenes remain selectable normally once the app is running.
+        self.virtual_scene = "garden"
         self.virtual_garden_mode = self.virtual_scene == "garden"
         self.virtual_space_mode = self.virtual_scene == "space"
         self.space_constellations = list(self.virtual_desktop_data.get("constellations", []))
@@ -2271,7 +2271,7 @@ class SpatialDesktop(QWidget):
         self._clipboard_capture_suppression_until = 0.0
         self.status = f"Ready — offline Vosk STT · Kokoro TTS: {self.tts.status}"
 
-        self.desktop_mode = "os"  # start in OS Desktop mode; the menu can switch to virtual/3D mode
+        self.desktop_mode = "virtual"  # Start in Virtual Desktop; Glass Menu stays open and OS mode remains selectable.
         self._applied_desktop_mode = None
         self._applied_menu_state = None
         self._last_native_topmost_reassert = 0.0
@@ -2644,6 +2644,58 @@ class SpatialDesktop(QWidget):
         self._glass_virtual_backdrop_size = size
         return self._glass_virtual_backdrop
 
+    def _paint_scene_atmosphere(self, painter, width, height, progress, from_scene):
+        """A thinning atmospheric limb follows the Garden/Space horizon during a tilt.
+
+        This runs only for the short cached-image slide, not during either scene's
+        normal rendering. At the spaceward end, the broad blue haze contracts
+        into Earth's very thin luminous edge before vanishing on arrival.
+        """
+        progress = max(0.0, min(1.0, float(progress)))
+        # Reverse the haze when returning toward Earth. Both ends are clean,
+        # including a completed slide where _scene_transition is discarded.
+        visibility = max(0.0, math.sin(math.pi * progress)) ** 0.65
+        if visibility < 0.035:
+            return
+        spaceward = progress if from_scene == "garden" else 1.0-progress
+        seam_y = float(height) * (progress if from_scene == "garden"
+                                 else 1.0-progress)
+        haze = max(4.0, float(height)*0.088*(1.0-spaceward)+4.0)
+        alpha = visibility
+        painter.save()
+        try:
+            painter.setRenderHint(QPainter.Antialiasing, True)
+            # Broad blue atmosphere gets narrower and more transparent as the
+            # viewer moves away from the Garden. Simple gradients avoid effects
+            # that would require generating a new full-screen scene each frame.
+            band = QLinearGradient(0, seam_y-haze*2.0, 0, seam_y+haze*1.2)
+            band.setColorAt(0.0, QColor(18, 70, 165, 0))
+            band.setColorAt(0.25, QColor(22, 106, 222, int(54*alpha)))
+            band.setColorAt(0.56, QColor(62, 175, 255, int(115*alpha)))
+            band.setColorAt(0.76, QColor(145, 219, 255, int(43*alpha)))
+            band.setColorAt(1.0, QColor(12, 73, 152, 0))
+            painter.setPen(Qt.NoPen)
+            painter.setBrush(QBrush(band))
+            painter.drawRect(QRectF(0, seam_y-haze*2.0, width, haze*3.2))
+
+            # A shallow curved horizon suggests Earth's limb from high above.
+            # The small upward bulge becomes visible before Space settles.
+            curve_height = min(float(height)*0.050, 44.0)
+            rim = QPainterPath()
+            rim.moveTo(-12.0, seam_y+curve_height*.15)
+            rim.quadTo(width*.5, seam_y-curve_height*1.5,
+                       width+12.0, seam_y+curve_height*.15)
+            painter.setBrush(Qt.NoBrush)
+            for stroke, color in (
+                (max(5.0, haze*.84), QColor(13, 96, 235, int(32*alpha))),
+                (max(3.0, haze*.26), QColor(32, 168, 255, int(95*alpha))),
+                (2.1, QColor(187, 241, 255, int(233*alpha))),
+            ):
+                painter.setPen(QPen(color, stroke, Qt.SolidLine, Qt.RoundCap))
+                painter.drawPath(rim)
+        finally:
+            painter.restore()
+
     def _virtual_background_style_data(self):
         index = max(0, min(len(VIRTUAL_BACKGROUND_STYLES)-1, int(self.virtual_background_style)))
         return VIRTUAL_BACKGROUND_STYLES[index]
@@ -2661,12 +2713,16 @@ class SpatialDesktop(QWidget):
                 # the whole Garden and Space scenes on every transition frame.
                 eased = amount * amount * (3.0-2.0*amount)
                 travel = float(height) * eased
-                direction = -1.0 if slide["from"] == "garden" else 1.0
+                # Looking UP makes the scenery move DOWN; looking back toward
+                # the Garden makes Space move UP. Reverse the previous slide.
+                direction = 1.0 if slide["from"] == "garden" else -1.0
                 painter.save()
                 try:
                     painter.setClipRect(QRectF(0, 0, width, height))
                     painter.drawImage(QPointF(0, direction*travel), slide["source"])
                     painter.drawImage(QPointF(0, direction*(travel-height)), slide["target"])
+                    self._paint_scene_atmosphere(painter, width, height, eased,
+                                                 slide["from"])
                 finally:
                     painter.restore()
                 return
@@ -2857,24 +2913,19 @@ class SpatialDesktop(QWidget):
                 painter.setBrush(QColor(221, 237, 255, alpha))
                 painter.drawEllipse(QPointF(x, y), radius, radius)
 
-            # A soft crescent moon on the other side of the scene from the day's sun path.
+            # The real-time night path is unchanged, but its lit crescent now
+            # reveals the same cratered lunar surface used in Space View.
             moon_x = width * (0.16 + 0.68 * float(scene.get("moon_progress", 0.5)))
             moon = QPointF(moon_x, height * 0.19)
-            moon_radius = max(17.0, height * 0.036)
-            halo = QRadialGradient(moon, moon_radius * 3.3)
-            halo.setColorAt(0.0, QColor(195, 220, 255, 60))
-            halo.setColorAt(0.48, QColor(174, 207, 255, 25))
-            halo.setColorAt(1.0, QColor(174, 207, 255, 0))
-            painter.setPen(Qt.NoPen)
-            painter.setBrush(QBrush(halo))
-            painter.drawEllipse(moon, moon_radius * 3.3, moon_radius * 3.3)
-            painter.setBrush(QColor(235, 241, 249, 245))
-            painter.drawEllipse(moon, moon_radius, moon_radius)
-            shadow_offset = moon_radius * 0.42
-            cut = self._garden_mix_colour(sky_top, sky_mid, 0.28)
-            painter.setBrush(cut)
-            painter.drawEllipse(QPointF(moon.x() + shadow_offset, moon.y() - moon_radius * 0.10),
-                                moon_radius * 0.90, moon_radius * 0.90)
+            moon_radius = max(17.0, min(width, height) * .055)
+            visible = QPainterPath()
+            visible.addEllipse(moon, moon_radius, moon_radius)
+            shadow = QPainterPath()
+            shadow.addEllipse(QPointF(moon.x() + moon_radius * .42,
+                                     moon.y() - moon_radius * .10),
+                              moon_radius * .90, moon_radius * .90)
+            self._paint_cratered_moon(painter, moon, moon_radius,
+                                     visible.subtracted(shadow))
         else:
             # The sun traverses the sky over daylight; its halo and colour follow both
             # solar elevation and real cloud cover/conditions.
@@ -3646,20 +3697,31 @@ class SpatialDesktop(QWidget):
                     else "NEXT  ·  Use the down arrow to see your stars in Garden")
         else:
             return
+        # Keep the instructions central and legible without blocking an open Glass
+        # Menu. The hints return automatically as soon as the menu is hidden.
+        if self.menu_open and self.hub_visible:
+            return
         painter.save()
         try:
             painter.setRenderHint(QPainter.Antialiasing, True)
-            painter.setFont(self._ui_font(9, QFont.DemiBold))
-            available = max(170.0, width-40.0)
-            text_width = min(available, QFontMetricsF(painter.font()).horizontalAdvance(hint)+30.0)
-            y = 95.0 if scene == "garden" else 104.0
-            bubble = QRectF(24.0, y, text_width, 33.0)
-            painter.setPen(QPen(QColor(130, 200, 248, 70), 1.0))
-            painter.setBrush(QColor(8, 21, 43, 175))
-            painter.drawRoundedRect(bubble, 10.0, 10.0)
-            painter.setPen(QColor(228, 247, 255, 238))
-            painter.drawText(bubble.adjusted(12.0, 0.0, -6.0, 0.0),
-                             Qt.AlignVCenter | Qt.AlignLeft, hint)
+            painter.setFont(self._ui_font(13, QFont.DemiBold))
+            metrics = QFontMetricsF(painter.font())
+            available = max(170.0, float(width)-32.0)
+            banner_w = min(available, max(330.0, metrics.horizontalAdvance(hint)+56.0))
+            wrapped = metrics.boundingRect(
+                QRectF(0.0, 0.0, max(90.0, banner_w-28.0), 500.0),
+                Qt.AlignCenter | Qt.TextWordWrap, hint)
+            banner_h = max(56.0, wrapped.height()+22.0)
+            bubble = QRectF((width-banner_w)*0.5, (height-banner_h)*0.5,
+                            banner_w, banner_h)
+            # Semi-transparent dark glass keeps the garden/nebula visible behind
+            # the tutorial while a bright cyan-white label remains readable.
+            painter.setPen(QPen(QColor(164, 234, 255, 160), 1.5))
+            painter.setBrush(QColor(8, 21, 43, 112))
+            painter.drawRoundedRect(bubble, 15.0, 15.0)
+            label = bubble.adjusted(14.0, 6.0, -14.0, -6.0)
+            painter.setPen(QColor(255, 255, 255, 250))
+            painter.drawText(label, Qt.AlignCenter | Qt.TextWordWrap, hint)
         finally:
             painter.restore()
 
@@ -3691,7 +3753,7 @@ class SpatialDesktop(QWidget):
         target_image = self._render_scene_slide_frame(target_scene)
         self._scene_transition = {
             "from": source_scene, "to": target_scene, "started": now,
-            "duration": 0.90, "source": source_image, "target": target_image,
+            "duration": 1.15, "source": source_image, "target": target_image,
         }
         self.status = ("Ascending into Space View" if target_scene == "space"
                        else "Descending into the Garden")
@@ -3926,6 +3988,52 @@ class SpatialDesktop(QWidget):
             self._space_extend_constellation(side, cursor, now)
         return True
 
+    def _paint_cratered_moon(self, painter, moon_center, moon_r, lit_shape=None):
+        """The same cached-scene moon for Space and Garden, with optional crescent."""
+        glow = QRadialGradient(moon_center, moon_r*2.35)
+        glow.setColorAt(0.0, QColor(184, 204, 235, 34))
+        glow.setColorAt(.50, QColor(121, 159, 220, 23))
+        glow.setColorAt(1.0, QColor(101, 151, 235, 0))
+        painter.setPen(Qt.NoPen)
+        painter.setBrush(QBrush(glow))
+        painter.drawEllipse(moon_center, moon_r*2.35, moon_r*2.35)
+        moon_surface = QRadialGradient(
+            QPointF(moon_center.x()-moon_r*.42, moon_center.y()-moon_r*.44),
+            moon_r*1.65)
+        moon_surface.setColorAt(0.0, QColor(222, 226, 230))
+        moon_surface.setColorAt(.43, QColor(168, 180, 194))
+        moon_surface.setColorAt(.79, QColor(100, 114, 139))
+        moon_surface.setColorAt(1.0, QColor(45, 56, 82))
+        painter.save()
+        if lit_shape is not None:
+            painter.setClipPath(lit_shape, Qt.IntersectClip)
+        painter.setPen(QPen(QColor(218, 227, 244, 145), 1.2))
+        painter.setBrush(QBrush(moon_surface))
+        painter.drawEllipse(moon_center, moon_r, moon_r)
+        # Clip surface detail to the moon's disk; paired dark crater hollows
+        # and tiny upper-left rims read well even on a modest-sized moon.
+        painter.save()
+        disk = QPainterPath()
+        disk.addEllipse(moon_center, moon_r, moon_r)
+        painter.setClipPath(disk)
+        for cx, cy, cr in (
+                (-.38, -.33, .18), (.25, -.39, .12), (.50, .12, .17),
+                (-.07, .08, .22), (-.46, .40, .13), (.12, .52, .12),
+                (-.02, -.60, .075), (.53, -.25, .068), (-.60, -.03, .075)):
+            crater_center = QPointF(moon_center.x()+cx*moon_r,
+                                   moon_center.y()+cy*moon_r)
+            radius = cr*moon_r
+            painter.setPen(Qt.NoPen)
+            painter.setBrush(QColor(67, 77, 100, 66))
+            painter.drawEllipse(crater_center, radius, radius*.77)
+            painter.setPen(QPen(QColor(239, 243, 248, 75), max(.7, moon_r*.018)))
+            painter.setBrush(Qt.NoBrush)
+            painter.drawArc(QRectF(crater_center.x()-radius,
+                                   crater_center.y()-radius*.77,
+                                   radius*2, radius*1.54), 28*16, 146*16)
+        painter.restore()
+        painter.restore()
+
     def _paint_space_background(self, painter, width, height):
         """One-time cached nebula, ringed planet, dust field and stars (no network/assets)."""
         painter.save()
@@ -3970,35 +4078,10 @@ class SpatialDesktop(QWidget):
             painter.setBrush(QColor(182+rng.randint(0, 70), 194+rng.randint(0, 50), 255, alpha))
             painter.setPen(Qt.NoPen)
             painter.drawEllipse(QPointF(x, y), radius, radius)
-        # Atmospheric halo behind the planet.
-        planet_center = QPointF(width*.79, height*.47)
-        planet_r = min(width, height)*.155
-        aura = QRadialGradient(planet_center, planet_r*1.85)
-        aura.setColorAt(0, QColor(71, 151, 226, 32))
-        aura.setColorAt(.72, QColor(75, 88, 225, 36))
-        aura.setColorAt(1, QColor(25, 80, 240, 0))
-        painter.setBrush(QBrush(aura))
-        painter.setPen(Qt.NoPen)
-        painter.drawEllipse(planet_center, planet_r*1.85, planet_r*1.85)
-        # Rings sit partly behind the planet and are redrawn as a foreground arc.
-        painter.save()
-        painter.translate(planet_center)
-        painter.rotate(-25)
-        for width_offset, alpha in ((1.75, 78), (1.92, 95), (2.07, 32)):
-            painter.setBrush(Qt.NoBrush)
-            painter.setPen(QPen(QColor(135, 187, 248, alpha), 2.0))
-            painter.drawEllipse(QRectF(-planet_r*width_offset, -planet_r*.47,
-                                       planet_r*width_offset*2, planet_r*.94))
-        painter.restore()
-        surface = QRadialGradient(QPointF(planet_center.x()-planet_r*.42,
-                                         planet_center.y()-planet_r*.45), planet_r*1.85)
-        surface.setColorAt(0, QColor(144, 207, 239))
-        surface.setColorAt(.40, QColor(46, 117, 183))
-        surface.setColorAt(.76, QColor(26, 57, 110))
-        surface.setColorAt(1, QColor(7, 17, 50))
-        painter.setPen(QPen(QColor(127, 191, 255, 150), 1.6))
-        painter.setBrush(QBrush(surface))
-        painter.drawEllipse(planet_center, planet_r, planet_r)
+        # Reuse the exact shaded, cratered Space moon rather than a flat disk.
+        moon_center = QPointF(width*.80, height*.38)
+        moon_r = min(width, height)*.055
+        self._paint_cratered_moon(painter, moon_center, moon_r)
         # Discrete bright anchor stars with subtle cyan halo and diffraction crosses.
         for x, y, size, phase, _ in self._space_stars:
             point = QPointF(width*x, height*y)
@@ -5159,10 +5242,28 @@ class SpatialDesktop(QWidget):
             painter.drawText(QRectF(frame.left() + 12, frame.top() + 5,
                                     frame.width() - 58, 25),
                              Qt.AlignVCenter | Qt.AlignLeft, "GESTURE MAP")
-            painter.setPen(QPen(QColor(125, 205, 223, 220), 1.0))
-            painter.setBrush(QBrush(QColor(35, 75, 90, 235)))
+            # Match Glass Menu CLOSE: red gradient, brighter on TLI hover, with
+            # the same pair of soft red outline glows (without moving the hit area).
+            close_hovered = any(point is not None and close_rect.contains(point)
+                                for point in self.side_cursor_positions.values())
+            close_gradient = QLinearGradient(close_rect.topLeft(), close_rect.bottomRight())
+            if close_hovered:
+                for expansion, alpha in ((7.0, 45), (3.5, 90)):
+                    painter.setPen(QPen(QColor(255, 90, 90, alpha), 3.0))
+                    painter.setBrush(Qt.NoBrush)
+                    painter.drawRoundedRect(close_rect.adjusted(-expansion, -expansion,
+                                                                  expansion, expansion),
+                                            8.0+expansion, 8.0+expansion)
+                close_gradient.setColorAt(0.0, QColor(255, 105, 100, 245))
+                close_gradient.setColorAt(1.0, QColor(215, 30, 40, 250))
+                painter.setPen(QPen(QColor(255, 215, 210, 250), 2.0))
+            else:
+                close_gradient.setColorAt(0.0, QColor(200, 55, 60, 215))
+                close_gradient.setColorAt(1.0, QColor(95, 12, 22, 235))
+                painter.setPen(QPen(QColor(255, 150, 150, 210), 1.5))
+            painter.setBrush(QBrush(close_gradient))
             painter.drawRoundedRect(close_rect, 6.0, 6.0)
-            painter.setPen(QPen(QColor(240, 255, 255), 2.0,
+            painter.setPen(QPen(QColor(250, 255, 255), 2.2,
                                 Qt.SolidLine, Qt.RoundCap))
             center = close_rect.center()
             painter.drawLine(QPointF(center.x()-5, center.y()-5),
@@ -12186,11 +12287,13 @@ try {
         """Keep gestures responsive while limiting full-screen painting/inference work."""
         garden_visible = (self.desktop_mode == "virtual" and
                           getattr(self, "virtual_garden_mode", False))
-        if self.menu_open and self.hub_visible:
+        if getattr(self, "_scene_transition", None) is not None:
+            # A scene slide stays fluid even when Glass Menu is visible. Cached scene
+            # images are moved rather than repainting both worlds at 30 FPS.
+            desired_ms = 33
+        elif self.menu_open and self.hub_visible:
             # Pause expensive background animation when reading a glass settings page.
             desired_ms = 50 if hand_present else 100
-        elif getattr(self, "_scene_transition", None) is not None:
-            desired_ms = 33  # A short, smooth slide; static images keep this inexpensive.
         elif garden_visible:
             # The animated garden used to force 60 FPS even with no hands.
             # 30 FPS during interaction, 15 FPS while idle preserves gentle motion.
