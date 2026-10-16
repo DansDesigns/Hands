@@ -300,6 +300,12 @@ SOUND_SETTING_ROWS = (
     ("sound_glass_buttons", "GLASS MENU BUTTONS"),
     ("sound_glass_toggle", "GLASS MENU TOGGLE"),
 )
+DEFAULT_UI_SOUNDS = {
+    'sound_gesture_timer_during': 'gesture_timer_during.mp3',
+    'sound_pinch': 'pinch.mp3',
+    'sound_glass_toggle': 'glass_menu_toggle.mp3',
+    'sound_glass_buttons': 'glass_menu_buttons.mp3',
+}
 SOUND_EXTENSIONS = {".wav", ".ogg", ".mp3", ".flac", ".aiff", ".aif"}
 
 def available_ui_sounds():
@@ -411,7 +417,8 @@ def load_ui_preferences() -> dict:
         "ui_font_scale": 1.2,
         "show_gesture_disabled_indicator": True,
         "garden_onboarding_completed": False,
-        **{key: "None" for key, _label in SOUND_SETTING_ROWS},
+        "sound_defaults_v1_applied": False,
+        **{key: DEFAULT_UI_SOUNDS.get(key, "None") for key, _label in SOUND_SETTING_ROWS},
     }
     try:
         supplied = json.loads(UI_SETTINGS_FILE.read_text(encoding="utf-8"))
@@ -429,8 +436,11 @@ def load_ui_preferences() -> dict:
             elif key in ("show_gesture_disabled_indicator", "garden_onboarding_completed"):
                 if isinstance(value, bool):
                     result[key] = value
+            elif key == "sound_defaults_v1_applied":
+                if isinstance(value, bool):
+                    result[key] = value
             elif key in dict(SOUND_SETTING_ROWS):
-                allowed = {"None", *available_ui_sounds()}
+                allowed = {"None", *available_ui_sounds(), *DEFAULT_UI_SOUNDS.values()}
                 if value in allowed:
                     result[key] = value
             elif value in NOTIFICATION_POSITIONS:
@@ -449,8 +459,11 @@ def save_ui_preferences(values: dict) -> None:
         elif key in ("show_gesture_disabled_indicator", "garden_onboarding_completed"):
             if isinstance(value, bool):
                 current[key] = value
+        elif key == "sound_defaults_v1_applied":
+            if isinstance(value, bool):
+                current[key] = value
         elif key in dict(SOUND_SETTING_ROWS):
-            allowed = {"None", *available_ui_sounds()}
+            allowed = {"None", *available_ui_sounds(), *DEFAULT_UI_SOUNDS.values()}
             if value in allowed:
                 current[key] = value
         elif value in NOTIFICATION_POSITIONS:
@@ -2132,6 +2145,12 @@ class SpatialDesktop(QWidget):
         self.swap_drag_scroll_notches = settings.get("swap_drag_scroll_notches", False)
         self.cursor_lock_priority = settings.get("cursor_lock_priority", "right")
         self.ui_preferences = load_ui_preferences()
+        if not self.ui_preferences.get("sound_defaults_v1_applied", False):
+            for sound_key, default_file in DEFAULT_UI_SOUNDS.items():
+                if self.ui_preferences.get(sound_key) in (None, "None", ""):
+                    self.ui_preferences[sound_key] = default_file
+            self.ui_preferences["sound_defaults_v1_applied"] = True
+            save_ui_preferences(self.ui_preferences)
         self.ui_font_scale = float(self.ui_preferences.get("ui_font_scale", 1.2))
         self.show_gesture_disabled_indicator = bool(
             self.ui_preferences.get("show_gesture_disabled_indicator", True))
@@ -2309,7 +2328,8 @@ class SpatialDesktop(QWidget):
         self._clipboard_capture_suppression_until = 0.0
         self.status = f"Ready — offline Vosk STT · Kokoro TTS: {self.tts.status}"
 
-        self.desktop_mode = "virtual"  # Start in Virtual Desktop; Glass Menu stays open and OS mode remains selectable.
+        self.desktop_mode = ("os" if self.ui_preferences.get("garden_onboarding_completed", False)
+                             else "virtual")  # After onboarding, start in OS Desktop.
         self._applied_desktop_mode = None
         self._applied_menu_state = None
         self._last_native_topmost_reassert = 0.0
