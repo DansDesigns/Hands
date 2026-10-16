@@ -297,14 +297,15 @@ def play_ui_sound(filename):
         return
     try:
         if shutil.which("paplay"):
-            subprocess.Popen(["paplay", str(path)], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            return subprocess.Popen(["paplay", str(path)], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         elif shutil.which("aplay") and path.suffix.lower() == ".wav":
-            subprocess.Popen(["aplay", "-q", str(path)], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            return subprocess.Popen(["aplay", "-q", str(path)], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         elif shutil.which("ffplay"):
-            subprocess.Popen(["ffplay", "-nodisp", "-autoexit", "-loglevel", "quiet", str(path)],
-                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            return subprocess.Popen(["ffplay", "-nodisp", "-autoexit", "-loglevel", "quiet", str(path)],
+                                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     except (OSError, ValueError):
         pass
+    return None
 # Hand render styles, in the order shown by the Settings -> Hands switch.
 HAND_RENDER_STYLES = ("skeleton", "flat", "3d")
 HAND_RENDER_STYLE_LABELS = {"skeleton": "SKELETON", "flat": "FLAT", "3d": "3D"}
@@ -1936,6 +1937,7 @@ class SpatialDesktop(QWidget):
         self.custom_gesture_triggers = {"left": HoldTrigger(), "right": HoldTrigger(), "overlap": HoldTrigger()}
         # Track which timer starts have already played the delayed timer-during sound.
         self._timer_during_sound_played_at = {}
+        self._timer_during_sound_processes = {}
         self.custom_gesture_live = {}
         self.cursor_smoothing = settings["cursor_smoothing"]
         self.tli_glow_intensity = settings.get("tli_glow_intensity", 1.0)
@@ -8650,6 +8652,9 @@ try {
             self.custom_gesture_message = "Could not save custom_gestures.json"
 
     def _reset_custom_gesture_triggers(self):
+        self._stop_timer_during_sound("custom:left")
+        self._stop_timer_during_sound("custom:right")
+        self._stop_timer_during_sound("custom:overlap")
         self.custom_gesture_triggers = {"left": HoldTrigger(), "right": HoldTrigger(), "overlap": HoldTrigger()}
         self.custom_gesture_live = {}
         self.custom_gesture_rings = {}
@@ -8841,7 +8846,10 @@ try {
                         f"custom:{side}", trigger.since, now)
                     rings[side] = (self.custom_gestures[candidate].get("label", ""), progress,
                                    max(0.0, hold*(1.0-progress)))
+            else:
+                self._stop_timer_during_sound(f"custom:{side}")
             if fired is not None:
+                self._stop_timer_during_sound(f"custom:{side}")
                 self._run_custom_gesture_action(fired, side)
 
         # Built-in: overlapping both TPIs (open hands, nothing else in progress) and
@@ -10498,14 +10506,35 @@ try {
         self.modifier_click_last_pose_at[side] = None
         self.modifier_click_armed[side] = True
 
+    def _stop_timer_during_sound(self, key):
+        """Stop the timer-during audio process immediately when its gesture ends."""
+        process = getattr(self, "_timer_during_sound_processes", {}).pop(key, None)
+        if process is not None:
+            try:
+                if process.poll() is None:
+                    process.terminate()
+                    try:
+                        process.wait(timeout=0.08)
+                    except subprocess.TimeoutExpired:
+                        process.kill()
+            except (OSError, ProcessLookupError):
+                pass
+
     def _maybe_play_timer_during_sound(self, key, started_at, now):
-        """Play timer-during feedback only after a gesture has held for 200 ms."""
+        """Play timer-during feedback after 200 ms and retain a stoppable player."""
         if started_at is None or now - float(started_at) < 0.2:
+            self._stop_timer_during_sound(key)
             return
         if self._timer_during_sound_played_at.get(key) == started_at:
+            process = self._timer_during_sound_processes.get(key)
+            if process is not None and process.poll() is not None:
+                self._timer_during_sound_processes.pop(key, None)
             return
+        self._stop_timer_during_sound(key)
         self._timer_during_sound_played_at[key] = started_at
-        play_ui_sound(self.ui_preferences.get("sound_gesture_timer_during", "None"))
+        process = play_ui_sound(self.ui_preferences.get("sound_gesture_timer_during", "None"))
+        if process is not None:
+            self._timer_during_sound_processes[key] = process
 
     def _menu_pinch_elapsed_seconds(self, side, now=None):
         """Count only held pinch time after the continuous pinch confirmation buffer."""
@@ -10534,6 +10563,7 @@ try {
         self.menu_pinch_latched.discard(side)
 
     def _clear_menu_pinch_sequence(self, side):
+        self._stop_timer_during_sound(f"pinch_menu:{side}")
         self.menu_pinch_started[side] = None
         self.menu_pinch_accumulated_seconds[side] = 0.0
         self.menu_pinch_pulse_started_at[side] = None
@@ -11446,6 +11476,7 @@ try {
                         not self.thumbs_up_toggle_latched[side]):
                     self.gesture_tracking_enabled[side] = not self.gesture_tracking_enabled.get(side, True)
                     self.thumbs_up_toggle_latched[side] = True
+                    self._stop_timer_during_sound(f"thumbs_up:{side}")
                     gesture_tracking_just_toggled.add(side)
                     state = "enabled" if self.gesture_tracking_enabled[side] else "disabled"
                     self.status = f"{side.title()} hand gesture tracking {state}"
@@ -11477,6 +11508,7 @@ try {
                     self.thumbs_up_hold_started[side] = None
                     self.thumbs_up_last_seen[side] = None
                     self.thumbs_up_toggle_latched[side] = False
+                    self._stop_timer_during_sound(f"thumbs_up:{side}")
 
             # Gesture tracking and cursor/TLI tracking are one per-hand switch. Keep the
             # camera landmarks in hand_positions so the virtual hand stays visible and the
