@@ -297,30 +297,17 @@ def play_ui_sound(filename):
         return
     try:
         if shutil.which("paplay"):
-            return subprocess.Popen(["paplay", str(path)], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            subprocess.Popen(["paplay", str(path)], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         elif shutil.which("aplay") and path.suffix.lower() == ".wav":
-            return subprocess.Popen(["aplay", "-q", str(path)], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            subprocess.Popen(["aplay", "-q", str(path)], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         elif shutil.which("ffplay"):
-            return subprocess.Popen(["ffplay", "-nodisp", "-autoexit", "-loglevel", "quiet", str(path)],
-                                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            subprocess.Popen(["ffplay", "-nodisp", "-autoexit", "-loglevel", "quiet", str(path)],
+                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     except (OSError, ValueError):
         pass
-    return None
 # Hand render styles, in the order shown by the Settings -> Hands switch.
 HAND_RENDER_STYLES = ("skeleton", "flat", "3d")
 HAND_RENDER_STYLE_LABELS = {"skeleton": "SKELETON", "flat": "FLAT", "3d": "3D"}
-
-def available_hand_models():
-    """Return selectable 3D hand model folders under assets/hands; root files are Default."""
-    folder = ROOT / "assets" / "hands"
-    found = []
-    try:
-        for child in sorted(folder.iterdir(), key=lambda item: item.name.casefold()):
-            if child.is_dir() and any(p.is_file() and p.suffix.lower() in {".glb", ".gltf"} for p in child.iterdir()):
-                found.append(child.name)
-    except OSError:
-        pass
-    return ["Default", *found]
 # Settings -> Notify rows: (ui preference key, label, default position).
 NOTIFICATION_SETTING_ROWS = (
     ("paused_notice_position", "GESTURE LEGEND LOCATION", "bottom-center"),
@@ -349,7 +336,6 @@ def load_ui_preferences() -> dict:
         "stt_indicator_position": "top-right",
         "ui_font_scale": 1.2,
         "show_gesture_disabled_indicator": True,
-        "hand_model_folder": "Default",
         **{key: "None" for key, _label in SOUND_SETTING_ROWS},
     }
     try:
@@ -367,9 +353,6 @@ def load_ui_preferences() -> dict:
                     pass
             elif key == "show_gesture_disabled_indicator":
                 if isinstance(value, bool):
-                    result[key] = value
-            elif key == "hand_model_folder":
-                if value in available_hand_models():
                     result[key] = value
             elif key in dict(SOUND_SETTING_ROWS):
                 allowed = {"None", *available_ui_sounds()}
@@ -390,9 +373,6 @@ def save_ui_preferences(values: dict) -> None:
                 pass
         elif key == "show_gesture_disabled_indicator":
             if isinstance(value, bool):
-                current[key] = value
-        elif key == "hand_model_folder":
-            if value in available_hand_models():
                 current[key] = value
         elif key in dict(SOUND_SETTING_ROWS):
             allowed = {"None", *available_ui_sounds()}
@@ -917,7 +897,7 @@ class Tracker:
         # Run inference at a modest active cadence and downshift further when no hands
         # are present. This substantially reduces sustained CPU use on software-rendered
         # Linux desktops while staying responsive enough for gesture interaction.
-        idle_frame_interval = 1.0 / 6.0
+        idle_frame_interval = 1.0 / 8.0
         # Paused hand tracking only needs occasional frames for the optional face welcome.
         paused_frame_interval = 1.0 / 2.0
         idle_after_seconds = 1.0
@@ -1937,7 +1917,6 @@ class SpatialDesktop(QWidget):
         self.custom_gesture_triggers = {"left": HoldTrigger(), "right": HoldTrigger(), "overlap": HoldTrigger()}
         # Track which timer starts have already played the delayed timer-during sound.
         self._timer_during_sound_played_at = {}
-        self._timer_during_sound_processes = {}
         self.custom_gesture_live = {}
         self.cursor_smoothing = settings["cursor_smoothing"]
         self.tli_glow_intensity = settings.get("tli_glow_intensity", 1.0)
@@ -1996,6 +1975,8 @@ class SpatialDesktop(QWidget):
             "ball": {"x": 0.70, "y": 0.82, "vx": 0.0, "vy": 0.0, "r": 0.027, "held": None},
             "sundial": {"x": 0.30, "y": 0.82, "held": None},
         }
+        self._garden_clock_projection_enabled = False
+        self._garden_clock_projection_started = 0.0
         self._garden_bird_seed = 19.0
         self._garden_bird_last_spawn = 0.0
         self._garden_birds = []
@@ -2161,7 +2142,7 @@ class SpatialDesktop(QWidget):
         # Loaded from gestures.txt above; set from Settings -> Hands -> CONTACT RANGE.
         self.hand_contact_weight = 0.0
         self.hand_contact_last_update = None
-        self.mouse_detached_by_side = {"left": True, "right": False}
+        self.mouse_detached_by_side = {"left": False, "right": False}
         self.peace_hold_started = {"left": None, "right": None}
         self.peace_toggle_latched = {"left": False, "right": False}
         # Per-hand gesture lock: a sustained thumbs-up toggles only the hand making it.
@@ -2946,31 +2927,30 @@ class SpatialDesktop(QWidget):
         dt = min(0.045, max(0.0, now - getattr(self, "_garden_prop_last_tick", now)))
         self._garden_prop_last_tick = now
         props = self._garden_props
-        # A pinch drag picks up the ball or sundial when the cursor is over it.
+        # Ball pickup is handled in the gesture loop so it takes priority over the
+        # Pinch Menu timer. Preserve the existing timed pinch-drag interaction for the
+        # sundial itself.
         cursors = getattr(self, "side_cursor_positions", {})
         pinching = getattr(self, "pinch_drag_active", {})
-        for side in ("left", "right"):
-            cursor = cursors.get(side)
-            active = bool(pinching.get(side, False)) if isinstance(pinching, dict) else False
-            if cursor is None:
-                active = False
-            if active and cursor is not None:
-                cx, cy = float(cursor.x()) / max(1.0, width), float(cursor.y()) / max(1.0, height)
-                for name, prop in props.items():
-                    if prop["held"] == side:
-                        prop["x"], prop["y"] = cx, cy
-                        break
-                    if prop["held"] is None:
-                        radius = prop.get("r", 0.045) + (0.025 if name == "ball" else 0.035)
-                        if (cx-prop["x"])**2 + (cy-prop["y"])**2 < radius**2:
-                            prop["held"] = side
-                            prop["x"], prop["y"] = cx, cy
-                            if name == "ball":
-                                prop["vx"] = prop["vy"] = 0.0
-                            break
-            for prop in props.values():
-                if prop["held"] == side and not active:
-                    prop["held"] = None
+        dial_prop = props.get("sundial")
+        if dial_prop is not None:
+            for side in ("left", "right"):
+                cursor = cursors.get(side)
+                active = bool(pinching.get(side, False)) if isinstance(pinching, dict) else False
+                if cursor is None:
+                    active = False
+                if active and cursor is not None:
+                    cx = float(cursor.x()) / max(1.0, width)
+                    cy = float(cursor.y()) / max(1.0, height)
+                    if dial_prop["held"] == side:
+                        dial_prop["x"], dial_prop["y"] = cx, cy
+                    elif dial_prop["held"] is None:
+                        radius = 0.078
+                        if (cx-dial_prop["x"])**2 + (cy-dial_prop["y"])**2 < radius**2:
+                            dial_prop["held"] = side
+                            dial_prop["x"], dial_prop["y"] = cx, cy
+                if dial_prop["held"] == side and not active:
+                    dial_prop["held"] = None
         ball = props["ball"]
         if ball["held"] is None:
             ball["vy"] += 0.78 * dt
@@ -2988,63 +2968,28 @@ class SpatialDesktop(QWidget):
                 ball["x"] = min(1.0-ball["r"], max(ball["r"], ball["x"]))
                 ball["vx"] *= -0.68
             ball["vx"] *= max(0.0, 1.0 - dt*0.55)
-        # Perspective bird traffic: some birds emerge at the horizon and grow as they
-        # approach the viewer; others enter high on the screen and shrink into the distance.
-        # Normalised endpoints make both flight paths scale correctly with the scene.
-        if now - self._garden_bird_last_spawn > 1.75 and len(self._garden_birds) < 9:
+        # Bird flock: staggered silhouettes fly across the sky, then respawn off-screen.
+        if now - self._garden_bird_last_spawn > 2.8:
             self._garden_bird_last_spawn = now
             self._garden_bird_seed = (self._garden_bird_seed * 1.71 + 13.7) % 997.0
-            seed = self._garden_bird_seed
-            if int(seed) % 3 != 0:
-                # Approach: start tiny near the vanishing point, then fan outward and grow.
-                side = -1.0 if int(seed * 7) % 2 == 0 else 1.0
-                end_x = 0.08 + (seed % 83.0) / 100.0
-                end_y = 0.34 + ((seed * 1.37) % 34.0) / 100.0
-                start_x = 0.5 + side * ((seed % 11.0) / 100.0)
-                start_y = 0.205 + ((seed * 0.71) % 45.0) / 1000.0
-                bird = {"mode": "approach", "x0": start_x, "y0": start_y,
-                        "x1": end_x, "y1": end_y, "t": 0.0,
-                        "duration": 4.8 + (seed % 24.0) / 10.0,
-                        "scale0": 0.12 + (seed % 8.0) / 100.0,
-                        "scale1": 0.8 + (seed % 45.0) / 100.0,
-                        "phase": seed}
-            else:
-                # Depart: enter from the upper foreground and converge toward the horizon.
-                start_x = 0.08 + (seed % 83.0) / 100.0
-                end_x = 0.43 + ((seed * 1.91) % 15.0) / 100.0
-                bird = {"mode": "depart", "x0": start_x, "y0": -0.015,
-                        "x1": end_x, "y1": 0.205 + ((seed * 0.61) % 45.0) / 1000.0,
-                        "t": 0.0, "duration": 3.0 + (seed % 18.0) / 10.0,
-                        "scale0": 0.72 + (seed % 35.0) / 100.0,
-                        "scale1": 0.09, "phase": seed}
-            self._garden_birds.append(bird)
-        for bird in self._garden_birds:
-            bird["t"] += dt / max(0.1, bird["duration"])
-        self._garden_birds = [b for b in self._garden_birds if b["t"] < 1.0]
+            self._garden_birds.append({
+                "x": -0.06, "y": 0.20 + (self._garden_bird_seed % 100)/1000.0,
+                "speed": 0.10 + (self._garden_bird_seed % 55)/400.0,
+                "scale": 0.7 + (self._garden_bird_seed % 40)/100.0,
+                "phase": self._garden_bird_seed,
+            })
+        self._garden_birds = [b for b in self._garden_birds if b["x"] < 1.08]
         painter.save()
         painter.setRenderHint(QPainter.Antialiasing, True)
         for bird in self._garden_birds:
-            # A gentle ease keeps distant birds subtle and makes their perspective clear.
-            t = min(1.0, max(0.0, bird["t"]))
-            eased = t * t * (3.0 - 2.0 * t)
-            bx = (bird["x0"] + (bird["x1"] - bird["x0"]) * eased) * width
-            by = (bird["y0"] + (bird["y1"] - bird["y0"]) * eased) * height
-            scale = bird["scale0"] + (bird["scale1"] - bird["scale0"]) * eased
-            # Orient the V-shaped silhouette along its flight path.
-            vx = (bird["x1"] - bird["x0"]) * width
-            vy = (bird["y1"] - bird["y0"]) * height
-            angle = math.degrees(math.atan2(vy, vx))
-            span = max(1.0, height * 0.012 * scale)
-            flap = math.sin(now * (7.5 + scale * 2.0) + bird["phase"]) * span * 0.65
-            pen = QPen(QColor(43, 67, 65, 210 if scene["is_day"] else 170),
-                       max(0.7, height * 0.0015 * max(0.45, scale)), Qt.SolidLine, Qt.RoundCap)
-            painter.save()
-            painter.translate(bx, by)
-            painter.rotate(angle)
+            bird["x"] += bird["speed"] * dt
+            bx, by = bird["x"]*width, bird["y"]*height
+            span = height * 0.012 * bird["scale"]
+            flap = math.sin(now*8.0 + bird["phase"]) * span * 0.7
+            pen = QPen(QColor(43, 67, 65, 210 if scene["is_day"] else 170), max(1.2, height*0.0015), Qt.SolidLine, Qt.RoundCap)
             painter.setPen(pen)
-            painter.drawLine(QPointF(-span, flap), QPointF(0.0, 0.0))
-            painter.drawLine(QPointF(0.0, 0.0), QPointF(span, flap))
-            painter.restore()
+            painter.drawLine(QPointF(bx-span, by+flap), QPointF(bx, by))
+            painter.drawLine(QPointF(bx, by), QPointF(bx+span, by+flap))
         # Ball with a soft ground shadow, glossy red/orange surface.
         bx, by, br = ball["x"]*width, ball["y"]*height, ball["r"]*height
         painter.setPen(Qt.NoPen)
@@ -3061,11 +3006,27 @@ class SpatialDesktop(QWidget):
         dial = props["sundial"]
         dx, dy = dial["x"]*width, dial["y"]*height
         radius = min(width, height)*0.043
+        # Short, tapered stone pedestal supports the sundial plate.
+        pedestal_top = dy-radius*0.02
+        pedestal_bottom = dy+radius*0.78
+        pedestal = QPolygonF([
+            QPointF(dx-radius*0.48, pedestal_top),
+            QPointF(dx+radius*0.48, pedestal_top),
+            QPointF(dx+radius*0.36, pedestal_bottom),
+            QPointF(dx-radius*0.36, pedestal_bottom),
+        ])
+        painter.setPen(QPen(QColor(91, 91, 83, 235), max(1.0, radius*0.045)))
+        painter.setBrush(QColor(133, 137, 130))
+        painter.drawPolygon(pedestal)
+        painter.setPen(QPen(QColor(173, 176, 165, 230), max(1.0, radius*0.035)))
+        painter.setBrush(QColor(166, 169, 158))
+        painter.drawRoundedRect(QRectF(dx-radius*0.53, pedestal_top-radius*0.10,
+                                       radius*1.06, radius*0.18), radius*0.05, radius*0.05)
         painter.setPen(QPen(QColor(86, 87, 61, 220), max(1.0, radius*0.08)))
         painter.setBrush(QColor(198, 183, 126))
-        painter.drawEllipse(QPointF(dx, dy), radius, radius*0.34)
+        painter.drawEllipse(QPointF(dx, dy-radius*0.12), radius, radius*0.34)
         painter.setBrush(QColor(227, 215, 164))
-        painter.drawEllipse(QPointF(dx, dy-radius*0.06), radius*0.88, radius*0.29)
+        painter.drawEllipse(QPointF(dx, dy-radius*0.18), radius*0.88, radius*0.29)
         painter.setPen(QPen(QColor(122, 104, 63, 180), max(1.0, radius*0.025)))
         for i in range(12):
             a = i*math.pi/6
@@ -3073,13 +3034,50 @@ class SpatialDesktop(QWidget):
                              QPointF(dx+math.cos(a)*radius*0.80, dy-radius*0.06+math.sin(a)*radius*0.24))
         progress = float(scene.get("progress", 0.5))
         angle = (progress-0.5)*math.pi*0.92
-        gnomon_tip = QPointF(dx+math.cos(angle)*radius*0.18, dy-radius*0.06-math.sin(angle)*radius*1.05)
+        gnomon_tip = QPointF(dx+math.cos(angle)*radius*0.18, dy-radius*0.18-math.sin(angle)*radius*1.05)
         painter.setPen(QPen(QColor(91, 75, 43), max(2.0, radius*0.10), Qt.SolidLine, Qt.RoundCap))
-        painter.drawLine(QPointF(dx, dy-radius*0.06), gnomon_tip)
+        painter.drawLine(QPointF(dx, dy-radius*0.18), gnomon_tip)
         shadow_angle = angle + math.pi
         painter.setPen(QPen(QColor(52, 62, 42, 145), max(2.0, radius*0.09), Qt.SolidLine, Qt.RoundCap))
-        painter.drawLine(QPointF(dx, dy-radius*0.03),
-                         QPointF(dx+math.cos(shadow_angle)*radius*0.83, dy-radius*0.03+math.sin(shadow_angle)*radius*0.25))
+        painter.drawLine(QPointF(dx, dy-radius*0.15),
+                         QPointF(dx+math.cos(shadow_angle)*radius*0.83, dy-radius*0.15+math.sin(shadow_angle)*radius*0.25))
+        # Bat-signal-inspired digital clock projection: a soft perspective beam rises
+        # from the sundial and lands on a wide, foreshortened clock display in the sky.
+        if bool(getattr(self, "_garden_clock_projection_enabled", False)):
+            elapsed = max(0.0, now - float(getattr(self, "_garden_clock_projection_started", now)))
+            pulse = 0.84 + 0.10 * math.sin(now * 2.2)
+            beam_top_y = height * 0.16
+            beam_half_width = width * 0.19
+            beam = QPolygonF([
+                QPointF(dx-radius*0.20, dy-radius*0.16),
+                QPointF(dx+radius*0.20, dy-radius*0.16),
+                QPointF(min(width*0.96, dx+beam_half_width), beam_top_y+height*0.035),
+                QPointF(max(width*0.04, dx-beam_half_width), beam_top_y+height*0.035),
+            ])
+            beam_gradient = QLinearGradient(dx, dy, dx, beam_top_y)
+            beam_gradient.setColorAt(0.0, QColor(113, 224, 255, int(25*pulse)))
+            beam_gradient.setColorAt(0.55, QColor(94, 205, 255, int(12*pulse)))
+            beam_gradient.setColorAt(1.0, QColor(114, 226, 255, int(3*pulse)))
+            painter.setPen(Qt.NoPen)
+            painter.setBrush(QBrush(beam_gradient))
+            painter.drawPolygon(beam)
+            display = QRectF(max(width*0.04, dx-beam_half_width), beam_top_y,
+                             min(width*0.92, beam_half_width*2), height*0.105)
+            painter.setBrush(QColor(31, 151, 206, int(32*pulse)))
+            painter.setPen(QPen(QColor(124, 225, 255, int(145*pulse)), max(1.0, height*0.0014)))
+            painter.drawRoundedRect(display, height*0.012, height*0.012)
+            # Perspective guide lines make the projection read as light cast into the sky.
+            painter.setPen(QPen(QColor(115, 223, 255, int(90*pulse)), max(1.0, height*0.001)))
+            painter.drawLine(QPointF(dx-radius*0.12, dy-radius*0.15), QPointF(display.left(), display.bottom()))
+            painter.drawLine(QPointF(dx+radius*0.12, dy-radius*0.15), QPointF(display.right(), display.bottom()))
+            painter.setPen(QColor(212, 249, 255, int(230*pulse)))
+            painter.setFont(QFont("Consolas", max(16, int(height*0.055)), QFont.Bold))
+            clock_text = datetime.now().strftime("%H:%M:%S")
+            painter.drawText(display.adjusted(0, 0, 0, -height*0.004), Qt.AlignCenter, clock_text)
+            painter.setFont(QFont("Consolas", max(7, int(height*0.012)), QFont.DemiBold))
+            painter.setPen(QColor(143, 224, 255, int(180*pulse)))
+            caption = "LOCAL TIME  •  SUNDIAL PROJECTION"
+            painter.drawText(display.adjusted(0, height*0.075, 0, height*0.015), Qt.AlignHCenter | Qt.AlignTop, caption)
         painter.restore()
 
     def _paint_virtual_garden(self, painter, width, height):
@@ -3623,7 +3621,6 @@ class SpatialDesktop(QWidget):
             stack("priority_toggle")
         elif page == "hands":
             stack("render_style")
-            stack("hand_model_folder")
             stack("skin_tint")
             stack("disabled_indicator_toggle")
             y += group
@@ -3639,13 +3636,9 @@ class SpatialDesktop(QWidget):
             buttons["swatch_right"] = (L+half+gap, y, half, 70.0)
             y += 70.0 + gap
         elif page == "sounds":
-            row_h, row_gap = 42.0, 8.0
-            for index, (key, _label) in enumerate(SOUND_SETTING_ROWS):
-                row_y = index * (row_h + row_gap)
-                buttons["sound:" + key] = (L, row_y, W, row_h)
-                buttons["sound_select:" + key] = (R, row_y, W, row_h)
-            y = len(SOUND_SETTING_ROWS) * (row_h + row_gap)
-            texts["help"] = (L, y, 2*W+(R-(L+W)), 42.0)
+            for key, _label in SOUND_SETTING_ROWS:
+                stack("sound:" + key, h=48.0, after=8.0)
+            texts["help"] = (L, y, W, 42.0)
             y += 42.0 + gap
         elif page == "notifications":
             for key, _label, _default in NOTIFICATION_SETTING_ROWS:
@@ -3773,7 +3766,7 @@ class SpatialDesktop(QWidget):
         key = self.sound_dropdown_key
         if key not in dict(SOUND_SETTING_ROWS):
             return {"panel": QRectF(), "items": []}
-        row_rect = self._settings_control_rects(cx, cy, scale, page="sounds").get("sound_select:" + key)
+        row_rect = self._settings_control_rects(cx, cy, scale, page="sounds").get("sound:" + key)
         if row_rect is None:
             return {"panel": QRectF(), "items": []}
         options = ["None", *available_ui_sounds()]
@@ -5720,6 +5713,24 @@ class SpatialDesktop(QWidget):
         # must not click an underlying application or the desktop.
         if self.menu_open and self.hub_visible and not self._canvas_menu_panel_contains(point):
             return
+        # In Garden Mode, clicking the sundial toggles its projected digital clock
+        # instead of being treated as an ordinary desktop click.
+        if (self.desktop_mode == "virtual" and getattr(self, "virtual_garden_mode", False)
+                and not self._gesture_ui_modal_open()):
+            dial = getattr(self, "_garden_props", {}).get("sundial")
+            if dial is not None:
+                width, height = max(1.0, float(self.width())), max(1.0, float(self.height()))
+                dx, dy = float(dial["x"]) * width, float(dial["y"]) * height
+                hit_rx = min(width, height) * 0.065
+                hit_ry = min(width, height) * 0.060
+                if ((float(point.x()) - dx) / hit_rx) ** 2 + ((float(point.y()) - dy) / hit_ry) ** 2 <= 1.0:
+                    self._garden_clock_projection_enabled = not bool(
+                        getattr(self, "_garden_clock_projection_enabled", False))
+                    self._garden_clock_projection_started = now
+                    self.status = ("Sundial clock projected into the sky" if self._garden_clock_projection_enabled
+                                   else "Sundial clock projection disabled")
+                    self.update()
+                    return
         self.click_side = side
         play_ui_sound(self.ui_preferences.get("sound_pinch", "None"))
         if self._canvas_menu_panel_contains(point):
@@ -5921,23 +5932,7 @@ class SpatialDesktop(QWidget):
                         self.schedule_gesture_settings_save()
                     self.status = "Hand rendering: " + HAND_RENDER_STYLE_LABELS[style].lower()
                     return
-                if pressed("hand_model_folder"):
-                    options = available_hand_models()
-                    current = self.ui_preferences.get("hand_model_folder", "Default")
-                    try:
-                        index = options.index(current)
-                    except ValueError:
-                        index = 0
-                    selected = options[(index + 1) % len(options)]
-                    self.ui_preferences["hand_model_folder"] = selected
-                    save_ui_preferences(self.ui_preferences)
-                    self._hand_mesh_renderer = None
-                    self._hand_mesh_notice_shown = False
-                    self.status = "3D hand model: " + selected
-                    self.update()
-                    return
                 if pressed("skin_tint"):
-                    self.hand_skin_effect_enabled = self.hand_render_style != "skeleton"
                     self.skin_use_skeleton_color = not self.skin_use_skeleton_color
                     self.schedule_gesture_settings_save()
                     self.status = "Skin uses skeleton colour" if self.skin_use_skeleton_color else "Skin uses natural colour"
@@ -5961,7 +5956,7 @@ class SpatialDesktop(QWidget):
 
             if self.settings_page == "sounds":
                 for key, _label in SOUND_SETTING_ROWS:
-                    if pressed("sound_select:" + key):
+                    if pressed("sound:" + key):
                         self.sound_dropdown_key = key
                         self.update()
                         break
@@ -8687,9 +8682,6 @@ try {
             self.custom_gesture_message = "Could not save custom_gestures.json"
 
     def _reset_custom_gesture_triggers(self):
-        self._stop_timer_during_sound("custom:left")
-        self._stop_timer_during_sound("custom:right")
-        self._stop_timer_during_sound("custom:overlap")
         self.custom_gesture_triggers = {"left": HoldTrigger(), "right": HoldTrigger(), "overlap": HoldTrigger()}
         self.custom_gesture_live = {}
         self.custom_gesture_rings = {}
@@ -8881,10 +8873,7 @@ try {
                         f"custom:{side}", trigger.since, now)
                     rings[side] = (self.custom_gestures[candidate].get("label", ""), progress,
                                    max(0.0, hold*(1.0-progress)))
-            else:
-                self._stop_timer_during_sound(f"custom:{side}")
             if fired is not None:
-                self._stop_timer_during_sound(f"custom:{side}")
                 self._run_custom_gesture_action(fired, side)
 
         # Built-in: overlapping both TPIs (open hands, nothing else in progress) and
@@ -9766,8 +9755,7 @@ try {
         if self._hand_mesh_renderer is None:
             try:
                 from hand_mesh_3d import HandMeshRenderer
-                self._hand_mesh_renderer = HandMeshRenderer(
-                    model_folder=self.ui_preferences.get("hand_model_folder", "Default"))
+                self._hand_mesh_renderer = HandMeshRenderer()
             except Exception as exc:
                 self._report_hand_mesh_problem(f"3D hands unavailable: {exc}")
                 return False
@@ -10485,7 +10473,7 @@ try {
                                         float(landmarks[4].y)-float(landmarks[2].y)) > 0.08
             # A true tracking-toggle thumbs-up must point nearly vertically upward,
             # not diagonally out to the side. Use aspect-corrected camera pixels.
-            thumb_vertical = thumb_axis_is_vertical_up(landmarks, max_angle_degrees=10.0)
+            thumb_vertical = thumb_axis_is_vertical_up(landmarks, max_angle_degrees=25.0)
             return thumb_up and fingers_folded and thumb_extended and thumb_vertical
         except (IndexError, AttributeError, TypeError, ValueError):
             return False
@@ -10541,35 +10529,14 @@ try {
         self.modifier_click_last_pose_at[side] = None
         self.modifier_click_armed[side] = True
 
-    def _stop_timer_during_sound(self, key):
-        """Stop the timer-during audio process immediately when its gesture ends."""
-        process = getattr(self, "_timer_during_sound_processes", {}).pop(key, None)
-        if process is not None:
-            try:
-                if process.poll() is None:
-                    process.terminate()
-                    try:
-                        process.wait(timeout=0.08)
-                    except subprocess.TimeoutExpired:
-                        process.kill()
-            except (OSError, ProcessLookupError):
-                pass
-
     def _maybe_play_timer_during_sound(self, key, started_at, now):
-        """Play timer-during feedback after 200 ms and retain a stoppable player."""
+        """Play timer-during feedback only after a gesture has held for 200 ms."""
         if started_at is None or now - float(started_at) < 0.2:
-            self._stop_timer_during_sound(key)
             return
         if self._timer_during_sound_played_at.get(key) == started_at:
-            process = self._timer_during_sound_processes.get(key)
-            if process is not None and process.poll() is not None:
-                self._timer_during_sound_processes.pop(key, None)
             return
-        self._stop_timer_during_sound(key)
         self._timer_during_sound_played_at[key] = started_at
-        process = play_ui_sound(self.ui_preferences.get("sound_gesture_timer_during", "None"))
-        if process is not None:
-            self._timer_during_sound_processes[key] = process
+        play_ui_sound(self.ui_preferences.get("sound_gesture_timer_during", "None"))
 
     def _menu_pinch_elapsed_seconds(self, side, now=None):
         """Count only held pinch time after the continuous pinch confirmation buffer."""
@@ -10598,7 +10565,6 @@ try {
         self.menu_pinch_latched.discard(side)
 
     def _clear_menu_pinch_sequence(self, side):
-        self._stop_timer_during_sound(f"pinch_menu:{side}")
         self.menu_pinch_started[side] = None
         self.menu_pinch_accumulated_seconds[side] = 0.0
         self.menu_pinch_pulse_started_at[side] = None
@@ -11067,11 +11033,9 @@ try {
         self.update()
 
     def _adjust_scene_timer_cadence(self, hand_present, now):
-        """Use a lower-cost 30 Hz Garden cadence; otherwise use active/idle UI cadence."""
+        """Run Garden Mode at 60 Hz; otherwise use active/idle UI cadence."""
         if getattr(self, "virtual_garden_mode", False):
-            # The scene includes weather, grass and animated props. 30 Hz remains smooth
-            # while roughly halving the repaint workload versus the old 60 Hz cadence.
-            desired_ms = 33
+            desired_ms = 16
         else:
             desired_ms = 50 if hand_present or not self._scene_is_idle(now) else 100
         timer = getattr(self, "timer", None)
@@ -11501,51 +11465,46 @@ try {
                              cursor.x() >= edge_width*0.955 or
                              cursor.y() <= edge_height*0.055 or
                              cursor.y() >= edge_height*0.945)
-            # This toggle remains active even while all ordinary gestures are locked.
-            thumbs_up = False if calibration_modal_frame else self._is_thumbs_up(landmarks)
-            if thumbs_up:
-                self.thumbs_up_last_seen[side] = now
-                if self.thumbs_up_hold_started[side] is None:
-                    self.thumbs_up_hold_started[side] = now
-                self._maybe_play_timer_during_sound(
-                    f"thumbs_up:{side}", self.thumbs_up_hold_started[side], now)
-                if (now-self.thumbs_up_hold_started[side] >= self.gesture_tracking_toggle_hold_seconds and
-                        not self.thumbs_up_toggle_latched[side]):
-                    self.gesture_tracking_enabled[side] = not self.gesture_tracking_enabled.get(side, True)
-                    self.thumbs_up_toggle_latched[side] = True
-                    self._stop_timer_during_sound(f"thumbs_up:{side}")
+            # Peace sign is the single per-hand toggle for both cursor and gesture tracking.
+            # It remains detectable while tracking is disabled so the same gesture can re-enable it.
+            peace = False if calibration_modal_frame else self._is_peace_sign(landmarks)
+            if peace:
+                if self.peace_hold_started[side] is None:
+                    self.peace_hold_started[side] = now
+                if (now-self.peace_hold_started[side] >= self.peace_toggle_hold_seconds
+                        and not self.peace_toggle_latched[side]):
+                    enabled = not self.gesture_tracking_enabled.get(side, True)
+                    self.gesture_tracking_enabled[side] = enabled
+                    self.peace_toggle_latched[side] = True
                     gesture_tracking_just_toggled.add(side)
-                    state = "enabled" if self.gesture_tracking_enabled[side] else "disabled"
-                    self.status = f"{side.title()} hand gesture tracking {state}"
-                    self.hand_tracking_notice_text = f"{side.title()} hand gestures {state}"
+                    # There is no separate cursor-detach state anymore: peace sign
+                    # switches native cursor and gesture handling together.
+                    self.mouse_detached_by_side[side] = False
+                    state = "enabled" if enabled else "disabled"
+                    self.status = f"{side.title()} hand cursor and gestures {state}"
+                    self.hand_tracking_notice_text = f"{side.title()} hand cursor + gestures {state}"
                     self.hand_tracking_notice_until = now + 5.0
-                    # Confirm the specific hand and its new gesture state aloud.
-                    spoken_state = "on" if self.gesture_tracking_enabled[side] else "off"
-                    self.tts.speak(f"{side} hand gestures {spoken_state}.")
-                    # Clear only this hand's pending gestures/actions. Never interrupt the
-                    # other hand, which remains fully usable throughout the toggle.
-                    self.peace_hold_started[side] = None
                     self.menu_pinch_started[side] = None
                     self.fist_started_at[side] = None
                     self.action_stop_wait_open[side] = True
                     self.action_stop_open_since[side] = None
-                    if not self.gesture_tracking_enabled[side]:
+                    if not enabled:
+                        self._cancel_side_interactions_for_tracking_pause(side)
                         self._end_pinch_drag(side, status=False)
                         self.active_action[side] = None
                         self.fist_action_menu_open[side] = False
                         self.fist_hovered_action[side] = None
                         if self.gesture_owner == side:
                             self.gesture_owner = None
+                    else:
+                        # Do not let the held peace sign immediately trigger another action.
+                        self.side_cursor_positions[side] = None
+                        self.smoothed_side_cursor_positions[side] = None
+                        self.cursor_updated_at[side] = 0.0
+                        self.tli_overrides.pop(side, None)
             else:
-                # MediaPipe can briefly lose the exact thumb pose for a frame or two.
-                # Keep the hold/latch through a short dropout so re-enabling a disabled
-                # hand doesn't require a perfectly uninterrupted classification.
-                last_thumb_frame = self.thumbs_up_last_seen.get(side)
-                if (last_thumb_frame is None or now-last_thumb_frame > 0.18):
-                    self.thumbs_up_hold_started[side] = None
-                    self.thumbs_up_last_seen[side] = None
-                    self.thumbs_up_toggle_latched[side] = False
-                    self._stop_timer_during_sound(f"thumbs_up:{side}")
+                self.peace_hold_started[side] = None
+                self.peace_toggle_latched[side] = False
 
             # Gesture tracking and cursor/TLI tracking are one per-hand switch. Keep the
             # camera landmarks in hand_positions so the virtual hand stays visible and the
@@ -11564,40 +11523,6 @@ try {
                     self._end_pinch_drag(side, status=False)
                 continue
 
-            peace = False if (calibration_modal_frame or not self.gesture_tracking_enabled.get(side, True)
-                              or side in gesture_tracking_just_toggled) else self._is_peace_sign(landmarks)
-            if peace:
-                if self.peace_hold_started[side] is None:
-                    self.peace_hold_started[side] = now
-                if now-self.peace_hold_started[side] >= self.peace_toggle_hold_seconds and not self.peace_toggle_latched[side]:
-                    self.mouse_detached_by_side[side] = not self.mouse_detached_by_side.get(side, False)
-                    self.peace_toggle_latched[side] = True
-                    detached = self.mouse_detached_by_side[side]
-                    # Never leave a native mouse button held when this hand is detached.
-                    # This prevents click-and-hold dragging from persisting after the
-                    # hand has been toggled out of native cursor control.
-                    if detached and self.pinch_drag_active.get(side, False):
-                        self._end_pinch_drag(side, status=False)
-                    # Drag scrolling is disabled while detached, so stop one in progress.
-                    active_scroll = self.active_action.get(side)
-                    if detached and active_scroll is not None and active_scroll.get("mode") == "scroll_window":
-                        self.active_action[side] = None
-                        self.action_stop_wait_open[side] = True
-                        self.action_stop_open_since[side] = None
-                        if self.gesture_owner == side:
-                            self.gesture_owner = None
-                    state = "detached" if detached else "attached"
-                    self.status = f"{side.title()} hand mouse {state}"
-                    # Detachment affects only native OS pointer movement. Keep updating
-                    # the live TLI and keep this hand fully available for glass/menu gestures.
-                    self.cursor_updated_at[side] = now
-                    if detached:
-                        self._refresh_hand_tracking_notice(now, show_enabled=False)
-                    else:
-                        self._refresh_hand_tracking_notice(now, show_enabled=True)
-            else:
-                self.peace_hold_started[side] = None
-                self.peace_toggle_latched[side] = False
             raw_fist = is_fist_or_grip_pose(landmarks, edge_tolerant=edge_tolerant)
             raw_pinch = is_thumb_index_menu_pinch(landmarks, edge_tolerant=edge_tolerant)
             raw_middle_pinch = is_thumb_middle_zoom_pinch(landmarks, edge_tolerant=edge_tolerant)
@@ -12090,6 +12015,63 @@ try {
                   and not self.floating_clipboard_visible and not self._virtual_pen_ui_contains(cursor)):
                 if self._handle_virtual_pen_frame(side, cursor, is_pinch, now):
                     continue
+
+            # Garden ball drag: pinch directly on the ball to pick it up, move while
+            # holding the pinch, then release to drop. This intentionally bypasses the
+            # normal Pinch Menu hold timer and its timer-during sound.
+            garden_active = (self.desktop_mode == "virtual" and
+                             getattr(self, "virtual_garden_mode", False) and
+                             not self._gesture_ui_modal_open())
+            garden_props = getattr(self, "_garden_props", {}) if garden_active else {}
+            garden_ball = garden_props.get("ball") if isinstance(garden_props, dict) else None
+            if garden_ball is not None:
+                if garden_ball.get("held") == side:
+                    if is_pinch and cursor is not None:
+                        garden_ball["x"] = float(cursor.x()) / max(1.0, float(self.width()))
+                        garden_ball["y"] = float(cursor.y()) / max(1.0, float(self.height()))
+                        garden_ball["vx"] = garden_ball["vy"] = 0.0
+                        if not hasattr(self, "_garden_ball_last_cursor"):
+                            self._garden_ball_last_cursor = {}
+                        self._garden_ball_last_cursor[side] = (float(cursor.x()), float(cursor.y()))
+                        self._clear_menu_pinch_sequence(side)
+                        continue
+                    garden_ball["held"] = None
+                    # Give a small natural toss based on the last hand movement.
+                    last = getattr(self, "_garden_ball_last_cursor", {}).get(side)
+                    if last is not None and cursor is not None:
+                        garden_ball["vx"] = max(-0.9, min(0.9, (float(cursor.x())-last[0]) / max(1.0, self.width()) * 8.0))
+                        garden_ball["vy"] = max(-0.9, min(0.9, (float(cursor.y())-last[1]) / max(1.0, self.height()) * 8.0))
+                    self._clear_menu_pinch_sequence(side)
+                    self.status = "Garden ball dropped"
+                    self.update()
+                    continue
+                if (is_pinch and cursor is not None and garden_ball.get("held") is None):
+                    bw, bh = max(1.0, float(self.width())), max(1.0, float(self.height()))
+                    bx, by = float(garden_ball["x"])*bw, float(garden_ball["y"])*bh
+                    br = float(garden_ball.get("r", 0.027))*bh
+                    # Forgiving pickup radius around the visible ball, suitable for the TLI.
+                    hit_rx = br + max(22.0, min(bw, bh)*0.018)
+                    hit_ry = br + max(22.0, min(bw, bh)*0.018)
+                    if ((float(cursor.x())-bx)/hit_rx)**2 + ((float(cursor.y())-by)/hit_ry)**2 <= 1.0:
+                        garden_ball["held"] = side
+                        garden_ball["x"] = float(cursor.x())/bw
+                        garden_ball["y"] = float(cursor.y())/bh
+                        garden_ball["vx"] = garden_ball["vy"] = 0.0
+                        if not hasattr(self, "_garden_ball_last_cursor"):
+                            self._garden_ball_last_cursor = {}
+                        self._garden_ball_last_cursor[side] = (float(cursor.x()), float(cursor.y()))
+                        self._clear_menu_pinch_sequence(side)
+                        self.gesture_owner = side
+                        self.canvas_active_side = side
+                        self.status = "Garden ball picked up — move while pinching; release to drop"
+                        self.update()
+                        continue
+                # Keep the last cursor for release momentum; don't retain stale samples
+                # across frames where this hand is no longer tracked.
+                if cursor is not None:
+                    if not hasattr(self, "_garden_ball_last_cursor"):
+                        self._garden_ball_last_cursor = {}
+                    self._garden_ball_last_cursor[side] = (float(cursor.x()), float(cursor.y()))
 
             # A moving held pinch is a native click-and-hold drag. Consume every frame
             # until release, so the same gesture cannot also fire a quick click or menu.
@@ -12638,7 +12620,9 @@ try {
                 self.fist_open_candidate_since[side] = None
                 # Measure this specific fist hold for quick-click release and the separate
                 # two-hand drag clutch. Right-only scroll itself has no hold-time requirement.
-                # Fist grab/scroll is intentionally silent while held; no gesture-timer sound.
+                if self.fist_action.get(side) != "slider" and not self.fist_start_controls.get(side):
+                    self._maybe_play_timer_during_sound(
+                        f"fist:{side}", self.fist_started_at[side], now)
                 current_fist_held = now-self.fist_started_at[side]
                 origin = self.fist_origin_points[side] or cursor
                 dx_from_origin = cursor.x()-origin.x()
@@ -13709,16 +13693,6 @@ try {
                             painter.setPen(QColor(235, 255, 255))
                             self._draw_fitted_button_label(painter, rect, label, base_size=label_size, min_size=6, inset=12*scale)
 
-                        model_rect = controls.get("hand_model_folder")
-                        if model_rect is not None:
-                            painter.setBrush(QBrush(QColor(10, 47, 67, 225)))
-                            painter.setPen(QPen(QColor(140, 230, 240, 210), 1.5*scale))
-                            painter.drawRoundedRect(model_rect, 10*scale, 10*scale)
-                            model_name = self.ui_preferences.get("hand_model_folder", "Default")
-                            self._draw_fitted_button_label(
-                                painter, model_rect, f"3D HAND MODEL  ·  {model_name}  ▾",
-                                base_size=label_size, min_size=6, inset=12*scale)
-
                         hand_setup_rect = controls["hand_setup"]
                         painter.setBrush(QBrush(QColor(18, 80, 93, 235)))
                         painter.setPen(QPen(QColor(115, 242, 250, 220), 1.4*scale))
@@ -13728,35 +13702,28 @@ try {
                                                        base_size=label_size, min_size=6, inset=12*scale)
 
                     elif self.settings_page == "sounds":
-                        # Labels stay in the left column; every sound selector shares a
-                        # fixed right-hand column, making the list easy to scan.
+                        # Render every sound setting as a clearly visible, independent dropdown.
+                        # Keep the label and current selection together so the page remains
+                        # understandable even when assets/sounds contains no audio files yet.
                         for key, label in SOUND_SETTING_ROWS:
-                            label_rect = controls.get("sound:" + key)
-                            select_rect = controls.get("sound_select:" + key)
-                            if label_rect is None or select_rect is None:
+                            rect = controls.get("sound:" + key)
+                            if rect is None:
                                 continue
-                            painter.setBrush(QBrush(QColor(10, 47, 67, 205)))
-                            painter.setPen(QPen(QColor(75, 150, 166, 180), 1.2*scale))
-                            painter.drawRoundedRect(label_rect, 9*scale, 9*scale)
-                            painter.setPen(QColor(225, 246, 250))
-                            self._draw_fitted_button_label(
-                                painter, label_rect, label,
-                                base_size=max(7, int(8.5*scale)), min_size=6, inset=12*scale)
                             selected_sound = self.ui_preferences.get(key, "None") or "None"
                             painter.setBrush(QBrush(QColor(10, 47, 67, 242)))
                             painter.setPen(QPen(QColor(140, 230, 240, 235), 1.7*scale))
-                            painter.drawRoundedRect(select_rect, 9*scale, 9*scale)
+                            painter.drawRoundedRect(rect, 10*scale, 10*scale)
                             painter.setPen(QColor(237, 252, 255))
                             display_sound = selected_sound if selected_sound != "None" else "None (silent)"
                             self._draw_fitted_button_label(
-                                painter, select_rect, f"{display_sound}   ▾",
+                                painter, rect, f"{label}     {display_sound}   ▾",
                                 base_size=max(7, int(8.5*scale)), min_size=6, inset=12*scale)
                         help_rect = text_rects.get("help")
                         if help_rect is not None:
                             painter.setPen(QColor(205, 235, 242))
                             self._draw_wrapped_fitted_text(
                                 painter, help_rect,
-                                "Choose a sound from the fixed list on the right. Add WAV, OGG, MP3, FLAC or AIFF files to assets/sounds. Changes save automatically.",
+                                "Select a row to choose a sound from assets/sounds. Add WAV, OGG, MP3, FLAC or AIFF files to populate the lists. Changes save automatically.",
                                 base_size=max(7, int(8*scale)), min_size=6)
 
                     elif self.settings_page == "notifications":
@@ -14001,7 +13968,7 @@ try {
                 self._paint_hand_skeleton(painter, points, side)
                 self._paint_gesture_disabled_indicator(painter, points, side)
                 # Keep the virtual skeleton visible when a hand is disabled, but remove
-                # its moving TLI/cursor until thumbs-up re-enables tracking.
+                # its moving TLI/cursor until a peace sign re-enables tracking.
                 if self.gesture_tracking_enabled.get(side, True):
                     cursor = self.side_cursor_positions.get(side)
                     if cursor is None:
@@ -14010,35 +13977,7 @@ try {
                     engaged = side in self.active_push_sides or (self.click_side == side and now < self.click_flash_until)
                     self._paint_tli(painter, cursor, side, engaged)
 
-            # Thumbs-up gesture-tracking toggle has a visible two-second confirmation ring.
-            for side in ("left", "right"):
-                thumbs_started = self.thumbs_up_hold_started.get(side)
-                if thumbs_started is None or self.thumbs_up_toggle_latched.get(side, False):
-                    continue
-                cursor = self.side_cursor_positions.get(side)
-                if cursor is None:
-                    # Tracking-off hands still need a visible re-enable countdown, but
-                    # this visual anchor is not fed back into cursor/gesture processing.
-                    points = self.hand_positions.get(side, [])
-                    if not points:
-                        continue
-                    cursor = self._scale_hand_tli_point(self.interactive_hand_anchor(points, side), points, side)
-                cursor = self._visual_tli_position(side, cursor)
-                elapsed = max(0.0, now-thumbs_started)
-                progress = min(1.0, elapsed/max(0.01, self.gesture_tracking_toggle_hold_seconds))
-                remaining = max(0.0, self.gesture_tracking_toggle_hold_seconds-elapsed)
-                ring = QRectF(cursor.x()-38, cursor.y()-38, 76, 76)
-                painter.setBrush(Qt.NoBrush)
-                painter.setPen(QPen(QColor(105, 240, 255, 95), 3))
-                painter.drawEllipse(ring)
-                painter.setPen(QPen(QColor(105, 240, 255, 245), 4))
-                painter.drawArc(ring, 90*16, -int(progress*360*16))
-                painter.setPen(QColor(220, 255, 255, 245))
-                painter.setFont(self._ui_font(8, QFont.DemiBold))
-                painter.drawText(QRectF(cursor.x()-24, cursor.y()+27, 48, 16), Qt.AlignCenter,
-                                 f"{remaining:.1f}s")
-
-            # Peace-sign tracking toggles use an immediate visual state notice; no toggle TTS.
+            # Peace-sign tracking toggle shows a hold ring until the combined switch fires.
             for side in ("left", "right"):
                 peace_started = self.peace_hold_started.get(side)
                 if peace_started is None or self.peace_toggle_latched.get(side, False):
