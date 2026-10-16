@@ -838,6 +838,103 @@ def is_thumb_middle_zoom_pinch(landmarks, edge_tolerant=False):
     )
 
 
+class _HandVisualMotionFilter:
+    """Suppress single-frame joint distortion without delaying whole-hand movement.
+
+    This filter operates ONLY on the painted hand. Raw MediaPipe landmarks are kept
+    for gesture recognition, hand contact/scale and the calibrated TLI. The previous
+    hand is first carried along with the present palm's translation, rotation and
+    scale, then each joint is eased toward its new measurement. A bad fingertip
+    therefore cannot drag the rest of the hand into a twisted pose.
+    """
+
+    _PALM = (0, 5, 9, 13, 17)
+    _CHAINS = ((1, 2, 3, 4), (5, 6, 7, 8), (9, 10, 11, 12),
+               (13, 14, 15, 16), (17, 18, 19, 20))
+    _Y_TO_X = 9.0 / 16.0
+
+    def __init__(self):
+        self._previous = {}
+
+    def update(self, side, landmarks, now):
+        """Return 21 stabilised (x, y, z) tuples, keeping the wrist live."""
+        if side not in ('left', 'right') or len(landmarks) < 21:
+            return list(landmarks)
+        try:
+            current = np.array([(float(p[0]), float(p[1])*self._Y_TO_X,
+                                 float(p[2]) if len(p) > 2 else 0.0)
+                                for p in landmarks[:21]], dtype=np.float64)
+        except (TypeError, ValueError, IndexError):
+            self._previous.pop(side, None)
+            return list(landmarks)
+        if not np.isfinite(current).all():
+            self._previous.pop(side, None)
+            return list(landmarks)
+
+        previous_entry = self._previous.get(side)
+        if previous_entry is None or not 0.0 < float(now)-previous_entry[1] < 0.30:
+            output = current
+        else:
+            previous, last_time = previous_entry
+            dt = min(0.10, max(0.001, float(now)-last_time))
+            # Carry the previous shape with the *current palm* so rapid sweeping,
+            # turning or moving toward the camera does not twist the fingers.
+            a = previous[list(self._PALM), :2]
+            b = current[list(self._PALM), :2]
+            ac = a.mean(axis=0)
+            bc = b.mean(axis=0)
+            aa = a-ac
+            bb = b-bc
+            spread = float(np.sum(aa*aa))
+            if spread <= 1e-9:
+                output = current
+            else:
+                u, singular, vt = np.linalg.svd(aa.T @ bb)
+                correction = np.eye(2)
+                if np.linalg.det(u @ vt) < 0:
+                    correction[1, 1] = -1.0
+                rotation = u @ correction @ vt
+                ratio = float(np.sum(singular * np.diag(correction)) / spread)
+                ratio = max(0.68, min(1.48, ratio))
+                predicted = previous.copy()
+                predicted[:, :2] = (previous[:, :2]-ac) @ rotation * ratio + bc
+                predicted[:, 2] = (previous[:, 2]-previous[0, 2])*ratio + current[0, 2]
+
+                palm_size = max(0.009, float(np.linalg.norm(current[9, :2]-current[0, :2])),
+                                float(np.linalg.norm(current[5, :2]-current[17, :2]))*0.82)
+                # Follow genuine articulation quickly but limit one-frame spikes.
+                response = 1.0-math.exp(-25.0*dt)
+                difference = current-predicted
+                # Palm joints should remain mutually coherent; distal joints can
+                # change farther in a frame when the person opens/closes a hand.
+                for index in range(21):
+                    reach = palm_size * (0.27 if index in self._PALM else 0.57)
+                    xy_len = float(np.linalg.norm(difference[index, :2]))
+                    if xy_len > reach:
+                        difference[index, :2] *= reach/xy_len
+                    z_limit = palm_size * (0.32 if index in self._PALM else 0.68)
+                    difference[index, 2] = max(-z_limit, min(z_limit, difference[index, 2]))
+                output = predicted + response*difference
+
+                # Guard impossible one-frame bone stretching. This is generous
+                # enough for foreshortening and naturally opening the fingers.
+                for chain in self._CHAINS:
+                    for parent, child in zip(chain, chain[1:]):
+                        old_length = float(np.linalg.norm(previous[child]-previous[parent]))
+                        new_bone = output[child]-output[parent]
+                        new_length = float(np.linalg.norm(new_bone))
+                        limit = max(0.27*palm_size, old_length*ratio*1.75)
+                        if new_length > limit and new_length > 1e-9:
+                            output[child] = output[parent] + new_bone*(limit/new_length)
+
+                # No hand-position lag: anchor the *whole visual shape* to the
+                # current wrist, matching the cursor's existing draw offset.
+                output += current[0]-output[0]
+
+        self._previous[side] = (output.copy(), float(now))
+        return [(float(p[0]), float(p[1])/self._Y_TO_X, float(p[2])) for p in output]
+
+
 class Tracker:
     """Low-latency, hand-only MediaPipe tracker. No body-pose model is loaded."""
     def __init__(self):
@@ -2016,8 +2113,13 @@ class SpatialDesktop(QWidget):
         # Lightweight interactive Garden props; coordinates are normalised to the scene.
         self._garden_props = {
             "ball": {"x": 0.70, "y": 0.82, "vx": 0.0, "vy": 0.0, "r": 0.027, "held": None},
-            "sundial": {"x": 0.30, "y": 0.82, "held": None},
+            "sundial": {"x": 0.30, "y": 0.77, "held": None},
         }
+        # Garden interactions are local to the scene, never native OS mouse drags.
+        # The projection is a click-to-toggle, not an expiring animation.
+        self._garden_sundial_projection_active = False
+        self._garden_sundial_hand_pinch = {"left": False, "right": False}
+        self._garden_sundial_hand_owned = {"left": False, "right": False}
         self._garden_bird_seed = 19.0
         self._garden_bird_last_spawn = 0.0
         self._garden_birds = []
@@ -2216,6 +2318,9 @@ class SpatialDesktop(QWidget):
         # hand_occlusion). Gestures and the TLI keep using hand_positions.
         self.hand_display_positions = {"left": None, "right": None}
         self._hand_tucker = TuckSmoother()
+        # Display-only: raw landmark geometry still drives all interaction logic.
+        self._hand_visual_motion_filter = _HandVisualMotionFilter()
+        self.hand_stable_positions = {"left": None, "right": None}
         # Keep raw, smoothed camera-mapped anchors separate from scaled interaction points.
         # This avoids feeding transformed coordinates back into the smoothing filter.
         self.smoothed_side_cursor_positions = {"left": None, "right": None}
@@ -2964,38 +3069,263 @@ class SpatialDesktop(QWidget):
         painter.drawText(rect.adjusted(9.0, 0.0, -6.0, 0.0), Qt.AlignVCenter | Qt.AlignLeft, text)
         painter.restore()
 
+    def mousePressEvent(self, event):
+        if (event.button() == Qt.LeftButton and self.virtual_garden_mode and
+                self.desktop_mode == "virtual" and not self._gesture_ui_modal_open()):
+            point = event.position()
+            if self._garden_sundial_hit(point):
+                self._garden_toggle_sundial(time.monotonic())
+                event.accept()
+                return
+            if self._garden_ball_hit(point) and self._garden_props["ball"].get("held") is None:
+                ball = self._garden_props["ball"]
+                ball["held"] = "mouse"
+                ball["release_since"] = None
+                ball["offset_x"] = ball["x"] - point.x()/max(1., float(self.width()))
+                ball["offset_y"] = ball["y"] - point.y()/max(1., float(self.height()))
+                ball["last_drag_at"] = time.monotonic()
+                ball["vx"] = ball["vy"] = 0.0
+                self.status = "Garden ball picked up"
+                self.update()
+                event.accept()
+                return
+        super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event):
+        if self._garden_props["ball"].get("held") == "mouse":
+            ball = self._garden_props["ball"]
+            point = event.position()
+            width, height = max(1., float(self.width())), max(1., float(self.height()))
+            x = min(1.0-ball["r"], max(ball["r"], point.x()/width+ball.get("offset_x", 0.0)))
+            y = min(1.0-ball["r"], max(ball["r"], point.y()/height+ball.get("offset_y", 0.0)))
+            now = time.monotonic()
+            dt = max(.008, now-float(ball.get("last_drag_at", now)))
+            ball["vx"] = max(-1.8, min(1.8, (x-ball["x"])/dt))
+            ball["vy"] = max(-1.8, min(1.8, (y-ball["y"])/dt))
+            ball["x"], ball["y"] = x, y
+            ball["last_drag_at"] = now
+            self.update()
+            event.accept()
+            return
+        super().mouseMoveEvent(event)
+
+    def mouseReleaseEvent(self, event):
+        if event.button() == Qt.LeftButton and self._garden_props["ball"].get("held") == "mouse":
+            self._garden_drop_ball("mouse")
+            self.update()
+            event.accept()
+            return
+        super().mouseReleaseEvent(event)
+
+    def _garden_ball_hit(self, point):
+        """Hit-test the painted ball in pixels (not mixed normalised x/y distances)."""
+        if point is None or self.desktop_mode != "virtual" or not self.virtual_garden_mode:
+            return False
+        if self._gesture_ui_modal_open() or self.floating_clipboard_visible:
+            return False
+        ball = self._garden_props["ball"]
+        width, height = max(1.0, float(self.width())), max(1.0, float(self.height()))
+        radius = max(15.0, height*float(ball["r"]) + 11.0)
+        return math.hypot(float(point.x()) - ball["x"]*width,
+                          float(point.y()) - ball["y"]*height) <= radius
+
+    def _garden_sundial_hit(self, point):
+        if point is None or self.desktop_mode != "virtual" or not self.virtual_garden_mode:
+            return False
+        if self._gesture_ui_modal_open():
+            return False
+        sundial = self._garden_props["sundial"]
+        width, height = max(1.0, float(self.width())), max(1.0, float(self.height()))
+        x, y = float(point.x()), float(point.y())
+        dx, dy = sundial["x"]*width, sundial["y"]*height
+        radius = min(width, height)*0.043
+        # Clicking the dial plate or its short pedestal activates the clock.
+        on_plate = (abs(x-dx) <= radius*1.12 and abs(y-dy) <= radius*0.55+9.0)
+        on_column = (abs(x-dx) <= radius*0.70 and dy <= y <= height*0.862)
+        return bool(on_plate or on_column)
+
+    @staticmethod
+    def _garden_object_pinch(landmarks, held=False):
+        """Local pinch recognition for scene props; do not change OS/Menu poses.
+
+        Garden pickup should not require two *other* fingers to be extended, as
+        the main Pinch Menu classifier does. It is deliberately only queried
+        while handling a garden prop.
+        """
+        if landmarks is None or len(landmarks) < 21:
+            return False
+        palm = max(1e-5, distance3d(landmarks, 0, 9))
+        index_gap = distance3d(landmarks, 4, 8)/palm
+        if index_gap > (0.60 if held else 0.42):
+            return False
+        # Reject a thumb-to-middle-finger pinch, but tolerate a naturally
+        # folded middle finger when index and thumb are very close together.
+        middle_gap = distance3d(landmarks, 4, 12)/palm
+        return bool(index_gap < 0.23 or index_gap + 0.065 < middle_gap)
+
+    def _garden_toggle_sundial(self, now):
+        self._garden_sundial_projection_active = not self._garden_sundial_projection_active
+        self.status = ("Sundial sky clock enabled" if self._garden_sundial_projection_active
+                       else "Sundial sky clock disabled")
+        self.update()
+
+    def _garden_handle_sundial_frame(self, side, cursor, is_pinch, now):
+        """Toggle on a fresh pinch over the dial; consume until it is released.
+
+        This bypasses the ordinary Pinch Menu and native click dispatcher, so
+        the dial can be toggled even if a fist or menu latch was left armed.
+        """
+        was_pinched = self._garden_sundial_hand_pinch[side]
+        self._garden_sundial_hand_pinch[side] = bool(is_pinch)
+        owned = self._garden_sundial_hand_owned[side]
+        over = self._garden_sundial_hit(cursor)
+        if owned:
+            self._clear_menu_pinch_sequence(side)
+            if not is_pinch:
+                self._garden_sundial_hand_owned[side] = False
+            return True
+        if not over:
+            return False
+        self._clear_menu_pinch_sequence(side)
+        self._reset_fist_gesture(side)
+        if is_pinch and not was_pinched:
+            self._garden_sundial_hand_owned[side] = True
+            self._garden_toggle_sundial(now)
+        return True
+
+    def _garden_handle_ball_frame(self, side, cursor, is_pinch, now):
+        """Capture ball pinch immediately: no menu countdown and no OS mouseDown."""
+        if self.desktop_mode != "virtual" or not self.virtual_garden_mode:
+            return False
+        ball = self._garden_props["ball"]
+        held = ball.get("held")
+        if held is not None and held != side:
+            # Still suppress Pinch Menu while hovering over an already-held ball.
+            if self._garden_ball_hit(cursor):
+                self._clear_menu_pinch_sequence(side)
+                return True
+            return False
+        over_ball = self._garden_ball_hit(cursor)
+        if held != side and not over_ball:
+            return False
+
+        # An interaction that begins over the ball must not arm the Pinch Menu,
+        # even while just hovering or while its pinch is being released.
+        self._clear_menu_pinch_sequence(side)
+        self._reset_fist_gesture(side)
+        if held != side:
+            if not is_pinch:
+                return True
+            ball["held"] = side
+            ball["release_since"] = None
+            ball["offset_x"] = ball["x"] - float(cursor.x())/max(1.0, float(self.width()))
+            ball["offset_y"] = ball["y"] - float(cursor.y())/max(1.0, float(self.height()))
+            ball["last_drag_at"] = now
+            ball["vx"] = ball["vy"] = 0.0
+            self.gesture_owner = side
+            self.status = "Garden ball picked up — move while pinching, release to drop"
+        if is_pinch:
+            ball["release_since"] = None
+            width, height = max(1.0, float(self.width())), max(1.0, float(self.height()))
+            x = min(1.0-ball["r"], max(ball["r"],
+                    float(cursor.x())/width + ball.get("offset_x", 0.0)))
+            y = min(1.0-ball["r"], max(ball["r"],
+                    float(cursor.y())/height + ball.get("offset_y", 0.0)))
+            dt = max(0.001, now-float(ball.get("last_drag_at", now)))
+            if dt >= 0.008:
+                target_vx = max(-1.8, min(1.8, (x-ball["x"])/dt))
+                target_vy = max(-1.8, min(1.8, (y-ball["y"])/dt))
+                ball["vx"] = 0.6*ball["vx"] + 0.4*target_vx
+                ball["vy"] = 0.6*ball["vy"] + 0.4*target_vy
+                ball["last_drag_at"] = now
+            ball["x"], ball["y"] = x, y
+        else:
+            # Allow a tiny dropout, but release normally when the pinch opens.
+            if ball.get("release_since") is None:
+                ball["release_since"] = now
+            if now-ball["release_since"] >= 0.08:
+                self._garden_drop_ball(side)
+        return True
+
+    def _garden_drop_ball(self, side):
+        ball = self._garden_props["ball"]
+        if ball.get("held") != side:
+            return
+        ball["held"] = None
+        ball["release_since"] = None
+        ball.pop("offset_x", None)
+        ball.pop("offset_y", None)
+        ball.pop("last_drag_at", None)
+        if self.gesture_owner == side:
+            self.gesture_owner = None
+        self.status = "Garden ball dropped"
+
+    def _paint_garden_sky_clock(self, painter, width, height, scene):
+        """Bat-signal-style illuminated digital clock projected from the sundial."""
+        if not self._garden_sundial_projection_active:
+            return
+        dial = self._garden_props["sundial"]
+        dx, dy = dial["x"]*width, dial["y"]*height
+        sky_x, sky_y = max(width*0.15, min(width*0.84, dx+width*0.045)), height*0.265
+        radius = min(height*0.100, width*0.115)
+        now = datetime.now()
+        tz_name = str(scene.get("timezone") or "")
+        if tz_name:
+            try:
+                from zoneinfo import ZoneInfo
+                now = datetime.now(ZoneInfo(tz_name))
+            except Exception:
+                pass
+        painter.save()
+        painter.setRenderHint(QPainter.Antialiasing, True)
+        # Wide transparent cone radiates from the gnomon to the sky projection.
+        beam = QPainterPath()
+        beam.moveTo(dx, dy-height*0.040)
+        beam.lineTo(sky_x-radius*0.80, sky_y)
+        beam.lineTo(sky_x+radius*0.80, sky_y)
+        beam.closeSubpath()
+        gradient = QLinearGradient(dx, dy, sky_x, sky_y)
+        gradient.setColorAt(0, QColor(255, 239, 156, 8))
+        gradient.setColorAt(0.55, QColor(195, 236, 255, 34))
+        gradient.setColorAt(1, QColor(185, 228, 255, 47))
+        painter.setPen(Qt.NoPen)
+        painter.setBrush(QBrush(gradient))
+        painter.drawPath(beam)
+        halo = QRadialGradient(QPointF(sky_x, sky_y), radius*1.35)
+        halo.setColorAt(0.0, QColor(227, 246, 255, 118))
+        halo.setColorAt(0.55, QColor(158, 215, 254, 93))
+        halo.setColorAt(0.79, QColor(149, 201, 246, 32))
+        halo.setColorAt(1.0, QColor(149, 201, 246, 0))
+        painter.setBrush(QBrush(halo))
+        painter.drawEllipse(QPointF(sky_x, sky_y), radius*1.35, radius*1.35)
+        painter.setBrush(QColor(12, 41, 68, 160))
+        painter.setPen(QPen(QColor(216, 245, 255, 205), max(1.5, radius*0.035)))
+        painter.drawEllipse(QPointF(sky_x, sky_y), radius, radius*0.76)
+        clock_font = QFont("Consolas")
+        clock_font.setWeight(QFont.Bold)
+        clock_font.setPixelSize(max(13, int(radius*0.39)))
+        painter.setFont(clock_font)
+        painter.setPen(QColor(229, 250, 255, 250))
+        painter.drawText(QRectF(sky_x-radius, sky_y-radius*0.43,
+                                radius*2.0, radius*0.80), Qt.AlignCenter,
+                         now.strftime("%H:%M:%S"))
+        painter.restore()
+
     def _paint_garden_props(self, painter, width, height, scene):
         """Animate small birds and hand-pickable garden props with inexpensive 2D physics."""
         now = time.monotonic()
         dt = min(0.045, max(0.0, now - getattr(self, "_garden_prop_last_tick", now)))
         self._garden_prop_last_tick = now
         props = self._garden_props
-        # A pinch drag picks up the ball or sundial when the cursor is over it.
-        cursors = getattr(self, "side_cursor_positions", {})
-        pinching = getattr(self, "pinch_drag_active", {})
-        for side in ("left", "right"):
-            cursor = cursors.get(side)
-            active = bool(pinching.get(side, False)) if isinstance(pinching, dict) else False
-            if cursor is None:
-                active = False
-            if active and cursor is not None:
-                cx, cy = float(cursor.x()) / max(1.0, width), float(cursor.y()) / max(1.0, height)
-                for name, prop in props.items():
-                    if prop["held"] == side:
-                        prop["x"], prop["y"] = cx, cy
-                        break
-                    if prop["held"] is None:
-                        radius = prop.get("r", 0.045) + (0.025 if name == "ball" else 0.035)
-                        if (cx-prop["x"])**2 + (cy-prop["y"])**2 < radius**2:
-                            prop["held"] = side
-                            prop["x"], prop["y"] = cx, cy
-                            if name == "ball":
-                                prop["vx"] = prop["vy"] = 0.0
-                            break
-            for prop in props.values():
-                if prop["held"] == side and not active:
-                    prop["held"] = None
+        # Object grabbing is handled in the gesture loop, not in paint. Otherwise
+        # a native Windows drag can mistakenly move the ball and arm Pinch Menu.
         ball = props["ball"]
+        if ball.get("held") in ("left", "right"):
+            owner = ball["held"]
+            last_seen = getattr(self, "hand_last_seen", {}).get(owner, 0.0) or 0.0
+            if (not self.gesture_tracking_enabled.get(owner, True) or
+                    now-float(last_seen) > 0.40):
+                self._garden_drop_ball(owner)
         if ball["held"] is None:
             ball["vy"] += 0.78 * dt
             ball["x"] += ball["vx"] * dt
@@ -3046,10 +3376,34 @@ class SpatialDesktop(QWidget):
         painter.setBrush(QBrush(ball_grad))
         painter.setPen(QPen(QColor(255, 245, 201, 210), max(1.0, br*0.07)))
         painter.drawEllipse(QPointF(bx, by), br, br)
-        # Sundial: stone plinth, brass rim, and a gnomon whose shadow follows solar time.
+        # Sundial on its short, shaped stone pedestal (visible below the dial plate).
         dial = props["sundial"]
         dx, dy = dial["x"]*width, dial["y"]*height
         radius = min(width, height)*0.043
+        ground_y = height*0.864
+        column_top = dy + radius*0.06
+        painter.setPen(Qt.NoPen)
+        painter.setBrush(QColor(7, 28, 19, 70))
+        painter.drawEllipse(QRectF(dx-radius*1.12, ground_y-radius*0.16,
+                                   radius*2.24, radius*0.40))
+        column_gradient = QLinearGradient(dx-radius*0.71, 0, dx+radius*0.71, 0)
+        column_gradient.setColorAt(0.0, QColor(85, 87, 84))
+        column_gradient.setColorAt(0.32, QColor(198, 199, 188))
+        column_gradient.setColorAt(0.75, QColor(153, 160, 152))
+        column_gradient.setColorAt(1.0, QColor(87, 94, 91))
+        painter.setBrush(QBrush(column_gradient))
+        painter.setPen(QPen(QColor(79, 88, 82, 225), max(1.0, radius*0.048)))
+        painter.drawRoundedRect(QRectF(dx-radius*0.67, column_top,
+                                       radius*1.34, max(3.0, ground_y-column_top)),
+                                radius*0.11, radius*0.11)
+        painter.setBrush(QColor(174, 178, 167))
+        painter.drawRoundedRect(QRectF(dx-radius*0.85, ground_y-radius*0.22,
+                                       radius*1.70, radius*0.33),
+                                radius*0.055, radius*0.055)
+        painter.setBrush(QColor(196, 199, 190))
+        painter.drawRoundedRect(QRectF(dx-radius*0.84, column_top-radius*0.20,
+                                       radius*1.68, radius*0.39),
+                                radius*0.07, radius*0.07)
         painter.setPen(QPen(QColor(86, 87, 61, 220), max(1.0, radius*0.08)))
         painter.setBrush(QColor(198, 183, 126))
         painter.drawEllipse(QPointF(dx, dy), radius, radius*0.34)
@@ -3099,6 +3453,7 @@ class SpatialDesktop(QWidget):
         painter.setRenderHint(QPainter.Antialiasing, False)
         painter.drawImage(QPointF(0, 0), background)
         self._paint_garden_weather_effects(painter, width, height, scene)
+        self._paint_garden_sky_clock(painter, width, height, scene)
         self._paint_garden_props(painter, width, height, scene)
         self._paint_garden_grass(painter, width, height, scene)
         self._paint_garden_weather_label(painter, width, height, scene)
@@ -5702,6 +6057,9 @@ class SpatialDesktop(QWidget):
         # must not click an underlying application or the desktop.
         if self.menu_open and self.hub_visible and not self._canvas_menu_panel_contains(point):
             return
+        if self._garden_sundial_hit(point):
+            self._garden_toggle_sundial(now)
+            return
         self.click_side = side
         play_ui_sound(self.ui_preferences.get("sound_pinch", "None"))
         if self._canvas_menu_panel_contains(point):
@@ -5856,6 +6214,9 @@ class SpatialDesktop(QWidget):
             if self.settings_page == "virtual":
                 if pressed("virtual_garden_toggle"):
                     self.virtual_garden_mode = not self.virtual_garden_mode
+                    if not self.virtual_garden_mode:
+                        for holding_side in ("left", "right"):
+                            self._garden_drop_ball(holding_side)
                     if self.virtual_garden_mode:
                         self._finish_virtual_pen_stroke()
                         self.virtual_pen_active = False
@@ -9686,8 +10047,11 @@ try {
         # of MediaPipe's guess; the skeleton style keeps showing the raw tracking.
         style = getattr(self, "hand_render_style", "flat")
         display = getattr(self, "hand_display_positions", {}).get(side) if side in ("left", "right") else None
-        if style != "skeleton" and display is not None and display[0] is points:
-            points = display[1]
+        if display is not None and display[0] is points:
+            if style == "skeleton":
+                points = self.hand_stable_positions.get(side) or points
+            else:
+                points = display[1]
 
         joints = {i: sp(i) for i in range(21)}
         painter.save()
@@ -11447,6 +11811,7 @@ try {
             self.apply_desktop_mode()
 
         self.hand_positions = {"left": [], "right": []}
+        self.hand_stable_positions = {"left": None, "right": None}
         self.tli_overrides = {}
         self.active_push_sides = set()
         self._update_hand_scale_origins(hands_by_side)
@@ -11479,8 +11844,12 @@ try {
             if lag > 90.0:  # a jump (re-acquired hand): don't drag the hand far behind
                 dx, dy = dx*90.0/lag, dy*90.0/lag
             self.hand_draw_offset[side] = (dx, dy)
-            self.hand_display_positions[side] = (self.hand_positions[side],
-                                                 self._hand_tucker.update(side, self.hand_positions[side], now))
+            # Stabilise the drawn shape, not the camera data used for gestures,
+            # cursor tracking or the existing two-hand contact calibration.
+            stable_visual = self._hand_visual_motion_filter.update(side, self.hand_positions[side], now)
+            self.hand_stable_positions[side] = stable_visual
+            self.hand_display_positions[side] = (
+                self.hand_positions[side], self._hand_tucker.update(side, stable_visual, now))
             cursor_points[side] = QPointF(cursor)
             # All interaction code and rendering now consume the same scaled TLI.
             self.side_cursor_positions[side] = QPointF(cursor)
@@ -11574,6 +11943,20 @@ try {
                     self._end_pinch_drag(side, status=False)
                 continue
 
+            # Interact with Garden props BEFORE fist/Pinch Menu classification,
+            # gesture-owner arbitration and OS mouse dragging. The interaction
+            # retains its own pinch state and cannot arm the Pinch Menu timer.
+            if self.virtual_garden_mode and self.desktop_mode == "virtual" and not calibration_modal_frame:
+                active_ball = self._garden_props["ball"].get("held") == side
+                active_dial = self._garden_sundial_hand_owned[side]
+                object_pinch = self._garden_object_pinch(
+                    landmarks, held=bool(active_ball or active_dial))
+                if self._garden_handle_ball_frame(side, cursor, object_pinch, now):
+                    if active_ball or self._garden_props["ball"].get("held") == side:
+                        self.active_push_sides.add(side)
+                    continue
+                if self._garden_handle_sundial_frame(side, cursor, object_pinch, now):
+                    continue
             raw_fist = is_fist_or_grip_pose(landmarks, edge_tolerant=edge_tolerant)
             raw_pinch = is_thumb_index_menu_pinch(landmarks, edge_tolerant=edge_tolerant)
             raw_middle_pinch = is_thumb_middle_zoom_pinch(landmarks, edge_tolerant=edge_tolerant)
