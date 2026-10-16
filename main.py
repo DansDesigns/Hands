@@ -2284,6 +2284,11 @@ class SpatialDesktop(QWidget):
         self.hub_visible = True
         self.settings_open = False
         self.settings_page = "interaction"
+        # Gesture Map floats above the normal Glass Menu rather than replacing it
+        # with a settings page. The previous position is restored on dismissal.
+        self.gesture_map_overlay_visible = False
+        self._gesture_map_previous_hub_pos = None
+        self._gesture_map_pixmaps = None  # Loaded only when requested, not every frame.
         self.update_status = f"Installed version: {read_version(VERSION_FILE)}\nSelect UPDATE to check GitHub and download a newer release."
         self.update_check_running = False
         self.update_progress_current = 0
@@ -4891,6 +4896,7 @@ class SpatialDesktop(QWidget):
         self.menu_open = visible
         self.hub_visible = visible
         if not visible:
+            self._hide_gesture_map_overlay()
             self.custom_gesture_dropdown = None
             self.sound_dropdown_key = None
             if self.custom_gesture_key_capture is not None:
@@ -5082,9 +5088,109 @@ class SpatialDesktop(QWidget):
             return min(base, fit_h, fit_w)
         return base
 
+    def _gesture_map_overlay_layout(self):
+        """Image rects above the Glass Menu, keeping room for it on small displays.
+
+        The PNGs are 16:9. Scale both together, fit the viewport and avoid
+        recomputing scaled pixmaps every frame (QPainter does the scaling).
+        """
+        screen_w, screen_h = max(1.0, float(self.width())), max(1.0, float(self.height()))
+        margin, gap, pad, header = 12.0, 12.0, 12.0, 31.0
+        menu_h = 430.0 * self.menu_ui_scale()  # main menu, never the settings panel
+        width_limit = min(1080.0, screen_w - 2.0 * margin)
+        available_h = max(64.0, screen_h - menu_h - 80.0 - header - 2.0 * pad)
+        image_w = max(20.0, min((width_limit - 2.0 * pad - gap) * 0.5,
+                                available_h * 16.0 / 9.0))
+        image_h = image_w * 9.0 / 16.0
+        frame_w = 2.0 * image_w + gap + 2.0 * pad
+        frame_h = image_h + header + 2.0 * pad
+        cx = self.hub_pos.x() * screen_w
+        x = max(margin, min(cx - frame_w * 0.5, screen_w - frame_w - margin))
+        frame = QRectF(x, margin, frame_w, frame_h)
+        close_rect = QRectF(frame.right() - pad - 25.0, frame.top() + 6.0, 25.0, 23.0)
+        image_y = frame.top() + pad + header
+        first = QRectF(frame.left() + pad, image_y, image_w, image_h)
+        second = QRectF(first.right() + gap, image_y, image_w, image_h)
+        return frame, close_rect, (first, second)
+
+    def _show_gesture_map_overlay(self):
+        if self.gesture_map_overlay_visible:
+            return
+        if self._gesture_map_pixmaps is None:
+            image_dir = ROOT / "images" / "gestures"
+            self._gesture_map_pixmaps = tuple(
+                QPixmap(str(image_dir / name))
+                for name in ("gestures1.PNG", "gestures2.PNG")
+            )
+        self._gesture_map_previous_hub_pos = QPointF(self.hub_pos)
+        self.gesture_map_overlay_visible = True
+        # Place the Glass Menu under the two pictures, without letting the menu
+        # disappear below the bottom edge. Restore its prior position on close.
+        frame, _, _ = self._gesture_map_overlay_layout()
+        height = max(1.0, float(self.height()))
+        menu_half_h = 215.0 * self.menu_ui_scale()
+        minimum_y = frame.bottom() + 14.0 + menu_half_h
+        maximum_y = height - 12.0 - menu_half_h
+        target_y = min(max(self.hub_pos.y() * height, minimum_y), max(minimum_y, maximum_y))
+        self.hub_pos = QPointF(self.hub_pos.x(), target_y / height)
+        self.update()
+
+    def _hide_gesture_map_overlay(self):
+        if not self.gesture_map_overlay_visible:
+            return
+        self.gesture_map_overlay_visible = False
+        if self._gesture_map_previous_hub_pos is not None:
+            self.hub_pos = self._gesture_map_previous_hub_pos
+            self._gesture_map_previous_hub_pos = None
+        self.update()
+
+    def _paint_gesture_map_overlay(self, painter):
+        if not self.gesture_map_overlay_visible or not (self.menu_open and self.hub_visible):
+            return
+        frame, close_rect, image_rects = self._gesture_map_overlay_layout()
+        painter.save()
+        try:
+            painter.setRenderHint(QPainter.SmoothPixmapTransform, True)
+            painter.setPen(QPen(QColor(130, 235, 245, 220), 1.5))
+            painter.setBrush(QBrush(QColor(7, 20, 34, 242)))
+            painter.drawRoundedRect(frame, 14.0, 14.0)
+            painter.setPen(QColor(222, 249, 255))
+            painter.setFont(self._ui_font(11, QFont.DemiBold))
+            painter.drawText(QRectF(frame.left() + 12, frame.top() + 5,
+                                    frame.width() - 58, 25),
+                             Qt.AlignVCenter | Qt.AlignLeft, "GESTURE MAP")
+            painter.setPen(QPen(QColor(125, 205, 223, 220), 1.0))
+            painter.setBrush(QBrush(QColor(35, 75, 90, 235)))
+            painter.drawRoundedRect(close_rect, 6.0, 6.0)
+            painter.setPen(QPen(QColor(240, 255, 255), 2.0,
+                                Qt.SolidLine, Qt.RoundCap))
+            center = close_rect.center()
+            painter.drawLine(QPointF(center.x()-5, center.y()-5),
+                             QPointF(center.x()+5, center.y()+5))
+            painter.drawLine(QPointF(center.x()+5, center.y()-5),
+                             QPointF(center.x()-5, center.y()+5))
+            for index, image_rect in enumerate(image_rects):
+                pixmap = self._gesture_map_pixmaps[index] if self._gesture_map_pixmaps else QPixmap()
+                painter.setPen(QPen(QColor(90, 165, 185, 200), 1.0))
+                painter.setBrush(QBrush(QColor(0, 0, 0, 255)))
+                painter.drawRoundedRect(image_rect.adjusted(-1, -1, 1, 1), 4.0, 4.0)
+                if not pixmap.isNull():
+                    painter.drawPixmap(image_rect, pixmap,
+                                       QRectF(0, 0, pixmap.width(), pixmap.height()))
+                else:
+                    painter.setPen(QColor(235, 210, 180))
+                    painter.setFont(self._ui_font(9, QFont.Normal))
+                    painter.drawText(image_rect.adjusted(8, 6, -8, -6),
+                                     Qt.AlignCenter | Qt.TextWordWrap,
+                                     f"Missing: images/gestures/gestures{index+1}.PNG")
+        finally:
+            painter.restore()
+
     def _canvas_menu_panel_contains(self, point):
         if point is None or not (self.menu_open and self.hub_visible):
             return False
+        if self.gesture_map_overlay_visible and self._gesture_map_overlay_layout()[0].contains(point):
+            return True
         cx, cy = self.hub_pos.x()*self.width(), self.hub_pos.y()*self.height()
         scale = self.menu_ui_scale()
         panel_width, panel_height = self._menu_panel_dimensions()
@@ -6706,6 +6812,14 @@ class SpatialDesktop(QWidget):
         # must not click an underlying application or the desktop.
         if self.menu_open and self.hub_visible and not self._canvas_menu_panel_contains(point):
             return
+        # The reference images are modal to the OS, but the Glass Menu remains
+        # available below them. A press on an image must never click the desktop.
+        if self.gesture_map_overlay_visible:
+            image_panel, image_close, _ = self._gesture_map_overlay_layout()
+            if image_panel.contains(point):
+                if image_close.contains(point):
+                    self._hide_gesture_map_overlay()
+                return
         if self._garden_sundial_hit(point):
             self._garden_toggle_sundial(now)
             return
@@ -6742,6 +6856,8 @@ class SpatialDesktop(QWidget):
                     (QRectF(cx+66*scale, cy+35*scale, 100*scale, 88*scale), "search"),
                 ]
                 action = next((name for rect, name in tiles if rect.contains(point)), None)
+                if action is not None and action != "gesture_map":
+                    self._hide_gesture_map_overlay()
                 if action == "desktop":
                     self.desktop_mode = "os" if self.desktop_mode == "virtual" else "virtual"
                     self.apply_desktop_mode()
@@ -6765,9 +6881,10 @@ class SpatialDesktop(QWidget):
                 elif action == "search":
                     self.open_search_bar(from_voice=False)
                 elif action == "gesture_map":
-                    self.settings_open = True
-                    self.settings_page = "gesture_map"
-                    self._begin_menu_transition(now)
+                    if self.gesture_map_overlay_visible:
+                        self._hide_gesture_map_overlay()
+                    else:
+                        self._show_gesture_map_overlay()
                 elif action == "speech_commands":
                     self.settings_open = True
                     self.settings_page = "speech_commands"
@@ -14976,6 +15093,9 @@ try {
                     if self.settings_page == "sounds":
                         self._paint_sound_dropdown(painter, cx, cy, scale)
             painter.restore()
+            # Keep the two gesture reference images over the menu background,
+            # but under the hand cursor/TLI overlay which is painted afterward.
+            self._paint_gesture_map_overlay(painter)
 
         # When move mode is engaged, animate waves and sparkles from the TLI/hand anchor.
         # This is the only window-drag feedback: the old outline around the grabbed
