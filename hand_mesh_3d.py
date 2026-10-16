@@ -523,18 +523,42 @@ in vec3 v_normal;
 in float v_fade;
 out vec4 f_colour;
 void main() {
-    vec3 n = normalize(v_normal);
-    vec3 view = vec3(0.0, 0.0, -1.0);           // toward the viewer
-    if (dot(n, view) < 0.0) n = -n;             // double-sided
-    vec3 key = normalize(vec3(-0.45, -0.70, -0.55));   // upper left, in front
-    vec3 fill = normalize(vec3(0.6, 0.35, -0.7));
-    float diffuse = max(0.0, (dot(n, key) + 0.25) / 1.25);
-    float fill_light = max(0.0, dot(n, fill)) * 0.22;
-    float rim = pow(1.0 - max(dot(n, view), 0.0), 2.4) * 0.28;
-    float spec = pow(max(dot(n, normalize(key + view)), 0.0), 28.0) * 0.16;
-    vec3 colour = base_colour * (0.36 + 0.72 * diffuse + fill_light) + vec3(rim * 0.55 + spec);
     if (v_fade <= 0.01) discard;
-    // Premultiplied alpha: the overlay composites this image directly.
+
+    // A soft studio key, broad fill and very faint reflected light keep fingers
+    // readable against both bright and dark desktop backgrounds.  This is one
+    // shading pass: no extra mesh draw, shadow buffer or per-frame CPU work.
+    vec3 n = normalize(v_normal);
+    vec3 view = vec3(0.0, 0.0, -1.0);
+    if (dot(n, view) < 0.0) n = -n; // back of an open hand is also visible
+    vec3 key = normalize(vec3(-0.43, -0.63, -0.74));
+    vec3 fill = normalize(vec3(0.77, 0.12, -0.62));
+    vec3 bounce = normalize(vec3(-0.15, 0.84, -0.52));
+
+    float ndv = clamp(dot(n, view), 0.0, 1.0);
+    // Wrapped diffuse avoids harsh stripes at round knuckles and fingertips.
+    float key_light = clamp((dot(n, key) + 0.35) / 1.35, 0.0, 1.0);
+    float fill_light = max(dot(n, fill), 0.0);
+    float bounce_light = max(dot(n, bounce), 0.0);
+    float level = 0.44 + 0.57 * key_light + 0.16 * fill_light
+                + 0.055 * bounce_light;
+
+    // Skin is warmer in shadow; highlights are broad and satiny rather than
+    // sharp and plastic.  Preserve the original user-selected skin colour.
+    vec3 shadow_tint = mix(vec3(0.96, 0.89, 0.86), vec3(1.0), key_light);
+    vec3 colour = base_colour * shadow_tint * level;
+    vec3 half_key = normalize(key + view);
+    float satin = pow(max(dot(n, half_key), 0.0), 17.0) * 0.095;
+    float sheen = pow(max(dot(n, half_key), 0.0), 52.0) * 0.035;
+    colour += vec3(1.0, 0.94, 0.89) * (satin + sheen);
+
+    // A narrow, slightly shaded rim distinguishes overlapping finger edges,
+    // without thick black outlines or a second geometry/rendering pass.
+    float edge = pow(1.0 - ndv, 2.4);
+    colour *= 1.0 - 0.105 * edge;
+    colour += vec3(0.035, 0.033, 0.031) * pow(edge, 3.0);
+
+    // The existing wrist fade and premultiplied-alpha overlay remain intact.
     f_colour = vec4(clamp(colour, 0.0, 1.0) * v_fade, v_fade);
 }
 """

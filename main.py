@@ -13,6 +13,7 @@ import json
 import base64
 import time
 import math
+import random
 import threading
 import queue
 import urllib.request
@@ -161,9 +162,11 @@ VIRTUAL_PEN_PALETTE = (
     ("ORANGE", "#ffad45"), ("GREEN", "#65e58d"), ("PURPLE", "#c58bff"),
     ("YELLOW", "#ffe66b"),
 )
+VIRTUAL_SCENES = ("grid", "garden", "space")
+VIRTUAL_SCENE_LABELS = {"grid": "GRID", "garden": "GARDEN", "space": "SPACE"}
 VIRTUAL_DESKTOP_DEFAULTS = {
     "background": {
-        "grid_enabled": True, "garden_mode": False, "style": 0, "brightness": 78.0,
+        "grid_enabled": True, "garden_mode": False, "scene": "grid", "style": 0, "brightness": 78.0,
         "glow": 55.0, "spacing": 64.0, "thickness": 1.25,
     },
     "strokes": [],
@@ -191,7 +194,12 @@ def normalise_virtual_desktop_data(value):
         style = int(background_source.get("style", defaults["style"]))
     except (TypeError, ValueError):
         style = defaults["style"]
+    # Older saves stored only garden_mode; never lose the selected Garden scene.
+    raw_scene = background_source.get("scene")
+    scene = (raw_scene if raw_scene in VIRTUAL_SCENES else
+             "garden" if background_source.get("garden_mode") is True else "grid")
     background = {
+        "scene": scene,
         "grid_enabled": (background_source.get("grid_enabled")
                          if isinstance(background_source.get("grid_enabled"), bool)
                          else defaults["grid_enabled"]),
@@ -240,7 +248,22 @@ def normalise_virtual_desktop_data(value):
                                           0.018 if erase else 0.0038),
                 "points": points,
             })
-    return {"background": background, "strokes": strokes}
+    constellations = []
+    for item in source.get("constellations", []) if isinstance(source.get("constellations"), list) else []:
+        if not isinstance(item, dict):
+            continue
+        raw_stars = item.get("stars", [])
+        if not isinstance(raw_stars, list):
+            continue
+        indices = []
+        for star in raw_stars[:72]:
+            if type(star) is int and 0 <= star < 120 and (not indices or star != indices[-1]):
+                indices.append(star)
+        if len(indices) >= 2:
+            constellations.append({"stars": indices})
+        if len(constellations) >= 120:
+            break
+    return {"background": background, "strokes": strokes, "constellations": constellations}
 
 
 def load_virtual_desktop_data(path=VIRTUAL_DESKTOP_DATA_FILE):
@@ -546,6 +569,7 @@ def save_gesture_settings(values: dict) -> None:
         "#",
         "# SETTINGS",
         "# hand_visual_scale: skeleton/TPI scale, 0.1 to 1.0.",
+        "# hand_display_fps: visual hand refresh cap, 5 to 30 FPS; default 15. Hand detection runs separately.",
         "# hand_contact_band_ratio: palm attraction distance beyond touch, in palm widths; 0.0 to 0.9; default 0.02.",
         "# palm_attract_acceleration: speed multiplier for the virtual hands blending toward shared contact alignment; 0.2 to 5.0x; default 0.33x.",
         "# skin_tone_darkness: 0 to 100 percent extra warm darkening of the skin-like hand mesh.",
@@ -581,6 +605,7 @@ def save_gesture_settings(values: dict) -> None:
         "# Settings slider drag uses a reduced gain (0.42x) for finer control; initial pickup preserves the value.",
         "# Default TPI colours: LEFT red, RIGHT blue. Swatches can still cycle independently.",
         f"hand_visual_scale={clamped('hand_visual_scale', 0.1, 1.0, 0.3):.2f}",
+        f"hand_display_fps={clamped('hand_display_fps', 5.0, 30.0, 15.0):.0f}",
         f"hand_recognition_threshold={clamped('hand_recognition_threshold', 0.30, 0.90, 0.60):.2f}",
         f"hand_contact_band_ratio={clamped('hand_contact_band_ratio', 0.0, 0.9, 0.02):.2f}",
         f"palm_attract_acceleration={clamped('palm_attract_acceleration', 0.2, 5.0, 0.33):.2f}",
@@ -627,6 +652,7 @@ def load_gesture_settings() -> dict:
     """Load settings for cursor mapping, smoothing, timing, and hand colours."""
     values = {
         "hand_visual_scale": 0.3,
+        "hand_display_fps": 15.0,
         "hand_recognition_threshold": 0.60,
         "hand_contact_band_ratio": 0.02,
         "palm_attract_acceleration": 0.33,
@@ -667,6 +693,7 @@ def load_gesture_settings() -> dict:
     }
     ranges = {
         "hand_visual_scale": (0.1, 1.0),
+        "hand_display_fps": (5.0, 30.0),
         "hand_recognition_threshold": (0.30, 0.90),
         "hand_contact_band_ratio": (0.0, 0.9),
         "palm_attract_acceleration": (0.2, 5.0),
@@ -1039,11 +1066,11 @@ class Tracker:
 
     def _loop(self):
         last_frame_time = 0.0
-        frame_interval = 1.0 / 18.0
-        # Run inference at a modest active cadence and downshift further when no hands
-        # are present. This substantially reduces sustained CPU use on software-rendered
-        # Linux desktops while staying responsive enough for gesture interaction.
-        idle_frame_interval = 1.0 / 8.0
+        # Inference is the largest ongoing CPU cost. Preserve a responsive active
+        # tracking cadence, but avoid processing excess camera frames with no hands.
+        # Gesture countdown timing is wall-clock based and still updated by the UI.
+        frame_interval = 1.0 / 15.0
+        idle_frame_interval = 1.0 / 6.0
         # Paused hand tracking only needs occasional frames for the optional face welcome.
         paused_frame_interval = 1.0 / 2.0
         idle_after_seconds = 1.0
@@ -1070,7 +1097,7 @@ class Tracker:
             last_wall, last_mono = time.time(), time.monotonic()
 
         while self.running:
-            # Active inference is capped at 18 FPS to reduce sustained CPU load. A much
+            # Active inference is capped at 15 FPS to reduce sustained CPU load. A much
             # longer pass means
             # the PC slept (the wall clock jumps across a suspend; the monotonic clock may
             # or may not, depending on the OS) or the driver stalled in grab(): either way
@@ -1300,9 +1327,21 @@ class SearchHandOverlay(QWidget):
         )
         self._global_hand_layer_active = windows_global_layer
         should_show = bool(search_visible or windows_global_layer)
-        # Poll slowly while hidden; keep the active visual layer aligned to the app's
-        # scene cadence instead of forcing extra high-frequency repaints on Windows.
-        wanted_interval = 40 if windows_global_layer else (24 if search_visible else 150)
+        # A permanently visible transparent Windows hand layer previously repainted
+        # the entire screen ~25 times/second even with no hands. Keep it responsive
+        # while there are visible hand landmarks or running countdowns, but let the
+        # empty layer fall to a low cadence. The 180 ms poll also detects new hands.
+        active_visuals = bool(
+            any(owner.hand_positions.get(side) for side in ("left", "right")) or
+            any(owner.peace_hold_started.get(side) is not None for side in ("left", "right")) or
+            any(owner.menu_pinch_started.get(side) is not None for side in ("left", "right")) or
+            bool(getattr(owner, "custom_gesture_rings", {})) or
+            any(owner.fist_action_menu_open.get(side, False) for side in ("left", "right"))
+        )
+        # User-configurable hand *display* FPS. This does not change camera
+        # inference, the gesture state machine, or pointer/TPI input cadence.
+        hand_frame_ms = max(1, round(1000.0 / max(5, min(30, owner.hand_display_fps))))
+        wanted_interval = hand_frame_ms if active_visuals else 180
         if self.sync_timer.interval() != wanted_interval:
             self.sync_timer.setInterval(wanted_interval)
         if not should_show:
@@ -1366,10 +1405,11 @@ class SearchHandOverlay(QWidget):
         # Reassert the topmost position without activation. This orders the overlay
         # above ordinary desktop windows; immersive Windows shell surfaces such as
         # Task View may still be in a higher system z-order band.
-        if now-self._last_raise > 0.12:
+        raise_interval = 0.12 if active_visuals else 0.65
+        if now-self._last_raise > raise_interval:
             self.raise_()
             self._last_raise = now
-        if sys.platform.startswith("win") and now-self._last_native_raise > 0.12:
+        if sys.platform.startswith("win") and now-self._last_native_raise > raise_interval:
             try:
                 hwnd = int(self.winId())
                 user32 = ctypes.windll.user32
@@ -2007,6 +2047,7 @@ class SpatialDesktop(QWidget):
 
         settings = load_gesture_settings()
         self.hand_visual_scale = settings["hand_visual_scale"]
+        self.hand_display_fps = int(min(30, max(5, round(settings.get("hand_display_fps", 15)))))
         self.hand_recognition_threshold = float(settings.get("hand_recognition_threshold", 0.60))
         self.hand_contact_band_ratio = settings.get("hand_contact_band_ratio", 0.02)
         self.palm_attract_acceleration = settings.get("palm_attract_acceleration", 0.33)
@@ -2077,7 +2118,17 @@ class SpatialDesktop(QWidget):
         self.virtual_desktop_data = load_virtual_desktop_data()
         virtual_bg = self.virtual_desktop_data["background"]
         self.virtual_grid_enabled = bool(virtual_bg["grid_enabled"])
-        self.virtual_garden_mode = bool(virtual_bg.get("garden_mode", False))
+        self.virtual_scene = virtual_bg.get("scene", "garden" if virtual_bg.get("garden_mode") else "grid")
+        if self.virtual_scene not in VIRTUAL_SCENES:
+            self.virtual_scene = "grid"
+        self.virtual_garden_mode = self.virtual_scene == "garden"
+        self.virtual_space_mode = self.virtual_scene == "space"
+        self.space_constellations = list(self.virtual_desktop_data.get("constellations", []))
+        self.space_drawing_by_side = {"left": None, "right": None, "mouse": None}
+        self.space_clear_press_latch = {"left": False, "right": False}
+        self._space_stars = self._make_space_stars()
+        self._space_background_cache = None
+        self._space_background_size = None
         self.virtual_background_style = int(virtual_bg["style"])
         self.virtual_grid_brightness = float(virtual_bg["brightness"])
         self.virtual_grid_glow = float(virtual_bg["glow"])
@@ -2478,6 +2529,7 @@ class SpatialDesktop(QWidget):
     def persist_gesture_settings(self):
         save_gesture_settings({
             "hand_visual_scale": self.hand_visual_scale,
+            "hand_display_fps": self.hand_display_fps,
             "hand_recognition_threshold": self.hand_recognition_threshold,
             "hand_contact_band_ratio": self.hand_contact_band_ratio,
             "palm_attract_acceleration": self.palm_attract_acceleration,
@@ -2587,6 +2639,9 @@ class SpatialDesktop(QWidget):
         """Paint the active Virtual desktop scene (grid canvas or separate Garden scene)."""
         if getattr(self, "virtual_garden_mode", False):
             self._paint_virtual_garden(painter, width, height)
+            return
+        if getattr(self, "virtual_space_mode", False):
+            self._paint_virtual_space(painter, width, height)
             return
         style = self._virtual_background_style_data()
         painter.fillRect(QRectF(0, 0, width, height), QColor(style["background"]))
@@ -3070,6 +3125,15 @@ class SpatialDesktop(QWidget):
         painter.restore()
 
     def mousePressEvent(self, event):
+        if (event.button() == Qt.LeftButton and self.desktop_mode == "virtual" and
+                self.virtual_space_mode and not self._gesture_ui_modal_open()):
+            point = event.position()
+            if self._space_clear_hit(point):
+                self._space_clear_constellations()
+            else:
+                self._space_start_constellation("mouse", point)
+            event.accept()
+            return
         if (event.button() == Qt.LeftButton and self.virtual_garden_mode and
                 self.desktop_mode == "virtual" and not self._gesture_ui_modal_open()):
             point = event.position()
@@ -3110,6 +3174,10 @@ class SpatialDesktop(QWidget):
         super().mouseMoveEvent(event)
 
     def mouseReleaseEvent(self, event):
+        if event.button() == Qt.LeftButton and self.space_drawing_by_side.get("mouse") is not None:
+            self._space_finish_constellation("mouse")
+            event.accept()
+            return
         if event.button() == Qt.LeftButton and self._garden_props["ball"].get("held") == "mouse":
             self._garden_drop_ball("mouse")
             self.update()
@@ -3314,7 +3382,9 @@ class SpatialDesktop(QWidget):
     def _paint_garden_props(self, painter, width, height, scene):
         """Animate small birds and hand-pickable garden props with inexpensive 2D physics."""
         now = time.monotonic()
-        dt = min(0.045, max(0.0, now - getattr(self, "_garden_prop_last_tick", now)))
+        # Repaints run at an adaptive rate; allow longer idle frame intervals
+        # without slowing ball gravity, bounces or bird travel in Garden Mode.
+        dt = min(0.12, max(0.0, now - getattr(self, "_garden_prop_last_tick", now)))
         self._garden_prop_last_tick = now
         props = self._garden_props
         # Object grabbing is handled in the gesture loop, not in paint. Otherwise
@@ -3459,11 +3529,311 @@ class SpatialDesktop(QWidget):
         self._paint_garden_weather_label(painter, width, height, scene)
         painter.restore()
 
+    @staticmethod
+    def _make_space_stars():
+        """Stable normalized star positions: ids survive resizing and app restarts."""
+        rng = random.Random(812734)
+        stars = []
+        # 100 bright drawable anchors, visible even when the nebula is dim.
+        for index in range(100):
+            x = 0.045 + 0.91 * rng.random()
+            y = 0.085 + 0.80 * rng.random()
+            stars.append((x, y, 1.2 + 2.7*rng.random(), rng.random()*6.283, index))
+        return stars
+
+    def _set_virtual_scene(self, scene):
+        if scene not in VIRTUAL_SCENES or scene == self.virtual_scene:
+            return
+        self._finish_virtual_pen_stroke()
+        for side in ("left", "right", "mouse"):
+            self._space_finish_constellation(side)
+        if self.virtual_garden_mode:
+            for side in ("left", "right", "mouse"):
+                if self._garden_props["ball"].get("held") == side:
+                    self._garden_drop_ball(side)
+        self.virtual_scene = scene
+        self.virtual_garden_mode = scene == "garden"
+        self.virtual_space_mode = scene == "space"
+        if scene != "grid":
+            self.virtual_pen_active = False
+            self.virtual_pen_erase = False
+            self.virtual_pen_popup_open = False
+        self._glass_virtual_backdrop = None
+        self._glass_virtual_backdrop_size = None
+        self._schedule_virtual_desktop_save()
+        self.status = f"Virtual scene: {VIRTUAL_SCENE_LABELS[scene].title()}"
+        self.update()
+
+    def _space_nearest_star(self, point, radius=None):
+        if point is None:
+            return None
+        width, height = max(1., float(self.width())), max(1., float(self.height()))
+        limit = (max(64., min(116., min(width, height)*0.098)) if radius is None else radius)
+        best, best_distance = None, limit*limit
+        for x, y, _, _, index in self._space_stars:
+            distance = (point.x()-x*width)**2 + (point.y()-y*height)**2
+            if distance < best_distance:
+                best, best_distance = index, distance
+        return best
+
+    def _space_star_point(self, star_id, width, height):
+        star = self._space_stars[int(star_id)]
+        return QPointF(star[0]*width, star[1]*height)
+
+    def _space_clear_rect(self, width=None, height=None):
+        width = float(self.width() if width is None else width)
+        height = float(self.height() if height is None else height)
+        return QRectF(width-206.0, height-78.0, 182.0, 44.0)
+
+    def _space_clear_hit(self, point):
+        return bool(point is not None and self.virtual_space_mode and
+                    self._space_clear_rect().contains(point) and
+                    not self._gesture_ui_modal_open())
+
+    def _space_clear_constellations(self):
+        if self.space_constellations:
+            self.space_constellations.clear()
+            self._schedule_virtual_desktop_save()
+        for side in self.space_drawing_by_side:
+            self.space_drawing_by_side[side] = None
+        self.status = "Space constellations cleared"
+        self.update()
+
+    def _space_start_constellation(self, side, point):
+        star_id = self._space_nearest_star(point)
+        if star_id is None:
+            return False
+        self.space_drawing_by_side[side] = {
+            "stars": [star_id], "cursor": QPointF(point),
+            "last_join_at": 0.,
+        }
+        self.status = "Tracing constellation — move across stars; release to finish"
+        self.update()
+        return True
+
+    def _space_extend_constellation(self, side, point, now):
+        stroke = self.space_drawing_by_side.get(side)
+        if stroke is None or point is None:
+            return False
+        stroke["cursor"] = QPointF(point)
+        candidate = self._space_nearest_star(point, radius=max(42., min(68., self.height()*.065)))
+        if candidate is not None and candidate not in stroke["stars"]:
+            latest = self._space_star_point(stroke["stars"][-1], self.width(), self.height())
+            target = self._space_star_point(candidate, self.width(), self.height())
+            if (math.hypot(latest.x()-target.x(), latest.y()-target.y()) >= 30. and
+                    now - stroke["last_join_at"] >= 0.10):
+                stroke["stars"].append(candidate)
+                stroke["last_join_at"] = now
+                if len(stroke["stars"]) >= 72:
+                    self._space_finish_constellation(side)
+                    return True
+        self.update()
+        return True
+
+    def _space_finish_constellation(self, side):
+        state = self.space_drawing_by_side.get(side)
+        if state is None:
+            return
+        self.space_drawing_by_side[side] = None
+        if len(state["stars"]) >= 2:
+            self.space_constellations.append({"stars": list(state["stars"])})
+            self.space_constellations = self.space_constellations[-120:]
+            self._schedule_virtual_desktop_save()
+            self.status = f"Constellation saved · {len(state['stars'])} stars connected"
+        self.update()
+
+    def _space_handle_frame(self, side, cursor, is_pinch, now):
+        """Own Space pinches before fist/Pinch Menu classification, never OS dragging."""
+        if not self.virtual_space_mode or self.desktop_mode != "virtual":
+            return False
+        if not is_pinch:
+            self.space_clear_press_latch[side] = False
+            if self.space_drawing_by_side.get(side) is not None:
+                self._space_finish_constellation(side)
+                self._clear_menu_pinch_sequence(side)
+                return True
+            return False
+        self._clear_menu_pinch_sequence(side)
+        self._reset_fist_gesture(side)
+        self.active_action[side] = None
+        self.action_stop_wait_open[side] = True
+        self.action_stop_open_since[side] = None
+        if self._space_clear_hit(cursor):
+            if not self.space_clear_press_latch[side]:
+                self._space_clear_constellations()
+                self.space_clear_press_latch[side] = True
+            return True
+        if self.space_clear_press_latch[side]:
+            return True  # Must release after CLEAR before starting a new line.
+        if self.space_drawing_by_side.get(side) is None:
+            self._space_start_constellation(side, cursor)
+        else:
+            self._space_extend_constellation(side, cursor, now)
+        return True
+
+    def _paint_space_background(self, painter, width, height):
+        """One-time cached nebula, ringed planet, dust field and stars (no network/assets)."""
+        painter.save()
+        painter.setRenderHint(QPainter.Antialiasing, True)
+        base = QLinearGradient(0, 0, width, height)
+        base.setColorAt(0, QColor(2, 4, 21))
+        base.setColorAt(.45, QColor(11, 13, 48))
+        base.setColorAt(1, QColor(1, 9, 26))
+        painter.fillRect(QRectF(0, 0, width, height), QBrush(base))
+        # Expansive clouds of gas with translucent radial colour glows.
+        for x, y, radius, rgba in (
+            (.18, .30, .61, (56, 42, 144, 94)),
+            (.42, .62, .59, (20, 124, 160, 70)),
+            (.65, .22, .48, (151, 52, 139, 50)),
+            (.21, .78, .32, (22, 180, 182, 37)),
+            (.89, .70, .44, (23, 59, 158, 50))):
+            cx, cy = width*x, height*y
+            gradient = QRadialGradient(QPointF(cx, cy), min(width, height)*radius)
+            gradient.setColorAt(0, QColor(*rgba))
+            gradient.setColorAt(.52, QColor(rgba[0], rgba[1], rgba[2], rgba[3]//3))
+            gradient.setColorAt(1, QColor(rgba[0], rgba[1], rgba[2], 0))
+            painter.setBrush(QBrush(gradient))
+            painter.setPen(Qt.NoPen)
+            r = min(width, height)*radius
+            painter.drawEllipse(QPointF(cx, cy), r, r)
+        # Tilted luminous galactic arm: layered wispy ellipses.
+        painter.save()
+        painter.translate(width*.30, height*.45)
+        painter.rotate(-24)
+        for w, h, tint in ((.52, .13, (87, 83, 192, 15)),
+                           (.47, .077, (119, 121, 210, 18)),
+                           (.40, .039, (176, 187, 248, 15))):
+            painter.setPen(Qt.NoPen)
+            painter.setBrush(QColor(*tint))
+            painter.drawEllipse(QRectF(-width*w*.5, -height*h*.5, width*w, height*h))
+        painter.restore()
+        rng = random.Random(93941)
+        for i in range(520):
+            x, y = rng.random()*width, rng.random()*height
+            radius = .25 + rng.random()*.85
+            alpha = rng.randint(46, 178)
+            painter.setBrush(QColor(182+rng.randint(0, 70), 194+rng.randint(0, 50), 255, alpha))
+            painter.setPen(Qt.NoPen)
+            painter.drawEllipse(QPointF(x, y), radius, radius)
+        # Atmospheric halo behind the planet.
+        planet_center = QPointF(width*.79, height*.47)
+        planet_r = min(width, height)*.155
+        aura = QRadialGradient(planet_center, planet_r*1.85)
+        aura.setColorAt(0, QColor(71, 151, 226, 32))
+        aura.setColorAt(.72, QColor(75, 88, 225, 36))
+        aura.setColorAt(1, QColor(25, 80, 240, 0))
+        painter.setBrush(QBrush(aura))
+        painter.setPen(Qt.NoPen)
+        painter.drawEllipse(planet_center, planet_r*1.85, planet_r*1.85)
+        # Rings sit partly behind the planet and are redrawn as a foreground arc.
+        painter.save()
+        painter.translate(planet_center)
+        painter.rotate(-25)
+        for width_offset, alpha in ((1.75, 78), (1.92, 95), (2.07, 32)):
+            painter.setBrush(Qt.NoBrush)
+            painter.setPen(QPen(QColor(135, 187, 248, alpha), 2.0))
+            painter.drawEllipse(QRectF(-planet_r*width_offset, -planet_r*.47,
+                                       planet_r*width_offset*2, planet_r*.94))
+        painter.restore()
+        surface = QRadialGradient(QPointF(planet_center.x()-planet_r*.42,
+                                         planet_center.y()-planet_r*.45), planet_r*1.85)
+        surface.setColorAt(0, QColor(144, 207, 239))
+        surface.setColorAt(.40, QColor(46, 117, 183))
+        surface.setColorAt(.76, QColor(26, 57, 110))
+        surface.setColorAt(1, QColor(7, 17, 50))
+        painter.setPen(QPen(QColor(127, 191, 255, 150), 1.6))
+        painter.setBrush(QBrush(surface))
+        painter.drawEllipse(planet_center, planet_r, planet_r)
+        # Discrete bright anchor stars with subtle cyan halo and diffraction crosses.
+        for x, y, size, phase, _ in self._space_stars:
+            point = QPointF(width*x, height*y)
+            glow = QRadialGradient(point, size*5.0)
+            glow.setColorAt(0, QColor(210, 248, 255, 180))
+            glow.setColorAt(1, QColor(76, 184, 245, 0))
+            painter.setPen(Qt.NoPen)
+            painter.setBrush(QBrush(glow))
+            painter.drawEllipse(point, size*5.0, size*5.0)
+            painter.setBrush(QColor(235, 248, 255, 238))
+            painter.drawEllipse(point, max(.9, size*.55), max(.9, size*.55))
+            if size > 2.5:
+                painter.setPen(QPen(QColor(162, 219, 255, 90), .85))
+                painter.drawLine(QPointF(point.x()-size*3, point.y()),
+                                 QPointF(point.x()+size*3, point.y()))
+                painter.drawLine(QPointF(point.x(), point.y()-size*3),
+                                 QPointF(point.x(), point.y()+size*3))
+        painter.restore()
+
+    def _paint_space_constellation(self, painter, ids, width, height, active=False, cursor=None):
+        points = [self._space_star_point(i, width, height) for i in ids if 0 <= i < len(self._space_stars)]
+        if not points:
+            return
+        painter.save()
+        painter.setRenderHint(QPainter.Antialiasing, True)
+        if len(points) >= 2:
+            line = QPainterPath(points[0])
+            for point in points[1:]:
+                line.lineTo(point)
+            painter.setBrush(Qt.NoBrush)
+            painter.setPen(QPen(QColor(55, 185, 255, 35), 12.0, Qt.SolidLine, Qt.RoundCap, Qt.RoundJoin))
+            painter.drawPath(line)
+            painter.setPen(QPen(QColor(89, 217, 255, 105), 5.0, Qt.SolidLine, Qt.RoundCap, Qt.RoundJoin))
+            painter.drawPath(line)
+            painter.setPen(QPen(QColor(213, 249, 255, 235), 1.9, Qt.SolidLine, Qt.RoundCap, Qt.RoundJoin))
+            painter.drawPath(line)
+        if active and cursor is not None:
+            painter.setPen(QPen(QColor(174, 239, 255, 135), 1.6, Qt.DashLine))
+            painter.drawLine(points[-1], cursor)
+        for point in points:
+            painter.setPen(Qt.NoPen)
+            painter.setBrush(QColor(76, 199, 255, 90))
+            painter.drawEllipse(point, 9., 9.)
+            painter.setBrush(QColor(240, 251, 255))
+            painter.drawEllipse(point, 3.5, 3.5)
+        painter.restore()
+
+    def _paint_virtual_space(self, painter, width, height):
+        size = (max(1, int(width)), max(1, int(height)))
+        if self._space_background_cache is None or self._space_background_size != size:
+            canvas = QImage(size[0], size[1], QImage.Format.Format_RGB32)
+            background_painter = QPainter(canvas)
+            try:
+                self._paint_space_background(background_painter, width, height)
+            finally:
+                background_painter.end()
+            self._space_background_cache = canvas
+            self._space_background_size = size
+        painter.drawImage(QPointF(0, 0), self._space_background_cache)
+        for drawing in self.space_constellations:
+            self._paint_space_constellation(painter, drawing["stars"], width, height)
+        for state in self.space_drawing_by_side.values():
+            if state is not None:
+                self._paint_space_constellation(painter, state["stars"], width, height,
+                                                active=True, cursor=state["cursor"])
+        painter.save()
+        painter.setRenderHint(QPainter.Antialiasing, True)
+        painter.setPen(QColor(207, 230, 255, 225))
+        painter.setFont(self._ui_font(13, QFont.DemiBold))
+        painter.drawText(QRectF(30, 26, min(620, width-50), 32), Qt.AlignLeft | Qt.AlignVCenter,
+                         "SPACE VIEW   /   CONSTELLATIONS")
+        painter.setPen(QColor(164, 201, 237, 205))
+        painter.setFont(self._ui_font(9, QFont.Normal))
+        painter.drawText(QRectF(30, 64, min(720, width-50), 32), Qt.AlignLeft | Qt.AlignVCenter,
+                         "Pinch and trace between stars · release to save")
+        button = self._space_clear_rect(width, height)
+        painter.setBrush(QColor(11, 34, 64, 218))
+        painter.setPen(QPen(QColor(104, 204, 240, 170), 1.3))
+        painter.drawRoundedRect(button, 12, 12)
+        painter.setPen(QColor(226, 247, 255))
+        painter.setFont(self._ui_font(9, QFont.DemiBold))
+        painter.drawText(button, Qt.AlignCenter, "CLEAR CONSTELLATIONS")
+        painter.restore()
+
     def _save_virtual_desktop_data(self):
         self.virtual_desktop_data = {
             "background": {
                 "grid_enabled": bool(self.virtual_grid_enabled),
                 "garden_mode": bool(self.virtual_garden_mode),
+                "scene": self.virtual_scene,
                 "style": int(self.virtual_background_style),
                 "brightness": float(self.virtual_grid_brightness),
                 "glow": float(self.virtual_grid_glow),
@@ -3471,6 +3841,7 @@ class SpatialDesktop(QWidget):
                 "thickness": float(self.virtual_grid_thickness),
             },
             "strokes": self.virtual_canvas_strokes,
+            "constellations": self.space_constellations,
         }
         saved = save_virtual_desktop_data(self.virtual_desktop_data)
         if saved:
@@ -3514,7 +3885,7 @@ class SpatialDesktop(QWidget):
         return {"panel": panel, "items": items}
 
     def _virtual_pen_ui_contains(self, point):
-        if point is None or getattr(self, "virtual_garden_mode", False):
+        if point is None or self.virtual_scene != "grid":
             return False
         dock = self._virtual_dock_geometry()["dock"]
         if dock.contains(point):
@@ -3525,7 +3896,7 @@ class SpatialDesktop(QWidget):
 
     def _handle_virtual_dock_click(self, point):
         """Handle hand clicks on the Virtual apps dock and Pen palette."""
-        if point is None or self.desktop_mode != "virtual" or self.virtual_garden_mode:
+        if point is None or self.desktop_mode != "virtual" or self.virtual_scene != "grid":
             return False
         # The glass menu is modal, but this handler runs only after its own hit tests.
         if self.menu_open and self.hub_visible:
@@ -3708,7 +4079,7 @@ class SpatialDesktop(QWidget):
             self.action_stop_wait_open[side] = True
             self.action_stop_open_since[side] = None
             return True
-        if (self.desktop_mode != "virtual" or getattr(self, "virtual_garden_mode", False) or
+        if (self.desktop_mode != "virtual" or self.virtual_scene != "grid" or
                 not self.virtual_pen_active or (self.menu_open and self.hub_visible) or self.settings_open or
                 self.floating_clipboard_visible or not is_pinch or
                 self._virtual_pen_ui_contains(cursor)):
@@ -3730,7 +4101,7 @@ class SpatialDesktop(QWidget):
 
     def _paint_virtual_app_dock(self, painter):
         """Draw the bottom Virtual Apps dock and its Pen colour/eraser popup."""
-        if (self.desktop_mode != "virtual" or self.virtual_garden_mode or
+        if (self.desktop_mode != "virtual" or self.virtual_scene != "grid" or
                 (self.menu_open and self.hub_visible) or self.settings_open):
             return
         geometry = self._virtual_dock_geometry()
@@ -3961,6 +4332,7 @@ class SpatialDesktop(QWidget):
             y += h + after
 
         right_h = 0.0
+        hand_fps_row_top = None
         if page == "interaction":
             stack("scroll_toggle")
             stack("swap_drag_scroll_toggle")
@@ -3974,6 +4346,10 @@ class SpatialDesktop(QWidget):
             stack("calibrate_right")
             y += group
             stack("hand_setup")
+            # Hand display FPS belongs below the left-side buttons, not among
+            # the recognition and appearance sliders on the right.
+            hand_fps_row_top = y + 10.0
+            y += 74.0
         elif page == "tli":
             stack("glow_toggle")
             y += 6.0
@@ -4012,7 +4388,7 @@ class SpatialDesktop(QWidget):
             texts["about"] = (L, y, 2*W+(R-(L+W)), 44.0)
             y += 44.0 + gap
         elif page == "virtual":
-            stack("virtual_garden_toggle")
+            stack("virtual_scene_switch")
             stack("virtual_grid_toggle")
             stack("virtual_background_style")
             texts["help"] = (L, y, W, 58.0)
@@ -4033,16 +4409,26 @@ class SpatialDesktop(QWidget):
         left_h = max(0.0, y - gap)
 
         sliders = []
-        for index, row in enumerate(self._settings_slider_rows(page)):
+        right_index = 0
+        for row in self._settings_slider_rows(page):
             name = row[0]
-            row_top = index*self.SETTINGS_SLIDER_PITCH
-            track_left, track_right = R+12.0, R+W-12.0
+            if page == "hands" and name == "hand_display_fps":
+                # Reuse the same draw/hover/drag code as every other slider,
+                # with its own left-column coordinates and button-safe spacing.
+                row_top = hand_fps_row_top
+                track_left, track_right = L+12.0, L+W-12.0
+                label_x = L
+            else:
+                row_top = right_index*self.SETTINGS_SLIDER_PITCH
+                right_index += 1
+                track_left, track_right = R+12.0, R+W-12.0
+                label_x = R
             if name == "scroll_notch_hue":
                 track_right -= 30.0  # room for the colour swatch at the track end
             sliders.append({"name": name, "y": row_top+12.0, "left": track_left, "right": track_right,
-                            "label": (R, row_top+22.0, W, 18.0)})
-        if sliders:
-            right_h = max(right_h, len(sliders)*self.SETTINGS_SLIDER_PITCH - 12.0)
+                            "label": (label_x, row_top+22.0, W, 18.0)})
+        if right_index:
+            right_h = max(right_h, right_index*self.SETTINGS_SLIDER_PITCH - 12.0)
 
         if page in ("gesture_map", "speech_commands"):
             height = self.SETTINGS_INFO_PAGE_HEIGHT
@@ -4073,6 +4459,13 @@ class SpatialDesktop(QWidget):
         width = area.width()/len(HAND_RENDER_STYLES)
         return [(style, QRectF(area.left()+i*width, area.top(), width, area.height()))
                 for i, style in enumerate(HAND_RENDER_STYLES)]
+
+    def _virtual_scene_segments(self, rect, scale):
+        """Matching three-way scene selector, with the same hit boxes as its painting."""
+        area = rect.adjusted(rect.width()*self.RENDER_SWITCH_CAPTION, 3*scale, -3*scale, -3*scale)
+        width = area.width()/len(VIRTUAL_SCENES)
+        return [(style, QRectF(area.left()+i*width, area.top(), width, area.height()))
+                for i, style in enumerate(VIRTUAL_SCENES)]
 
     def _settings_text_rects(self, cx=None, cy=None, scale=None, page=None):
         return self._settings_control_rects(cx, cy, scale, page=page, kind="texts")
@@ -4491,6 +4884,7 @@ class SpatialDesktop(QWidget):
             ]
         if page == "hands":
             return [
+                ("hand_display_fps", self.hand_display_fps, 5.0, 30.0, "HAND DISPLAY FPS"),
                 ("hand_scale", self.hand_visual_scale, 0.1, 1.0, "HAND SCALE"),
                 ("hand_recognition_threshold", self.hand_recognition_threshold, 0.30, 0.90, "HAND RECOGNITION THRESHOLD"),
                 ("finger_thickness", self.finger_thickness, 0.8, 10.0, "FINGER THICKNESS"),
@@ -5977,8 +6371,11 @@ class SpatialDesktop(QWidget):
         value = minimum+ratio*(maximum-minimum)
         if name == "ui_font_scale":
             value /= 100.0
+        if name == "hand_display_fps":
+            value = float(round(value))
         attributes = {
             "hand_scale": ("hand_visual_scale", 0.005),
+            "hand_display_fps": ("hand_display_fps", 0.5),
             "hand_recognition_threshold": ("hand_recognition_threshold", 0.01),
             "sensitivity": ("hand_tracking_sensitivity", 0.01),
             "scroll_acceleration": ("scroll_acceleration", 0.01),
@@ -6018,7 +6415,7 @@ class SpatialDesktop(QWidget):
             attr, threshold = attributes[name]
             old_value = float(getattr(self, attr))
             if abs(value-old_value) >= threshold:
-                setattr(self, attr, value)
+                setattr(self, attr, int(value) if name == "hand_display_fps" else value)
                 if name == "default_gesture_hold_seconds":
                     self.menu_pinch_hold_seconds = value
                     self.peace_toggle_hold_seconds = value
@@ -6212,21 +6609,12 @@ class SpatialDesktop(QWidget):
                 return
 
             if self.settings_page == "virtual":
-                if pressed("virtual_garden_toggle"):
-                    self.virtual_garden_mode = not self.virtual_garden_mode
-                    if not self.virtual_garden_mode:
-                        for holding_side in ("left", "right"):
-                            self._garden_drop_ball(holding_side)
-                    if self.virtual_garden_mode:
-                        self._finish_virtual_pen_stroke()
-                        self.virtual_pen_active = False
-                        self.virtual_pen_erase = False
-                        self.virtual_pen_popup_open = False
-                    self._glass_virtual_backdrop = None
-                    self._glass_virtual_backdrop_size = None
-                    self._schedule_virtual_desktop_save()
-                    self.status = "Garden Mode enabled" if self.virtual_garden_mode else "Garden Mode disabled — Grid restored"
-                    self.update()
+                if pressed("virtual_scene_switch"):
+                    style = next((name for name, seg in self._virtual_scene_segments(
+                        controls["virtual_scene_switch"], scale) if seg.contains(point)), None)
+                    if style is None:  # Caption cycles through the scenes, like Hands / Render.
+                        style = VIRTUAL_SCENES[(VIRTUAL_SCENES.index(self.virtual_scene)+1) % len(VIRTUAL_SCENES)]
+                    self._set_virtual_scene(style)
                 elif pressed("virtual_grid_toggle"):
                     self.virtual_grid_enabled = not self.virtual_grid_enabled
                     self._glass_virtual_backdrop = None
@@ -9668,6 +10056,8 @@ try {
 
     @staticmethod
     def _settings_slider_value_text(name, value):
+        if name == "hand_display_fps":
+            return f"{int(round(value))} FPS"
         if name == "smoothing":
             return f"{value:.2f}"
         if name == "pinch_timer":
@@ -10121,9 +10511,8 @@ try {
 
         The GL render/readback path is CPU-expensive on software OpenGL (common on
         Linux desktops). Render at 72% resolution and cap expensive pose renders to
-        15 FPS, reusing/repositioning the latest image between renders. Large pose
-        changes can still trigger an immediate render so fingers don't lag behind a
-        quick open/close gesture.
+        the selected Hand Display FPS, repositioning the cached image between
+        pose renders. Gesture input stays independent of this visual limit.
         """
         if self._hand_mesh_renderer is None:
             try:
@@ -10145,19 +10534,10 @@ try {
         now = time.monotonic()
         colour = (base.red(), base.green(), base.blue())
         render_scale = 0.72
-        render_interval = 1.0 / 15.0
+        render_interval = 1.0 / max(5, min(30, self.hand_display_fps))
         cache = self._hand_mesh_frame_cache.get(model_side)
-        render_now = cache is None or (now - cache["rendered_at"]) >= render_interval
-
-        if cache is not None and not render_now:
-            # Compare pose relative to the wrist so ordinary hand translation can use
-            # a cheap image offset. Big articulation/depth changes bypass the throttle.
-            translation = target[0, :2] - cache["target"][0, :2]
-            shape_delta = target[:, :2] - cache["target"][:, :2] - translation
-            max_shape_delta = float(np.max(np.linalg.norm(shape_delta, axis=1)))
-            max_depth_delta = float(np.max(np.abs(target[:, 2] - cache["target"][:, 2])))
-            if colour != cache["colour"] or max_shape_delta > 18.0 or max_depth_delta > 22.0:
-                render_now = True
+        render_now = (cache is None or now - cache["rendered_at"] >= render_interval or
+                      (cache is not None and colour != cache["colour"]))
 
         if render_now:
             # Lower pixel workload matters much more than multisampling on CPU-backed
@@ -10182,8 +10562,8 @@ try {
             self._hand_mesh_frame_cache[model_side] = cache
 
         # Translate the cached image by the current wrist movement without rebuilding
-        # its vertex pose. Relative finger/palm movement is refreshed at least every
-        # 1/15 sec, or immediately when it exceeds the limits above.
+        # its vertex pose. Finger articulation refreshes on the chosen FPS
+        # cadence; translation stays visually responsive between mesh renders.
         translation = target[0, :2] - cache["target"][0, :2]
         dest = QRectF(cache["left"] + float(translation[0]),
                       cache["top"] + float(translation[1]),
@@ -11379,9 +11759,11 @@ try {
     def _scene_is_idle(self, now):
         """True when no hand is in view and nothing is animating.
 
-        Garden Mode is continuously animated, so it must never use idle throttling.
+        Garden Mode is animated only when its virtual scene is actually visible;
+        selecting Garden while in OS mode must not force nonstop repaints.
         """
-        if getattr(self, "virtual_garden_mode", False):
+        if (self.desktop_mode == "virtual" and
+                getattr(self, "virtual_garden_mode", False)):
             return False
         try:
             if getattr(self, "virtual_pen_active_stroke", None) is not None:
@@ -11424,20 +11806,25 @@ try {
         return True
 
     def _request_scene_repaint(self, now):
-        if (not getattr(self, "virtual_garden_mode", False) and self._scene_is_idle(now) and
+        if (self._scene_is_idle(now) and
                 now-getattr(self, "_last_scene_repaint", 0.0) < self.IDLE_REPAINT_INTERVAL):
             return
         self._last_scene_repaint = now
         self.update()
 
     def _adjust_scene_timer_cadence(self, hand_present, now):
-        """Run Garden Mode at 60 Hz; otherwise use active/idle UI cadence."""
-        if getattr(self, "virtual_garden_mode", False):
-            desired_ms = 16
-        elif self.menu_open and self.hub_visible:
-            desired_ms = 70 if hand_present or not self._scene_is_idle(now) else 100
+        """Keep gestures responsive while limiting full-screen painting/inference work."""
+        garden_visible = (self.desktop_mode == "virtual" and
+                          getattr(self, "virtual_garden_mode", False))
+        if self.menu_open and self.hub_visible:
+            # Pause expensive background animation when reading a glass settings page.
+            desired_ms = 50 if hand_present else 100
+        elif garden_visible:
+            # The animated garden used to force 60 FPS even with no hands.
+            # 30 FPS during interaction, 15 FPS while idle preserves gentle motion.
+            desired_ms = 33 if hand_present else 66
         else:
-            desired_ms = 50 if hand_present or not self._scene_is_idle(now) else 100
+            desired_ms = 50 if hand_present else 100
         timer = getattr(self, "timer", None)
         if timer is not None and timer.interval() != desired_ms:
             timer.setInterval(desired_ms)
@@ -11957,6 +12344,17 @@ try {
                     continue
                 if self._garden_handle_sundial_frame(side, cursor, object_pinch, now):
                     continue
+            if (self.virtual_space_mode and self.desktop_mode == "virtual" and
+                    not calibration_modal_frame and not peace and not self._gesture_ui_modal_open()):
+                # A closed fist must not masquerade as a thumb/index drawing pinch.
+                draw_pinch = (not is_fist_or_grip_pose(landmarks, edge_tolerant=edge_tolerant)
+                              and self._garden_object_pinch(
+                                  landmarks, held=self.space_drawing_by_side.get(side) is not None))
+                if self._space_handle_frame(side, cursor, draw_pinch, now):
+                    continue
+            if (self.virtual_space_mode and self._gesture_ui_modal_open() and
+                    self.space_drawing_by_side.get(side) is not None):
+                self._space_finish_constellation(side)
             raw_fist = is_fist_or_grip_pose(landmarks, edge_tolerant=edge_tolerant)
             raw_pinch = is_thumb_index_menu_pinch(landmarks, edge_tolerant=edge_tolerant)
             raw_middle_pinch = is_thumb_middle_zoom_pinch(landmarks, edge_tolerant=edge_tolerant)
@@ -13255,6 +13653,8 @@ try {
             self._stop_timer_during_sound(key)
         if getattr(self, "virtual_pen_active_stroke", None) is not None:
             self._finish_virtual_pen_stroke()
+        for side in ("left", "right", "mouse"):
+            self._space_finish_constellation(side)
         pending_virtual_save = getattr(self, "virtual_desktop_save_timer", None)
         if pending_virtual_save is not None and pending_virtual_save.isActive():
             pending_virtual_save.stop()
@@ -13298,7 +13698,22 @@ try {
             app.quit()
 
     def mouseMoveEvent(self, event):
-        # This overlay is gesture-controlled; physical mouse movement has no action.
+        if self.space_drawing_by_side.get("mouse") is not None:
+            self._space_extend_constellation("mouse", event.position(), time.monotonic())
+        elif self._garden_props["ball"].get("held") == "mouse":
+            # The original Garden mouseMoveEvent above is shadowed by this method.
+            ball = self._garden_props["ball"]
+            point = event.position()
+            width, height = max(1., float(self.width())), max(1., float(self.height()))
+            x = min(1.0-ball["r"], max(ball["r"], point.x()/width+ball.get("offset_x", 0.0)))
+            y = min(1.0-ball["r"], max(ball["r"], point.y()/height+ball.get("offset_y", 0.0)))
+            now = time.monotonic()
+            dt = max(.008, now-float(ball.get("last_drag_at", now)))
+            ball["vx"] = max(-1.8, min(1.8, (x-ball["x"])/dt))
+            ball["vy"] = max(-1.8, min(1.8, (y-ball["y"])/dt))
+            ball["x"], ball["y"] = x, y
+            ball["last_drag_at"] = now
+            self.update()
         event.accept()
 
     def _stop_native_custom_key_capture(self):
@@ -13565,7 +13980,7 @@ try {
             self._paint_virtual_background(painter, width, height)
             # Garden is its own scene: keep the saved grid canvas hidden, not layered
             # beneath the garden. Returning to Grid mode reveals those strokes again.
-            if not self.virtual_garden_mode:
+            if self.virtual_scene == "grid":
                 canvas_layer = self._ensure_virtual_canvas_layer()
                 if canvas_layer is not None and not canvas_layer.isNull():
                     painter.drawImage(QPointF(0, 0), canvas_layer)
@@ -13972,16 +14387,28 @@ try {
                                 label, base_size=label_size, min_size=6, inset=2)
 
                     elif self.settings_page == "virtual":
-                        garden_button = controls["virtual_garden_toggle"]
-                        garden_fill = QColor(55, 145, 82, 235) if self.virtual_garden_mode else QColor(75, 80, 89, 205)
-                        garden_edge = QColor(155, 245, 180, 230) if self.virtual_garden_mode else QColor(155, 162, 172, 200)
-                        painter.setBrush(QBrush(garden_fill))
-                        painter.setPen(QPen(garden_edge, 1.5*scale))
-                        painter.drawRoundedRect(garden_button, 10*scale, 10*scale)
-                        painter.setPen(QColor(240, 255, 245) if self.virtual_garden_mode else QColor(225, 238, 242))
-                        self._draw_fitted_button_label(
-                            painter, garden_button, "GARDEN MODE  ·  "+("ON" if self.virtual_garden_mode else "OFF"),
-                            base_size=label_size, min_size=6, inset=12*scale)
+                        # Exactly the same three-way segmented style used by Hands → Render.
+                        switch = controls["virtual_scene_switch"]
+                        painter.setBrush(QBrush(QColor(10, 37, 55, 225)))
+                        painter.setPen(QPen(QColor(125, 235, 245, 210), 1.5*scale))
+                        painter.drawRoundedRect(switch, 10*scale, 10*scale)
+                        caption_w = switch.width()*self.RENDER_SWITCH_CAPTION
+                        painter.setPen(QColor(200, 240, 248))
+                        self._draw_fitted_button_label(painter, QRectF(switch.left(), switch.top(), caption_w, switch.height()),
+                                                       "SCENE", base_size=label_size, min_size=6, inset=8*scale)
+                        for seg_index, (scene_name, seg) in enumerate(self._virtual_scene_segments(switch, scale)):
+                            selected = scene_name == self.virtual_scene
+                            if selected:
+                                painter.setBrush(QBrush(QColor(55, 145, 82, 235)))
+                                painter.setPen(QPen(QColor(155, 245, 180, 230), 1.2*scale))
+                                painter.drawRoundedRect(seg.adjusted(1*scale, 0, -1*scale, 0), 8*scale, 8*scale)
+                            elif seg_index > 0 and VIRTUAL_SCENES[seg_index-1] != self.virtual_scene:
+                                painter.setPen(QPen(QColor(125, 235, 245, 90), 1.0*scale))
+                                painter.drawLine(QPointF(seg.left(), seg.top()+6*scale),
+                                                 QPointF(seg.left(), seg.bottom()-6*scale))
+                            painter.setPen(QColor(245, 255, 250) if selected else QColor(175, 210, 220))
+                            self._draw_fitted_button_label(painter, seg, VIRTUAL_SCENE_LABELS[scene_name],
+                                                           base_size=label_size, min_size=6, inset=3*scale)
 
                         grid_button = controls["virtual_grid_toggle"]
                         grid_fill = QColor(55, 145, 82, 225) if self.virtual_grid_enabled else QColor(75, 80, 89, 205)
@@ -14006,7 +14433,7 @@ try {
                         painter.setPen(QColor(185, 225, 235))
                         self._draw_wrapped_fitted_text(
                             painter, text_rects["help"],
-                            "Garden is a separate, dock-free scene with a time-aware sun/moon and live weather. Weather uses an approximate network location only while Garden Mode is active and refreshes every 15 minutes via Open-Meteo. Offline, local time still drives day/night; turn Garden off to restore the grid and saved drawings.",
+                            "Choose Grid for the pen canvas, Garden for interactive nature and weather, or Space for a glowing starfield. In Space, pinch and trace between stars to draw constellations; release to save. Click CLEAR in Space to erase constellations only. Your Grid drawings and Garden scene remain intact.",
                             base_size=max(7, int(8*scale)), min_size=6,
                             align=Qt.AlignLeft | Qt.AlignTop)
 
