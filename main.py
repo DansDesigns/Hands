@@ -287,8 +287,8 @@ def available_ui_sounds():
     except OSError:
         return []
 
-def play_ui_sound(filename):
-    """Play a selected bundled UI sound using an available system audio player."""
+def play_ui_sound(filename, *, stop_event=None):
+    """Play bundled UI audio. An optional event lets gesture timers cancel it early."""
     if not filename or filename == "None":
         return
     folder = (ROOT / "assets" / "sounds").resolve()
@@ -296,13 +296,64 @@ def play_ui_sound(filename):
     if path.parent != folder or not path.is_file() or path.suffix.lower() not in SOUND_EXTENSIONS:
         return
     try:
-        if shutil.which("paplay"):
-            subprocess.Popen(["paplay", str(path)], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        elif shutil.which("aplay") and path.suffix.lower() == ".wav":
-            subprocess.Popen(["aplay", "-q", str(path)], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        elif shutil.which("ffplay"):
-            subprocess.Popen(["ffplay", "-nodisp", "-autoexit", "-loglevel", "quiet", str(path)],
-                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        if os.name == "nt" and path.suffix.lower() in {".mp3", ".wav"}:
+            # Windows does not normally ship with paplay/aplay/ffplay. Use its
+            # native MCI playback asynchronously so gesture recognition never
+            # blocks while the chosen timer sound plays.
+            def _play_windows_mci():
+                alias = "spatial_ui_" + uuid.uuid4().hex[:12]
+                mci = ctypes.windll.winmm.mciSendStringW
+                try:
+                    media_type = "mpegvideo" if path.suffix.lower() == ".mp3" else "waveaudio"
+                    if mci(f'open "{path}" type {media_type} alias {alias}', None, 0, None) != 0:
+                        return
+                    if stop_event is None:
+                        mci(f"play {alias} wait", None, 0, None)
+                    else:
+                        # MCI `play ... wait` cannot be interrupted safely by the UI.
+                        # Use nonblocking playback and poll the stop event instead.
+                        if stop_event.is_set():
+                            return
+                        if mci(f"play {alias}", None, 0, None) != 0:
+                            return
+                        while not stop_event.wait(0.035):
+                            mode = ctypes.create_unicode_buffer(32)
+                            if mci(f"status {alias} mode", mode, len(mode), None) != 0:
+                                break
+                            if mode.value.strip().lower() != "playing":
+                                break
+                        if stop_event.is_set():
+                            mci(f"stop {alias}", None, 0, None)
+                except (OSError, ValueError, AttributeError):
+                    pass
+                finally:
+                    try:
+                        mci(f"close {alias}", None, 0, None)
+                    except (OSError, ValueError, AttributeError):
+                        pass
+            threading.Thread(target=_play_windows_mci, daemon=True).start()
+        else:
+            command = None
+            if shutil.which("paplay"):
+                command = ["paplay", str(path)]
+            elif shutil.which("aplay") and path.suffix.lower() == ".wav":
+                command = ["aplay", "-q", str(path)]
+            elif shutil.which("ffplay"):
+                command = ["ffplay", "-nodisp", "-autoexit", "-loglevel", "quiet", str(path)]
+            if command is not None and (stop_event is None or not stop_event.is_set()):
+                process = subprocess.Popen(command, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                if stop_event is not None:
+                    def _stop_process_on_cancel():
+                        # Wait for exit *or* cancellation without blocking the scene timer.
+                        while process.poll() is None:
+                            if stop_event.wait(0.035):
+                                if process.poll() is None:
+                                    try:
+                                        process.terminate()
+                                    except OSError:
+                                        pass
+                                break
+                    threading.Thread(target=_stop_process_on_cancel, daemon=True).start()
     except (OSError, ValueError):
         pass
 # Hand render styles, in the order shown by the Settings -> Hands switch.
@@ -718,20 +769,18 @@ def _finger_straightness_values(landmarks):
 
 
 def is_fist_or_grip_pose(landmarks, edge_tolerant=False):
-    """Fist/grip pose; relax one landmark threshold near screen edges."""
+    """Require a clearly curled four-finger grip before scrolling or dragging."""
     if landmarks is None or len(landmarks) < 21:
         return False
     straight = _finger_straightness_values(landmarks)
-    # Keep a pointing index finger from being mistaken for a grip. Allow one noisy
-    # landmark chain among the remaining fingers because hand tracking is imperfect.
-    # Slightly wider margins tolerate ordinary half-curled knuckles and the extra
-    # landmark noise seen in a diagonal/side-on grip, without accepting a straight index.
-    index_limit = 0.87 if edge_tolerant else 0.83
-    other_limit = 0.90 if edge_tolerant else 0.86
-    fingers_closed = straight[0] <= index_limit and sum(value <= other_limit for value in straight[1:]) >= 2
-    # A thumb merely lying alongside the fist is common in a grip. Reject only a
-    # clearly extended thumb (as in thumbs-up/down), not a moderate sideways offset.
+    # Three curled fingers plus a half-open index was triggering scroll while
+    # pointing or pinching. Require all four to curl, including at screen edges.
+    index_limit = 0.79 if edge_tolerant else 0.77
+    other_limit = 0.83 if edge_tolerant else 0.81
+    fingers_closed = straight[0] <= index_limit and all(
+        value <= other_limit for value in straight[1:])
     return fingers_closed and not thumb_sticking_out(landmarks, threshold=-0.55)
+
 
 
 def fingers_closed_pose(landmarks, edge_tolerant=False):
@@ -1295,9 +1344,12 @@ class SearchHandOverlay(QWidget):
             owner._paint_hand_skeleton(painter, points, side)
             owner._paint_gesture_disabled_indicator(painter, points, side)
             cursor = owner.side_cursor_positions.get(side)
+            peace_counting = (owner.peace_hold_started.get(side) is not None and
+                              not owner.peace_toggle_latched.get(side, False))
+            if cursor is None and peace_counting:
+                cursor = owner._scale_hand_tli_point(
+                    owner.interactive_hand_anchor(points, side), points, side)
             if cursor is None:
-                # The current frame has landmarks but no eligible cursor (for example,
-                # a paused hand). Do not synthesize a second/fallback TLI in this overlay.
                 continue
             cursor = owner._visual_tli_position(side, cursor, points)
             # TLI is drawn once, in the final loop below, so the Search overlay never
@@ -1308,21 +1360,6 @@ class SearchHandOverlay(QWidget):
             mode = "pinch"
             if owner.menu_pinch_release_candidate_since.get(side) is not None:
                 started = None
-            peace_started = owner.peace_hold_started.get(side)
-            if peace_started is not None and not owner.peace_toggle_latched.get(side, False):
-                ring = QRectF(cursor.x()-31, cursor.y()-31, 62, 62)
-                elapsed = max(0.0, now-peace_started)
-                progress = min(1.0, max(0.0, elapsed/max(0.01, owner.peace_toggle_hold_seconds)))
-                painter.setBrush(Qt.NoBrush)
-                painter.setPen(QPen(QColor(255, 220, 110, 100), 3))
-                painter.drawEllipse(ring)
-                painter.setPen(QPen(QColor(255, 220, 110, 245), 4))
-                painter.drawArc(ring, 90*16, -int(progress*360*16))
-                painter.setPen(QColor(255, 242, 205, 245))
-                painter.setFont(QFont("Sans", 8, QFont.DemiBold))
-                remaining = max(0.0, owner.peace_toggle_hold_seconds-elapsed)
-                painter.drawText(QRectF(cursor.x()-22, cursor.y()+29, 44, 16), Qt.AlignCenter,
-                                 f"{remaining:.1f}s")
             if started is not None:
                 elapsed = owner._menu_pinch_elapsed_seconds(side, now)
                 delay = owner.pinch_buffer_seconds
@@ -1425,6 +1462,10 @@ class SearchHandOverlay(QWidget):
                 # The common bright TLI remains the single visible/interactive cursor.
             engaged = side in owner.active_push_sides or (owner.click_side == side and now < owner.click_flash_until)
             owner._paint_tli(painter, cursor, side, engaged)
+        # Windows uses this layer in place of main-window hand rendering. Paint
+        # peace timers AFTER all cursors so an off hand still gets its circle.
+        for side in ("left", "right"):
+            owner._paint_peace_sign_timer(painter, side, now)
         painter.end()
 
 
@@ -1917,6 +1958,8 @@ class SpatialDesktop(QWidget):
         self.custom_gesture_triggers = {"left": HoldTrigger(), "right": HoldTrigger(), "overlap": HoldTrigger()}
         # Track which timer starts have already played the delayed timer-during sound.
         self._timer_during_sound_played_at = {}
+        self._timer_during_sound_stop_events = {}
+        self._timer_during_sound_seen_keys = set()
         self.custom_gesture_live = {}
         self.cursor_smoothing = settings["cursor_smoothing"]
         self.tli_glow_intensity = settings.get("tli_glow_intensity", 1.0)
@@ -1975,8 +2018,6 @@ class SpatialDesktop(QWidget):
             "ball": {"x": 0.70, "y": 0.82, "vx": 0.0, "vy": 0.0, "r": 0.027, "held": None},
             "sundial": {"x": 0.30, "y": 0.82, "held": None},
         }
-        self._garden_clock_projection_enabled = False
-        self._garden_clock_projection_started = 0.0
         self._garden_bird_seed = 19.0
         self._garden_bird_last_spawn = 0.0
         self._garden_birds = []
@@ -2142,8 +2183,10 @@ class SpatialDesktop(QWidget):
         # Loaded from gestures.txt above; set from Settings -> Hands -> CONTACT RANGE.
         self.hand_contact_weight = 0.0
         self.hand_contact_last_update = None
-        self.mouse_detached_by_side = {"left": False, "right": False}
+        self.mouse_detached_by_side = {"left": True, "right": False}
         self.peace_hold_started = {"left": None, "right": None}
+        # Countdown visuals must survive removal of the disabled hand's native cursor.
+        self.peace_timer_anchor_by_side = {"left": None, "right": None}
         self.peace_toggle_latched = {"left": False, "right": False}
         # Per-hand gesture lock: a sustained thumbs-up toggles only the hand making it.
         # Camera tracking and the other hand remain active while one hand is disabled.
@@ -2927,30 +2970,31 @@ class SpatialDesktop(QWidget):
         dt = min(0.045, max(0.0, now - getattr(self, "_garden_prop_last_tick", now)))
         self._garden_prop_last_tick = now
         props = self._garden_props
-        # Ball pickup is handled in the gesture loop so it takes priority over the
-        # Pinch Menu timer. Preserve the existing timed pinch-drag interaction for the
-        # sundial itself.
+        # A pinch drag picks up the ball or sundial when the cursor is over it.
         cursors = getattr(self, "side_cursor_positions", {})
         pinching = getattr(self, "pinch_drag_active", {})
-        dial_prop = props.get("sundial")
-        if dial_prop is not None:
-            for side in ("left", "right"):
-                cursor = cursors.get(side)
-                active = bool(pinching.get(side, False)) if isinstance(pinching, dict) else False
-                if cursor is None:
-                    active = False
-                if active and cursor is not None:
-                    cx = float(cursor.x()) / max(1.0, width)
-                    cy = float(cursor.y()) / max(1.0, height)
-                    if dial_prop["held"] == side:
-                        dial_prop["x"], dial_prop["y"] = cx, cy
-                    elif dial_prop["held"] is None:
-                        radius = 0.078
-                        if (cx-dial_prop["x"])**2 + (cy-dial_prop["y"])**2 < radius**2:
-                            dial_prop["held"] = side
-                            dial_prop["x"], dial_prop["y"] = cx, cy
-                if dial_prop["held"] == side and not active:
-                    dial_prop["held"] = None
+        for side in ("left", "right"):
+            cursor = cursors.get(side)
+            active = bool(pinching.get(side, False)) if isinstance(pinching, dict) else False
+            if cursor is None:
+                active = False
+            if active and cursor is not None:
+                cx, cy = float(cursor.x()) / max(1.0, width), float(cursor.y()) / max(1.0, height)
+                for name, prop in props.items():
+                    if prop["held"] == side:
+                        prop["x"], prop["y"] = cx, cy
+                        break
+                    if prop["held"] is None:
+                        radius = prop.get("r", 0.045) + (0.025 if name == "ball" else 0.035)
+                        if (cx-prop["x"])**2 + (cy-prop["y"])**2 < radius**2:
+                            prop["held"] = side
+                            prop["x"], prop["y"] = cx, cy
+                            if name == "ball":
+                                prop["vx"] = prop["vy"] = 0.0
+                            break
+            for prop in props.values():
+                if prop["held"] == side and not active:
+                    prop["held"] = None
         ball = props["ball"]
         if ball["held"] is None:
             ball["vy"] += 0.78 * dt
@@ -3006,27 +3050,11 @@ class SpatialDesktop(QWidget):
         dial = props["sundial"]
         dx, dy = dial["x"]*width, dial["y"]*height
         radius = min(width, height)*0.043
-        # Short, tapered stone pedestal supports the sundial plate.
-        pedestal_top = dy-radius*0.02
-        pedestal_bottom = dy+radius*0.78
-        pedestal = QPolygonF([
-            QPointF(dx-radius*0.48, pedestal_top),
-            QPointF(dx+radius*0.48, pedestal_top),
-            QPointF(dx+radius*0.36, pedestal_bottom),
-            QPointF(dx-radius*0.36, pedestal_bottom),
-        ])
-        painter.setPen(QPen(QColor(91, 91, 83, 235), max(1.0, radius*0.045)))
-        painter.setBrush(QColor(133, 137, 130))
-        painter.drawPolygon(pedestal)
-        painter.setPen(QPen(QColor(173, 176, 165, 230), max(1.0, radius*0.035)))
-        painter.setBrush(QColor(166, 169, 158))
-        painter.drawRoundedRect(QRectF(dx-radius*0.53, pedestal_top-radius*0.10,
-                                       radius*1.06, radius*0.18), radius*0.05, radius*0.05)
         painter.setPen(QPen(QColor(86, 87, 61, 220), max(1.0, radius*0.08)))
         painter.setBrush(QColor(198, 183, 126))
-        painter.drawEllipse(QPointF(dx, dy-radius*0.12), radius, radius*0.34)
+        painter.drawEllipse(QPointF(dx, dy), radius, radius*0.34)
         painter.setBrush(QColor(227, 215, 164))
-        painter.drawEllipse(QPointF(dx, dy-radius*0.18), radius*0.88, radius*0.29)
+        painter.drawEllipse(QPointF(dx, dy-radius*0.06), radius*0.88, radius*0.29)
         painter.setPen(QPen(QColor(122, 104, 63, 180), max(1.0, radius*0.025)))
         for i in range(12):
             a = i*math.pi/6
@@ -3034,50 +3062,13 @@ class SpatialDesktop(QWidget):
                              QPointF(dx+math.cos(a)*radius*0.80, dy-radius*0.06+math.sin(a)*radius*0.24))
         progress = float(scene.get("progress", 0.5))
         angle = (progress-0.5)*math.pi*0.92
-        gnomon_tip = QPointF(dx+math.cos(angle)*radius*0.18, dy-radius*0.18-math.sin(angle)*radius*1.05)
+        gnomon_tip = QPointF(dx+math.cos(angle)*radius*0.18, dy-radius*0.06-math.sin(angle)*radius*1.05)
         painter.setPen(QPen(QColor(91, 75, 43), max(2.0, radius*0.10), Qt.SolidLine, Qt.RoundCap))
-        painter.drawLine(QPointF(dx, dy-radius*0.18), gnomon_tip)
+        painter.drawLine(QPointF(dx, dy-radius*0.06), gnomon_tip)
         shadow_angle = angle + math.pi
         painter.setPen(QPen(QColor(52, 62, 42, 145), max(2.0, radius*0.09), Qt.SolidLine, Qt.RoundCap))
-        painter.drawLine(QPointF(dx, dy-radius*0.15),
-                         QPointF(dx+math.cos(shadow_angle)*radius*0.83, dy-radius*0.15+math.sin(shadow_angle)*radius*0.25))
-        # Bat-signal-inspired digital clock projection: a soft perspective beam rises
-        # from the sundial and lands on a wide, foreshortened clock display in the sky.
-        if bool(getattr(self, "_garden_clock_projection_enabled", False)):
-            elapsed = max(0.0, now - float(getattr(self, "_garden_clock_projection_started", now)))
-            pulse = 0.84 + 0.10 * math.sin(now * 2.2)
-            beam_top_y = height * 0.16
-            beam_half_width = width * 0.19
-            beam = QPolygonF([
-                QPointF(dx-radius*0.20, dy-radius*0.16),
-                QPointF(dx+radius*0.20, dy-radius*0.16),
-                QPointF(min(width*0.96, dx+beam_half_width), beam_top_y+height*0.035),
-                QPointF(max(width*0.04, dx-beam_half_width), beam_top_y+height*0.035),
-            ])
-            beam_gradient = QLinearGradient(dx, dy, dx, beam_top_y)
-            beam_gradient.setColorAt(0.0, QColor(113, 224, 255, int(25*pulse)))
-            beam_gradient.setColorAt(0.55, QColor(94, 205, 255, int(12*pulse)))
-            beam_gradient.setColorAt(1.0, QColor(114, 226, 255, int(3*pulse)))
-            painter.setPen(Qt.NoPen)
-            painter.setBrush(QBrush(beam_gradient))
-            painter.drawPolygon(beam)
-            display = QRectF(max(width*0.04, dx-beam_half_width), beam_top_y,
-                             min(width*0.92, beam_half_width*2), height*0.105)
-            painter.setBrush(QColor(31, 151, 206, int(32*pulse)))
-            painter.setPen(QPen(QColor(124, 225, 255, int(145*pulse)), max(1.0, height*0.0014)))
-            painter.drawRoundedRect(display, height*0.012, height*0.012)
-            # Perspective guide lines make the projection read as light cast into the sky.
-            painter.setPen(QPen(QColor(115, 223, 255, int(90*pulse)), max(1.0, height*0.001)))
-            painter.drawLine(QPointF(dx-radius*0.12, dy-radius*0.15), QPointF(display.left(), display.bottom()))
-            painter.drawLine(QPointF(dx+radius*0.12, dy-radius*0.15), QPointF(display.right(), display.bottom()))
-            painter.setPen(QColor(212, 249, 255, int(230*pulse)))
-            painter.setFont(QFont("Consolas", max(16, int(height*0.055)), QFont.Bold))
-            clock_text = datetime.now().strftime("%H:%M:%S")
-            painter.drawText(display.adjusted(0, 0, 0, -height*0.004), Qt.AlignCenter, clock_text)
-            painter.setFont(QFont("Consolas", max(7, int(height*0.012)), QFont.DemiBold))
-            painter.setPen(QColor(143, 224, 255, int(180*pulse)))
-            caption = "LOCAL TIME  •  SUNDIAL PROJECTION"
-            painter.drawText(display.adjusted(0, height*0.075, 0, height*0.015), Qt.AlignHCenter | Qt.AlignTop, caption)
+        painter.drawLine(QPointF(dx, dy-radius*0.03),
+                         QPointF(dx+math.cos(shadow_angle)*radius*0.83, dy-radius*0.03+math.sin(shadow_angle)*radius*0.25))
         painter.restore()
 
     def _paint_virtual_garden(self, painter, width, height):
@@ -3637,9 +3628,10 @@ class SpatialDesktop(QWidget):
             y += 70.0 + gap
         elif page == "sounds":
             for key, _label in SOUND_SETTING_ROWS:
-                stack("sound:" + key, h=48.0, after=8.0)
+                stack("sound:" + key, h=43.0, after=7.0)
             texts["help"] = (L, y, W, 42.0)
             y += 42.0 + gap
+            right_h = max(right_h, 340.0)
         elif page == "notifications":
             for key, _label, _default in NOTIFICATION_SETTING_ROWS:
                 stack("notify:" + key)
@@ -3763,47 +3755,44 @@ class SpatialDesktop(QWidget):
         return rects
 
     def _sound_dropdown_layout(self, cx, cy, scale):
-        key = self.sound_dropdown_key
-        if key not in dict(SOUND_SETTING_ROWS):
-            return {"panel": QRectF(), "items": []}
-        row_rect = self._settings_control_rects(cx, cy, scale, page="sounds").get("sound:" + key)
-        if row_rect is None:
-            return {"panel": QRectF(), "items": []}
+        # Persistent list in the right column, rather than a popup over the rows.
+        key = self.sound_dropdown_key or SOUND_SETTING_ROWS[0][0]
+        layout = self._settings_layout("sounds")
+        right = self.SETTINGS_RIGHT_X
+        top = layout["top"] + 2.0
+        item_h = 29.0 * scale
         options = ["None", *available_ui_sounds()]
-        item_h = 30.0 * scale
-        _panel_width, panel_height = self._menu_panel_dimensions("sounds")
-        panel_top = cy - panel_height * 0.5 * scale
-        panel_bottom = cy + panel_height * 0.5 * scale
-        max_items = max(1, int((panel_height * scale - 96.0 * scale) / max(1.0, item_h)))
+        max_items = max(1, int(330.0 / 29.0))
         options = options[:max_items]
-        height = len(options) * item_h
-        top = row_rect.bottom() + 4.0*scale
-        if top + height > panel_bottom - 48.0*scale:
-            top = row_rect.top() - height - 4.0*scale
-        top = max(panel_top + 44.0*scale, min(top, panel_bottom - height - 48.0*scale))
-        width = max(row_rect.width(), 220.0*scale)
-        left = max(row_rect.left(), self.hub_pos.x()*self.width() - 350.0*scale)
-        panel = QRectF(left, top, width, height)
-        return {"panel": panel, "items": [(value, QRectF(left, top+i*item_h, width, item_h))
-                                             for i, value in enumerate(options)]}
+        left = cx + right*scale
+        panel_top = cy + top*scale
+        width = self.SETTINGS_COLUMN_W*scale
+        panel = QRectF(left, panel_top, width, (len(options)+1)*item_h)
+        items = [(value, QRectF(left, panel_top+(i+1)*item_h, width, item_h))
+                 for i, value in enumerate(options)]
+        return {"panel": panel, "items": items, "key": key,
+                "header": QRectF(left, panel_top, width, item_h)}
 
     def _paint_sound_dropdown(self, painter, cx, cy, scale):
         layout = self._sound_dropdown_layout(cx, cy, scale)
         panel = layout["panel"]
-        if panel.isNull() or panel.isEmpty():
-            return
-        painter.setBrush(QBrush(QColor(5, 22, 35, 248)))
-        painter.setPen(QPen(QColor(155, 245, 255, 235), 1.5*scale))
+        painter.setBrush(QBrush(QColor(5, 22, 35, 238)))
+        painter.setPen(QPen(QColor(155, 245, 255, 210), 1.5*scale))
         painter.drawRoundedRect(panel, 10*scale, 10*scale)
-        selected = self.ui_preferences.get(self.sound_dropdown_key, "None")
+        painter.setPen(QColor(235, 250, 255))
+        painter.setFont(self._ui_font(max(7, int(9*scale)), QFont.DemiBold))
+        heading = dict(SOUND_SETTING_ROWS).get(layout["key"], "SOUND")
+        painter.drawText(layout["header"].adjusted(10*scale, 0, -6*scale, 0),
+                         Qt.AlignVCenter | Qt.AlignLeft, heading + "  ·  CHOOSE SOUND")
+        selected = self.ui_preferences.get(layout["key"], "None")
         for value, rect in layout["items"]:
-            painter.setBrush(QBrush(QColor(40, 115, 82, 235) if value == selected else QColor(18, 55, 75, 235)))
+            painter.setBrush(QBrush(QColor(40, 115, 82, 235) if value == selected else QColor(18, 55, 75, 220)))
             painter.setPen(QPen(QColor(110, 200, 220, 100), 0.7*scale))
             painter.drawRect(rect)
             painter.setPen(QColor(240, 252, 255))
             painter.setFont(self._ui_font(max(7, int(9*scale)), QFont.DemiBold))
             label = "None (silent)" if value == "None" else value
-            painter.drawText(rect.adjusted(10*scale, 0, -8*scale, 0), Qt.AlignVCenter | Qt.AlignLeft, label)
+            self._draw_fitted_button_label(painter, rect, label, base_size=max(7, int(9*scale)), min_size=6, inset=9*scale)
 
     def _notification_rect(self, position, width, height, margin=18):
         """Position a notification in one of six screen anchors."""
@@ -5713,24 +5702,6 @@ class SpatialDesktop(QWidget):
         # must not click an underlying application or the desktop.
         if self.menu_open and self.hub_visible and not self._canvas_menu_panel_contains(point):
             return
-        # In Garden Mode, clicking the sundial toggles its projected digital clock
-        # instead of being treated as an ordinary desktop click.
-        if (self.desktop_mode == "virtual" and getattr(self, "virtual_garden_mode", False)
-                and not self._gesture_ui_modal_open()):
-            dial = getattr(self, "_garden_props", {}).get("sundial")
-            if dial is not None:
-                width, height = max(1.0, float(self.width())), max(1.0, float(self.height()))
-                dx, dy = float(dial["x"]) * width, float(dial["y"]) * height
-                hit_rx = min(width, height) * 0.065
-                hit_ry = min(width, height) * 0.060
-                if ((float(point.x()) - dx) / hit_rx) ** 2 + ((float(point.y()) - dy) / hit_ry) ** 2 <= 1.0:
-                    self._garden_clock_projection_enabled = not bool(
-                        getattr(self, "_garden_clock_projection_enabled", False))
-                    self._garden_clock_projection_started = now
-                    self.status = ("Sundial clock projected into the sky" if self._garden_clock_projection_enabled
-                                   else "Sundial clock projection disabled")
-                    self.update()
-                    return
         self.click_side = side
         play_ui_sound(self.ui_preferences.get("sound_pinch", "None"))
         if self._canvas_menu_panel_contains(point):
@@ -5800,21 +5771,17 @@ class SpatialDesktop(QWidget):
             if self.settings_page == "gestures" and self.custom_gesture_dropdown is not None:
                 self._click_custom_gesture_dropdown(point, cx, cy, scale)
                 return
-            if self.settings_page == "sounds" and self.sound_dropdown_key is not None:
+            if self.settings_page == "sounds":
                 popup = self._sound_dropdown_layout(cx, cy, scale)
-                selected = None
                 for value, rect in popup.get("items", []):
                     if rect.contains(point):
-                        selected = value
-                        break
-                key = self.sound_dropdown_key
-                self.sound_dropdown_key = None
-                if selected is not None:
-                    self.ui_preferences[key] = selected
-                    save_ui_preferences(self.ui_preferences)
-                    self.status = f"{key.replace('sound_', '').replace('_', ' ').title()} sound: {selected}"
-                self.update()
-                return
+                        key = popup["key"]
+                        self.sound_dropdown_key = key
+                        self.ui_preferences[key] = value
+                        save_ui_preferences(self.ui_preferences)
+                        self.status = f"{key.replace('sound_', '').replace('_', ' ').title()} sound: {value}"
+                        self.update()
+                        return
 
             # Back and the three Settings sub-pages share a stable navigation row.
             if self._settings_back_rect(cx, cy, scale).contains(point):
@@ -6397,6 +6364,7 @@ class SpatialDesktop(QWidget):
             self.left_modifier_release_candidate_since = None
 
     def _reset_fist_gesture(self, side, release_mouse=True):
+        self._stop_timer_during_sound(f"fist:{side}")
         if release_mouse:
             self._release_fist_mouse(side)
         marker = getattr(self, "fist_scroll_markers", {}).get(side)
@@ -9597,6 +9565,47 @@ try {
             return 1.0
         return min(limit, max(1.0, full/max(flat, full/limit)))
 
+    def _paint_peace_sign_timer(self, painter, side, now):
+        """Show the SAME progress ring for disabling and re-enabling a hand.
+
+        Disabled hands intentionally have no TLI/cursor. The separate display-only
+        anchor captured from live hand landmarks remains available until the pose
+        ends, so the countdown never depends on enabled cursor tracking.
+        """
+        started = self.peace_hold_started.get(side)
+        if started is None or self.peace_toggle_latched.get(side, False):
+            return
+        points = self.hand_positions.get(side, [])
+        if len(points) < 21:
+            return  # No visible hand: never leave a phantom countdown on screen.
+        center = self.peace_timer_anchor_by_side.get(side)
+        if center is None:
+            # Defensive fallback for the first frame or restored state; disabled
+            # tracking must not prevent the countdown from being drawn.
+            center = self._scale_hand_tli_point(
+                self.interactive_hand_anchor(points, side), points, side)
+        if center is None:
+            return
+        center = QPointF(center)
+        elapsed = max(0.0, now-started)
+        duration = max(0.01, self.peace_toggle_hold_seconds)
+        progress = min(1.0, elapsed/duration)
+        remaining = max(0.0, duration-elapsed)
+        ring = QRectF(center.x()-32, center.y()-32, 64, 64)
+        painter.save()
+        try:
+            painter.setBrush(Qt.NoBrush)
+            painter.setPen(QPen(QColor(255, 220, 110, 100), 3))
+            painter.drawEllipse(ring)
+            painter.setPen(QPen(QColor(255, 220, 110, 248), 4))
+            painter.drawArc(ring, 90*16, -int(progress*360*16))
+            painter.setPen(QColor(255, 242, 205, 245))
+            painter.setFont(self._ui_font(8, QFont.DemiBold))
+            painter.drawText(QRectF(center.x()-22, center.y()+23, 44, 16),
+                             Qt.AlignCenter, f"{remaining:.1f}s")
+        finally:
+            painter.restore()
+
     def _paint_gesture_disabled_indicator(self, painter, points, side):
         """Draw a red prohibition badge over a hand whose gesture input is disabled."""
         if (not getattr(self, "show_gesture_disabled_indicator", True) or
@@ -10432,10 +10441,10 @@ try {
         """Keep a disabled-hand notice persistent; show a timed enabled message otherwise."""
         now = time.monotonic() if now is None else now
         disabled = [side.title() for side in ("left", "right")
-                    if self.mouse_detached_by_side.get(side, False)]
+                    if not self.gesture_tracking_enabled.get(side, True)]
         if disabled:
             label = " & ".join(disabled)
-            self.hand_tracking_notice_text = f"{label} mouse detached"
+            self.hand_tracking_notice_text = f"{label} cursor + gestures detached"
             self.hand_tracking_notice_until = float("inf")
         elif show_enabled:
             self.hand_tracking_notice_text = "Hand tracking enabled"
@@ -10529,14 +10538,38 @@ try {
         self.modifier_click_last_pose_at[side] = None
         self.modifier_click_armed[side] = True
 
+    def _stop_timer_during_sound(self, key):
+        """End one gesture's audio at the same moment its hold/countdown ends."""
+        stop_event = self._timer_during_sound_stop_events.pop(key, None)
+        if stop_event is not None:
+            stop_event.set()
+        self._timer_during_sound_played_at.pop(key, None)
+
+    def _stop_inactive_timer_during_sounds(self):
+        """End sounds whose timers vanished during this hand-tracking frame."""
+        for key in list(self._timer_during_sound_stop_events):
+            if key not in self._timer_during_sound_seen_keys:
+                self._stop_timer_during_sound(key)
+        self._timer_during_sound_seen_keys.clear()
+
     def _maybe_play_timer_during_sound(self, key, started_at, now):
-        """Play timer-during feedback only after a gesture has held for 200 ms."""
-        if started_at is None or now - float(started_at) < 0.2:
+        """Play after 200 ms; keep it cancellable while this timer is visible."""
+        if started_at is None:
+            self._stop_timer_during_sound(key)
             return
+        self._timer_during_sound_seen_keys.add(key)
         if self._timer_during_sound_played_at.get(key) == started_at:
             return
+        # A new hold must never inherit a sound from the previous hold.
+        if key in self._timer_during_sound_stop_events:
+            self._stop_timer_during_sound(key)
+        if now - float(started_at) < 0.2:
+            return
         self._timer_during_sound_played_at[key] = started_at
-        play_ui_sound(self.ui_preferences.get("sound_gesture_timer_during", "None"))
+        stop_event = threading.Event()
+        self._timer_during_sound_stop_events[key] = stop_event
+        play_ui_sound(self.ui_preferences.get("sound_gesture_timer_during", "None"),
+                      stop_event=stop_event)
 
     def _menu_pinch_elapsed_seconds(self, side, now=None):
         """Count only held pinch time after the continuous pinch confirmation buffer."""
@@ -10565,6 +10598,7 @@ try {
         self.menu_pinch_latched.discard(side)
 
     def _clear_menu_pinch_sequence(self, side):
+        self._stop_timer_during_sound(f"pinch_menu:{side}")
         self.menu_pinch_started[side] = None
         self.menu_pinch_accumulated_seconds[side] = 0.0
         self.menu_pinch_pulse_started_at[side] = None
@@ -11036,6 +11070,8 @@ try {
         """Run Garden Mode at 60 Hz; otherwise use active/idle UI cadence."""
         if getattr(self, "virtual_garden_mode", False):
             desired_ms = 16
+        elif self.menu_open and self.hub_visible:
+            desired_ms = 70 if hand_present or not self._scene_is_idle(now) else 100
         else:
             desired_ms = 50 if hand_present or not self._scene_is_idle(now) else 100
         timer = getattr(self, "timer", None)
@@ -11353,6 +11389,7 @@ try {
         """Mutually-exclusive quick clicks, direct fist manipulation, and Pinch Menu gestures."""
         # Track which hand toggled this frame so only that hand's gesture processing pauses.
         gesture_tracking_just_toggled = set()
+        self._timer_during_sound_seen_keys.clear()
         self._remember_external_foreground_window()
         now = time.monotonic()
         previous_scene_time = getattr(self, "_last_update_scene_time", now)
@@ -11374,6 +11411,7 @@ try {
             self.depth += (self.target_depth-self.depth)*0.16
             self._adjust_scene_timer_cadence(False, now)
             self._request_scene_repaint(now)
+            self._stop_inactive_timer_during_sounds()
             return
         detected_hands, _frame_id = self.tracker.snapshot()
         hands_by_side = {}
@@ -11401,6 +11439,7 @@ try {
             self._collect_hand_calibration_frame(hands_by_side)
             self.depth += (self.target_depth-self.depth)*0.16
             self.update()
+            self._stop_inactive_timer_during_sounds()
             return
 
         menu_state = bool(self.menu_open and self.hub_visible)
@@ -11465,31 +11504,43 @@ try {
                              cursor.x() >= edge_width*0.955 or
                              cursor.y() <= edge_height*0.055 or
                              cursor.y() >= edge_height*0.945)
-            # Peace sign is the single per-hand toggle for both cursor and gesture tracking.
-            # It remains detectable while tracking is disabled so the same gesture can re-enable it.
+            # Peace sign is the combined per-hand cursor + gesture tracking toggle.
+            # It is recognized even while tracking is disabled so it can re-enable it.
             peace = False if calibration_modal_frame else self._is_peace_sign(landmarks)
             if peace:
+                # This display-only anchor is deliberately separate from
+                # side_cursor_positions, which becomes None when tracking is disabled.
+                # It never drives pointer movement or any interaction.
+                self.peace_timer_anchor_by_side[side] = QPointF(cursor)
                 if self.peace_hold_started[side] is None:
                     self.peace_hold_started[side] = now
-                if (now-self.peace_hold_started[side] >= self.peace_toggle_hold_seconds
+                # The same selected "gesture timer during" sound accompanies both
+                # disabling and re-enabling tracking. Play it once per held pose.
+                if not self.peace_toggle_latched[side]:
+                    self._maybe_play_timer_during_sound(
+                        f"peace_toggle:{side}", self.peace_hold_started[side], now)
+                if (now - self.peace_hold_started[side] >= self.peace_toggle_hold_seconds
                         and not self.peace_toggle_latched[side]):
                     enabled = not self.gesture_tracking_enabled.get(side, True)
                     self.gesture_tracking_enabled[side] = enabled
+                    self.mouse_detached_by_side[side] = not enabled
                     self.peace_toggle_latched[side] = True
+                    self._stop_timer_during_sound(f"peace_toggle:{side}")
                     gesture_tracking_just_toggled.add(side)
-                    # There is no separate cursor-detach state anymore: peace sign
-                    # switches native cursor and gesture handling together.
-                    self.mouse_detached_by_side[side] = False
                     state = "enabled" if enabled else "disabled"
                     self.status = f"{side.title()} hand cursor and gestures {state}"
-                    self.hand_tracking_notice_text = f"{side.title()} hand cursor + gestures {state}"
-                    self.hand_tracking_notice_until = now + 5.0
+                    if enabled and all(self.gesture_tracking_enabled.get(other, True)
+                                       for other in ("left", "right") if other != side):
+                        self.hand_tracking_notice_text = f"{side.title()} cursor + gestures enabled"
+                        self.hand_tracking_notice_until = now + 5.0
+                    else:
+                        self._refresh_hand_tracking_notice(now)
+                    self.tts.speak(f"{side} {state}.")
                     self.menu_pinch_started[side] = None
                     self.fist_started_at[side] = None
                     self.action_stop_wait_open[side] = True
                     self.action_stop_open_since[side] = None
                     if not enabled:
-                        self._cancel_side_interactions_for_tracking_pause(side)
                         self._end_pinch_drag(side, status=False)
                         self.active_action[side] = None
                         self.fist_action_menu_open[side] = False
@@ -11497,18 +11548,18 @@ try {
                         if self.gesture_owner == side:
                             self.gesture_owner = None
                     else:
-                        # Do not let the held peace sign immediately trigger another action.
                         self.side_cursor_positions[side] = None
                         self.smoothed_side_cursor_positions[side] = None
                         self.cursor_updated_at[side] = 0.0
                         self.tli_overrides.pop(side, None)
             else:
+                self._stop_timer_during_sound(f"peace_toggle:{side}")
                 self.peace_hold_started[side] = None
                 self.peace_toggle_latched[side] = False
+                self.peace_timer_anchor_by_side[side] = None
 
-            # Gesture tracking and cursor/TLI tracking are one per-hand switch. Keep the
-            # camera landmarks in hand_positions so the virtual hand stays visible and the
-            # thumbs-up can re-enable the hand, but do not provide a moving cursor while off.
+            # Disabled hands retain visible landmarks and peace-sign recognition,
+            # but must never drive the native pointer or other gestures.
             if not self.gesture_tracking_enabled.get(side, True):
                 self.side_cursor_positions[side] = None
                 self.smoothed_side_cursor_positions[side] = None
@@ -11647,6 +11698,7 @@ try {
             self.active_push_sides = set()
             self.depth += (self.target_depth-self.depth)*0.16
             self.update()
+            self._stop_inactive_timer_during_sounds()
             return
 
         if self._process_middle_pinch_zoom(cursor_points, poses, now):
@@ -11656,6 +11708,7 @@ try {
             self.active_push_sides.clear()
             self.depth += (self.target_depth-self.depth)*0.16
             self._request_scene_repaint(now)
+            self._stop_inactive_timer_during_sounds()
             return
 
         self._process_custom_gestures(hands_by_side, cursor_points, poses, now)
@@ -11694,6 +11747,7 @@ try {
                     self._set_os_pointer(cursor_points[mouse_side])
             self.depth += (self.target_depth-self.depth)*0.16
             self._request_scene_repaint(now)
+            self._stop_inactive_timer_during_sounds()
             return
 
         preferred = self.cursor_lock_priority if self.cursor_lock_priority in ("left", "right") else "right"
@@ -12015,63 +12069,6 @@ try {
                   and not self.floating_clipboard_visible and not self._virtual_pen_ui_contains(cursor)):
                 if self._handle_virtual_pen_frame(side, cursor, is_pinch, now):
                     continue
-
-            # Garden ball drag: pinch directly on the ball to pick it up, move while
-            # holding the pinch, then release to drop. This intentionally bypasses the
-            # normal Pinch Menu hold timer and its timer-during sound.
-            garden_active = (self.desktop_mode == "virtual" and
-                             getattr(self, "virtual_garden_mode", False) and
-                             not self._gesture_ui_modal_open())
-            garden_props = getattr(self, "_garden_props", {}) if garden_active else {}
-            garden_ball = garden_props.get("ball") if isinstance(garden_props, dict) else None
-            if garden_ball is not None:
-                if garden_ball.get("held") == side:
-                    if is_pinch and cursor is not None:
-                        garden_ball["x"] = float(cursor.x()) / max(1.0, float(self.width()))
-                        garden_ball["y"] = float(cursor.y()) / max(1.0, float(self.height()))
-                        garden_ball["vx"] = garden_ball["vy"] = 0.0
-                        if not hasattr(self, "_garden_ball_last_cursor"):
-                            self._garden_ball_last_cursor = {}
-                        self._garden_ball_last_cursor[side] = (float(cursor.x()), float(cursor.y()))
-                        self._clear_menu_pinch_sequence(side)
-                        continue
-                    garden_ball["held"] = None
-                    # Give a small natural toss based on the last hand movement.
-                    last = getattr(self, "_garden_ball_last_cursor", {}).get(side)
-                    if last is not None and cursor is not None:
-                        garden_ball["vx"] = max(-0.9, min(0.9, (float(cursor.x())-last[0]) / max(1.0, self.width()) * 8.0))
-                        garden_ball["vy"] = max(-0.9, min(0.9, (float(cursor.y())-last[1]) / max(1.0, self.height()) * 8.0))
-                    self._clear_menu_pinch_sequence(side)
-                    self.status = "Garden ball dropped"
-                    self.update()
-                    continue
-                if (is_pinch and cursor is not None and garden_ball.get("held") is None):
-                    bw, bh = max(1.0, float(self.width())), max(1.0, float(self.height()))
-                    bx, by = float(garden_ball["x"])*bw, float(garden_ball["y"])*bh
-                    br = float(garden_ball.get("r", 0.027))*bh
-                    # Forgiving pickup radius around the visible ball, suitable for the TLI.
-                    hit_rx = br + max(22.0, min(bw, bh)*0.018)
-                    hit_ry = br + max(22.0, min(bw, bh)*0.018)
-                    if ((float(cursor.x())-bx)/hit_rx)**2 + ((float(cursor.y())-by)/hit_ry)**2 <= 1.0:
-                        garden_ball["held"] = side
-                        garden_ball["x"] = float(cursor.x())/bw
-                        garden_ball["y"] = float(cursor.y())/bh
-                        garden_ball["vx"] = garden_ball["vy"] = 0.0
-                        if not hasattr(self, "_garden_ball_last_cursor"):
-                            self._garden_ball_last_cursor = {}
-                        self._garden_ball_last_cursor[side] = (float(cursor.x()), float(cursor.y()))
-                        self._clear_menu_pinch_sequence(side)
-                        self.gesture_owner = side
-                        self.canvas_active_side = side
-                        self.status = "Garden ball picked up — move while pinching; release to drop"
-                        self.update()
-                        continue
-                # Keep the last cursor for release momentum; don't retain stale samples
-                # across frames where this hand is no longer tracked.
-                if cursor is not None:
-                    if not hasattr(self, "_garden_ball_last_cursor"):
-                        self._garden_ball_last_cursor = {}
-                    self._garden_ball_last_cursor[side] = (float(cursor.x()), float(cursor.y()))
 
             # A moving held pinch is a native click-and-hold drag. Consume every frame
             # until release, so the same gesture cannot also fire a quick click or menu.
@@ -12435,6 +12432,7 @@ try {
                                 self.active_push_sides.clear()
                                 self.depth += (self.target_depth-self.depth)*0.16
                                 self.update()
+                                self._stop_inactive_timer_during_sounds()
                                 return
                             self.menu_pinch_click_fired[side] = True
                         if pinch_timer_gap_restarts_buffer(
@@ -12537,6 +12535,7 @@ try {
                                 self.active_push_sides.clear()
                                 self.depth += (self.target_depth-self.depth)*0.16
                                 self.update()
+                                self._stop_inactive_timer_during_sounds()
                                 return
                             self.menu_pinch_click_fired[side] = True
                     # A release before confirmation expires cancels the sequence once stable.
@@ -12826,6 +12825,7 @@ try {
                                 self.active_push_sides.clear()
                                 self.depth += (self.target_depth-self.depth)*0.16
                                 self.update()
+                                self._stop_inactive_timer_during_sounds()
                                 return
                     # A long fist has already started manipulation; it cannot also click on release.
                     self._reset_fist_gesture(side)
@@ -12863,10 +12863,13 @@ try {
             if mouse_side in cursor_points:
                 self._set_os_pointer(cursor_points[mouse_side])
 
+        self._stop_inactive_timer_during_sounds()
         self.depth += (self.target_depth-self.depth)*0.16
         self._request_scene_repaint(now)
 
     def closeEvent(self, event):
+        for key in list(self._timer_during_sound_stop_events):
+            self._stop_timer_during_sound(key)
         if getattr(self, "virtual_pen_active_stroke", None) is not None:
             self._finish_virtual_pen_stroke()
         pending_virtual_save = getattr(self, "virtual_desktop_save_timer", None)
@@ -13710,13 +13713,14 @@ try {
                             if rect is None:
                                 continue
                             selected_sound = self.ui_preferences.get(key, "None") or "None"
-                            painter.setBrush(QBrush(QColor(10, 47, 67, 242)))
-                            painter.setPen(QPen(QColor(140, 230, 240, 235), 1.7*scale))
+                            active = key == (self.sound_dropdown_key or SOUND_SETTING_ROWS[0][0])
+                            painter.setBrush(QBrush(QColor(45, 118, 78, 242) if active else QColor(10, 47, 67, 242)))
+                            painter.setPen(QPen(QColor(160, 245, 185, 235) if active else QColor(140, 230, 240, 235), 1.7*scale))
                             painter.drawRoundedRect(rect, 10*scale, 10*scale)
                             painter.setPen(QColor(237, 252, 255))
                             display_sound = selected_sound if selected_sound != "None" else "None (silent)"
                             self._draw_fitted_button_label(
-                                painter, rect, f"{label}     {display_sound}   ▾",
+                                painter, rect, f"{label}  ·  {display_sound}",
                                 base_size=max(7, int(8.5*scale)), min_size=6, inset=12*scale)
                         help_rect = text_rects.get("help")
                         if help_rect is not None:
@@ -13894,7 +13898,7 @@ try {
                     if self.settings_page == "gestures" and self.custom_gesture_dropdown is not None:
                         # Painted after the sliders so the open list sits on top of them.
                         self._paint_custom_gesture_dropdown(painter, cx, cy, scale)
-                    if self.settings_page == "sounds" and self.sound_dropdown_key is not None:
+                    if self.settings_page == "sounds":
                         self._paint_sound_dropdown(painter, cx, cy, scale)
             painter.restore()
 
@@ -13968,7 +13972,7 @@ try {
                 self._paint_hand_skeleton(painter, points, side)
                 self._paint_gesture_disabled_indicator(painter, points, side)
                 # Keep the virtual skeleton visible when a hand is disabled, but remove
-                # its moving TLI/cursor until a peace sign re-enables tracking.
+                # its moving TLI/cursor until peace sign re-enables tracking.
                 if self.gesture_tracking_enabled.get(side, True):
                     cursor = self.side_cursor_positions.get(side)
                     if cursor is None:
@@ -13977,28 +13981,10 @@ try {
                     engaged = side in self.active_push_sides or (self.click_side == side and now < self.click_flash_until)
                     self._paint_tli(painter, cursor, side, engaged)
 
-            # Peace-sign tracking toggle shows a hold ring until the combined switch fires.
+            # One countdown renderer for both ON->OFF and OFF->ON, even though
+            # OFF hands deliberately have no live TLI or side cursor.
             for side in ("left", "right"):
-                peace_started = self.peace_hold_started.get(side)
-                if peace_started is None or self.peace_toggle_latched.get(side, False):
-                    continue
-                cursor = self.side_cursor_positions.get(side)
-                if cursor is None:
-                    continue
-                cursor = self._visual_tli_position(side, cursor)
-                elapsed = max(0.0, now-peace_started)
-                progress = min(1.0, elapsed/max(0.01, self.peace_toggle_hold_seconds))
-                remaining = max(0.0, self.peace_toggle_hold_seconds-elapsed)
-                ring = QRectF(cursor.x()-32, cursor.y()-32, 64, 64)
-                painter.setBrush(Qt.NoBrush)
-                painter.setPen(QPen(QColor(255, 220, 110, 100), 3))
-                painter.drawEllipse(ring)
-                painter.setPen(QPen(QColor(255, 220, 110, 248), 4))
-                painter.drawArc(ring, 90*16, -int(progress*360*16))
-                painter.setPen(QColor(255, 242, 205, 245))
-                painter.setFont(self._ui_font(8, QFont.DemiBold))
-                painter.drawText(QRectF(cursor.x()-22, cursor.y()+23, 44, 16), Qt.AlignCenter,
-                                 f"{remaining:.1f}s")
+                self._paint_peace_sign_timer(painter, side, now)
 
             # Custom gestures with their circle timer on show a filling ring at the TLI
             # (midway between both TPIs for the overlap gesture) until the gesture fires.
