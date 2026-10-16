@@ -2124,6 +2124,14 @@ class SpatialDesktop(QWidget):
         self.virtual_garden_mode = self.virtual_scene == "garden"
         self.virtual_space_mode = self.virtual_scene == "space"
         self.space_constellations = list(self.virtual_desktop_data.get("constellations", []))
+        # Play-based onboarding is contextual, not a modal calibration wizard.
+        self._scene_tutorial_steps = set()
+        self._scene_arrow_pinch_previous = {"left": False, "right": False}
+        self._scene_arrow_pinch_latched = {"left": False, "right": False}
+        self._scene_transition = None
+        self._space_constellation_revision = 0
+        self._garden_constellation_cache = None
+        self._garden_constellation_cache_key = None
         self.space_drawing_by_side = {"left": None, "right": None, "mouse": None}
         self.space_clear_press_latch = {"left": False, "right": False}
         self._space_stars = self._make_space_stars()
@@ -2520,7 +2528,7 @@ class SpatialDesktop(QWidget):
         self.custom_key_capture_poll_timer = QTimer(self)
         self.custom_key_capture_poll_timer.setInterval(20)
         self.custom_key_capture_poll_timer.timeout.connect(self._poll_custom_key_capture)
-        QTimer.singleShot(1200, self._maybe_start_hand_onboarding)
+        # Open with the existing glass menu; hand calibration stays available in Hands settings.
         QTimer.singleShot(2400, self.speak_startup_greeting)
 
     def schedule_gesture_settings_save(self):
@@ -2637,6 +2645,26 @@ class SpatialDesktop(QWidget):
 
     def _paint_virtual_background(self, painter, width, height):
         """Paint the active Virtual desktop scene (grid canvas or separate Garden scene)."""
+        slide = getattr(self, "_scene_transition", None)
+        if slide is not None:
+            elapsed = max(0.0, time.monotonic()-slide["started"])
+            amount = min(1.0, elapsed / slide["duration"])
+            if amount >= 1.0:
+                self._scene_transition = None
+            else:
+                # Smooth movement of two *cached* scene images; avoid re-rendering
+                # the whole Garden and Space scenes on every transition frame.
+                eased = amount * amount * (3.0-2.0*amount)
+                travel = float(height) * eased
+                direction = -1.0 if slide["from"] == "garden" else 1.0
+                painter.save()
+                try:
+                    painter.setClipRect(QRectF(0, 0, width, height))
+                    painter.drawImage(QPointF(0, direction*travel), slide["source"])
+                    painter.drawImage(QPointF(0, direction*(travel-height)), slide["target"])
+                finally:
+                    painter.restore()
+                return
         if getattr(self, "virtual_garden_mode", False):
             self._paint_virtual_garden(painter, width, height)
             return
@@ -3125,6 +3153,14 @@ class SpatialDesktop(QWidget):
         painter.restore()
 
     def mousePressEvent(self, event):
+        if event.button() == Qt.LeftButton and self.desktop_mode == "virtual":
+            if self._scene_transition is not None:
+                event.accept()
+                return
+            if not self._gesture_ui_modal_open() and self._scene_arrow_hit(event.position()):
+                self._start_scene_slide(time.monotonic())
+                event.accept()
+                return
         if (event.button() == Qt.LeftButton and self.desktop_mode == "virtual" and
                 self.virtual_space_mode and not self._gesture_ui_modal_open()):
             point = event.position()
@@ -3150,6 +3186,7 @@ class SpatialDesktop(QWidget):
                 ball["last_drag_at"] = time.monotonic()
                 ball["vx"] = ball["vy"] = 0.0
                 self.status = "Garden ball picked up"
+                self._scene_tutorial_steps.add("ball")
                 self.update()
                 event.accept()
                 return
@@ -3233,6 +3270,7 @@ class SpatialDesktop(QWidget):
 
     def _garden_toggle_sundial(self, now):
         self._garden_sundial_projection_active = not self._garden_sundial_projection_active
+        self._scene_tutorial_steps.add("sundial")
         self.status = ("Sundial sky clock enabled" if self._garden_sundial_projection_active
                        else "Sundial sky clock disabled")
         self.update()
@@ -3292,6 +3330,7 @@ class SpatialDesktop(QWidget):
             ball["vx"] = ball["vy"] = 0.0
             self.gesture_owner = side
             self.status = "Garden ball picked up — move while pinching, release to drop"
+            self._scene_tutorial_steps.add("ball")
         if is_pinch:
             ball["release_since"] = None
             width, height = max(1.0, float(self.width())), max(1.0, float(self.height()))
@@ -3522,12 +3561,217 @@ class SpatialDesktop(QWidget):
         painter.save()
         painter.setRenderHint(QPainter.Antialiasing, False)
         painter.drawImage(QPointF(0, 0), background)
+        # Stars drawn in Space persist in the Garden sky when it is actually night.
+        # The constellation layer is cached independently of Garden's weather cache.
+        self._paint_garden_constellations(painter, width, height, scene)
         self._paint_garden_weather_effects(painter, width, height, scene)
         self._paint_garden_sky_clock(painter, width, height, scene)
         self._paint_garden_props(painter, width, height, scene)
         self._paint_garden_grass(painter, width, height, scene)
         self._paint_garden_weather_label(painter, width, height, scene)
+        self._paint_scene_arrow(painter, width, height, "garden")
+        self._paint_scene_tutorial_hint(painter, width, height, "garden", scene)
         painter.restore()
+
+    def _scene_arrow_rect(self, scene=None, width=None, height=None):
+        """Same arrow geometry for painting, mouse clicks and hand hit-testing."""
+        scene = self.virtual_scene if scene is None else scene
+        width = float(self.width() if width is None else width)
+        height = float(self.height() if height is None else height)
+        if scene not in ("garden", "space"):
+            return QRectF()
+        y = 22.0 if scene == "garden" else max(8.0, height-95.0)
+        return QRectF(max(8.0, (width-206.0)/2.0), y, min(206.0, width-16.0), 55.0)
+
+    def _scene_arrow_hit(self, point):
+        return bool(point is not None and self.desktop_mode == "virtual" and
+                    self.virtual_scene in ("garden", "space") and
+                    self._scene_transition is None and
+                    not self._gesture_ui_modal_open() and
+                    self._scene_arrow_rect().contains(point))
+
+    def _paint_scene_arrow(self, painter, width, height, scene):
+        rect = self._scene_arrow_rect(scene, width, height)
+        if rect.isEmpty():
+            return
+        painter.save()
+        try:
+            painter.setRenderHint(QPainter.Antialiasing, True)
+            painter.setPen(QPen(QColor(162, 214, 251, 175), 1.25))
+            painter.setBrush(QColor(11, 25, 51, 195) if scene == "garden"
+                             else QColor(18, 22, 58, 210))
+            painter.drawRoundedRect(rect, 16.0, 16.0)
+            x = rect.left() + 27.0
+            y = rect.center().y()
+            direction = -1.0 if scene == "garden" else 1.0
+            painter.setPen(QPen(QColor(203, 244, 255, 245), 3.0,
+                                Qt.SolidLine, Qt.RoundCap, Qt.RoundJoin))
+            painter.drawLine(QPointF(x, y+direction*-11.0), QPointF(x, y+direction*11.0))
+            painter.drawLine(QPointF(x, y+direction*11.0),
+                             QPointF(x-9.0, y+direction*2.0))
+            painter.drawLine(QPointF(x, y+direction*11.0),
+                             QPointF(x+9.0, y+direction*2.0))
+            painter.setPen(QColor(234, 245, 255))
+            painter.setFont(self._ui_font(9, QFont.DemiBold))
+            painter.drawText(rect.adjusted(48.0, 0.0, -7.0, 0.0),
+                             Qt.AlignVCenter | Qt.AlignLeft,
+                             "EXPLORE STARS" if scene == "garden" else "BACK TO GARDEN")
+        finally:
+            painter.restore()
+
+    def _paint_scene_tutorial_hint(self, painter, width, height, scene, weather=None):
+        """Unintrusive play prompts, advanced by real interactions in each scene."""
+        steps = self._scene_tutorial_steps
+        if scene == "garden":
+            if self.space_constellations and "constellation" in steps:
+                hint = ("Look up! Your constellations shine in the night sky."
+                        if weather is not None and not weather.get("is_day", True)
+                        else "Your constellations will appear in this sky at night.")
+            elif "ball" not in steps:
+                hint = "TRY IT  ·  Pinch and carry the bouncing ball"
+            elif "sundial" not in steps:
+                hint = "TRY IT  ·  Tap the sundial to project the time"
+            elif "space" not in steps:
+                hint = "NEXT  ·  Select the up arrow to explore the stars"
+            else:
+                return
+        elif scene == "space":
+            hint = ("TRY IT  ·  Pinch a star, trace to others, then release"
+                    if "constellation" not in steps
+                    else "NEXT  ·  Use the down arrow to see your stars in Garden")
+        else:
+            return
+        painter.save()
+        try:
+            painter.setRenderHint(QPainter.Antialiasing, True)
+            painter.setFont(self._ui_font(9, QFont.DemiBold))
+            available = max(170.0, width-40.0)
+            text_width = min(available, QFontMetricsF(painter.font()).horizontalAdvance(hint)+30.0)
+            y = 95.0 if scene == "garden" else 104.0
+            bubble = QRectF(24.0, y, text_width, 33.0)
+            painter.setPen(QPen(QColor(130, 200, 248, 70), 1.0))
+            painter.setBrush(QColor(8, 21, 43, 175))
+            painter.drawRoundedRect(bubble, 10.0, 10.0)
+            painter.setPen(QColor(228, 247, 255, 238))
+            painter.drawText(bubble.adjusted(12.0, 0.0, -6.0, 0.0),
+                             Qt.AlignVCenter | Qt.AlignLeft, hint)
+        finally:
+            painter.restore()
+
+    def _render_scene_slide_frame(self, scene):
+        """Capture each scene once; the transition itself only moves these images."""
+        width, height = max(1, self.width()), max(1, self.height())
+        image = QImage(width, height, QImage.Format.Format_RGB32)
+        image.fill(QColor(4, 11, 29))
+        painter = QPainter(image)
+        try:
+            if scene == "garden":
+                self._paint_virtual_garden(painter, width, height)
+            else:
+                self._paint_virtual_space(painter, width, height)
+        finally:
+            painter.end()
+        return image
+
+    def _start_scene_slide(self, now):
+        """Slide vertically between the two playable virtual scenes, without blocking input."""
+        if (self._scene_transition is not None or self.desktop_mode != "virtual" or
+                self.virtual_scene not in ("garden", "space") or self._gesture_ui_modal_open()):
+            return False
+        source_scene = self.virtual_scene
+        target_scene = "space" if source_scene == "garden" else "garden"
+        source_image = self._render_scene_slide_frame(source_scene)
+        self._set_virtual_scene(target_scene)
+        self._scene_tutorial_steps.add("space" if target_scene == "space" else "returned")
+        target_image = self._render_scene_slide_frame(target_scene)
+        self._scene_transition = {
+            "from": source_scene, "to": target_scene, "started": now,
+            "duration": 0.90, "source": source_image, "target": target_image,
+        }
+        self.status = ("Ascending into Space View" if target_scene == "space"
+                       else "Descending into the Garden")
+        self.update()
+        return True
+
+    def _scene_arrow_handle_frame(self, side, cursor, landmarks, now, edge_tolerant=False):
+        """Prioritise arrow pinch-clicks and silence menus while hovering arrows."""
+        is_pinch = (not is_fist_or_grip_pose(landmarks, edge_tolerant=edge_tolerant)
+                    and self._garden_object_pinch(landmarks,
+                        held=self._scene_arrow_pinch_latched.get(side, False)))
+        previous = self._scene_arrow_pinch_previous.get(side, False)
+        self._scene_arrow_pinch_previous[side] = bool(is_pinch)
+        if self._scene_transition is not None:
+            self._clear_menu_pinch_sequence(side)
+            self._reset_fist_gesture(side)
+            if not is_pinch:
+                self._scene_arrow_pinch_latched[side] = False
+            return True
+        if self._scene_arrow_pinch_latched.get(side, False):
+            self._clear_menu_pinch_sequence(side)
+            if not is_pinch:
+                self._scene_arrow_pinch_latched[side] = False
+            return True
+        if not self._scene_arrow_hit(cursor):
+            return False
+        self._clear_menu_pinch_sequence(side)
+        self._reset_fist_gesture(side)
+        if is_pinch and not previous:
+            if self._start_scene_slide(now):
+                self._scene_arrow_pinch_latched[side] = True
+        return True  # Hover itself should never start the Pinch Menu or fist scroll.
+
+    def _paint_garden_constellations(self, painter, width, height, scene):
+        """Draw saved Space constellations over the Garden sky, at night only."""
+        if scene.get("is_day", True) or not self.space_constellations:
+            return
+        size = (max(1, int(width)), max(1, int(height*0.57)))
+        key = (size, self._space_constellation_revision)
+        if self._garden_constellation_cache is None or self._garden_constellation_cache_key != key:
+            overlay = QImage(size[0], size[1], QImage.Format.Format_ARGB32_Premultiplied)
+            overlay.fill(Qt.transparent)
+            layer = QPainter(overlay)
+            try:
+                layer.setRenderHint(QPainter.Antialiasing, True)
+                # The Space star identities and line topology are unchanged. Only
+                # project their positions into the Garden's upper sky region.
+                for constellation in self.space_constellations:
+                    points = []
+                    for star_id in constellation.get("stars", []):
+                        if type(star_id) is int and 0 <= star_id < len(self._space_stars):
+                            sx, sy = self._space_stars[star_id][:2]
+                            points.append(QPointF(width*(0.08+0.84*sx),
+                                                  height*(0.065+0.50*sy)))
+                    if len(points) < 2:
+                        continue
+                    path = QPainterPath(points[0])
+                    for point in points[1:]:
+                        path.lineTo(point)
+                    layer.setBrush(Qt.NoBrush)
+                    layer.setPen(QPen(QColor(63, 177, 255, 42), 9.0,
+                                      Qt.SolidLine, Qt.RoundCap, Qt.RoundJoin))
+                    layer.drawPath(path)
+                    layer.setPen(QPen(QColor(151, 213, 255, 160), 3.0,
+                                      Qt.SolidLine, Qt.RoundCap, Qt.RoundJoin))
+                    layer.drawPath(path)
+                    layer.setPen(QPen(QColor(238, 252, 255, 210), 1.25,
+                                      Qt.SolidLine, Qt.RoundCap, Qt.RoundJoin))
+                    layer.drawPath(path)
+                    layer.setPen(Qt.NoPen)
+                    for point in points:
+                        layer.setBrush(QColor(126, 201, 255, 70))
+                        layer.drawEllipse(point, 6.0, 6.0)
+                        layer.setBrush(QColor(246, 251, 255, 245))
+                        layer.drawEllipse(point, 2.3, 2.3)
+            finally:
+                layer.end()
+            self._garden_constellation_cache = overlay
+            self._garden_constellation_cache_key = key
+        painter.save()
+        try:
+            painter.setOpacity(max(0.18, 1.0-0.80*float(scene.get("cloudiness", 0.0))))
+            painter.drawImage(QPointF(0, 0), self._garden_constellation_cache)
+        finally:
+            painter.restore()
 
     @staticmethod
     def _make_space_stars():
@@ -3544,6 +3788,7 @@ class SpatialDesktop(QWidget):
     def _set_virtual_scene(self, scene):
         if scene not in VIRTUAL_SCENES or scene == self.virtual_scene:
             return
+        self._scene_transition = None
         self._finish_virtual_pen_stroke()
         for side in ("left", "right", "mouse"):
             self._space_finish_constellation(side)
@@ -3593,6 +3838,8 @@ class SpatialDesktop(QWidget):
     def _space_clear_constellations(self):
         if self.space_constellations:
             self.space_constellations.clear()
+            self._space_constellation_revision += 1
+            self._garden_constellation_cache = None
             self._schedule_virtual_desktop_save()
         for side in self.space_drawing_by_side:
             self.space_drawing_by_side[side] = None
@@ -3638,6 +3885,9 @@ class SpatialDesktop(QWidget):
         if len(state["stars"]) >= 2:
             self.space_constellations.append({"stars": list(state["stars"])})
             self.space_constellations = self.space_constellations[-120:]
+            self._space_constellation_revision += 1
+            self._garden_constellation_cache = None
+            self._scene_tutorial_steps.add("constellation")
             self._schedule_virtual_desktop_save()
             self.status = f"Constellation saved · {len(state['stars'])} stars connected"
         self.update()
@@ -3826,6 +4076,8 @@ class SpatialDesktop(QWidget):
         painter.setPen(QColor(226, 247, 255))
         painter.setFont(self._ui_font(9, QFont.DemiBold))
         painter.drawText(button, Qt.AlignCenter, "CLEAR CONSTELLATIONS")
+        self._paint_scene_arrow(painter, width, height, "space")
+        self._paint_scene_tutorial_hint(painter, width, height, "space")
         painter.restore()
 
     def _save_virtual_desktop_data(self):
@@ -11763,7 +12015,8 @@ try {
         selecting Garden while in OS mode must not force nonstop repaints.
         """
         if (self.desktop_mode == "virtual" and
-                getattr(self, "virtual_garden_mode", False)):
+                (getattr(self, "virtual_garden_mode", False) or
+                 getattr(self, "_scene_transition", None) is not None)):
             return False
         try:
             if getattr(self, "virtual_pen_active_stroke", None) is not None:
@@ -11819,6 +12072,8 @@ try {
         if self.menu_open and self.hub_visible:
             # Pause expensive background animation when reading a glass settings page.
             desired_ms = 50 if hand_present else 100
+        elif getattr(self, "_scene_transition", None) is not None:
+            desired_ms = 33  # A short, smooth slide; static images keep this inexpensive.
         elif garden_visible:
             # The animated garden used to force 60 FPS even with no hands.
             # 30 FPS during interaction, 15 FPS while idle preserves gentle motion.
@@ -12330,6 +12585,12 @@ try {
                     self._end_pinch_drag(side, status=False)
                 continue
 
+            # Explore Garden <-> Space before Garden props, fist scrolling, pinch
+            # menus or constellation drawing. Hovering the arrow consumes gestures.
+            if (self.desktop_mode == "virtual" and not calibration_modal_frame and not peace and
+                    self.virtual_scene in ("garden", "space") and not self._gesture_ui_modal_open()):
+                if self._scene_arrow_handle_frame(side, cursor, landmarks, now, edge_tolerant):
+                    continue
             # Interact with Garden props BEFORE fist/Pinch Menu classification,
             # gesture-owner arbitration and OS mouse dragging. The interaction
             # retains its own pinch state and cannot arm the Pinch Menu timer.
@@ -12547,6 +12808,10 @@ try {
             timeout = self.tracking_loss_grace_seconds if self._needs_tracking_loss_grace(side) else 0.16
             if missing_for <= timeout:
                 continue
+            # A lost hand must not leave the scene-arrow pinch latched, otherwise
+            # its next appearance could skip the first intentional pinch-click.
+            self._scene_arrow_pinch_previous[side] = False
+            self._scene_arrow_pinch_latched[side] = False
             clipboard_was_active = self.floating_clipboard_drag_state.get(side) is not None
             if clipboard_was_active:
                 clipboard_state = self.floating_clipboard_drag_state.get(side) or {}
