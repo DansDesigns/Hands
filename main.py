@@ -119,6 +119,8 @@ from PySide6.QtGui import QPainter, QColor, QPen, QBrush, QFont, QFontMetricsF, 
 from PySide6.QtCore import QUrl
 from PySide6.QtWidgets import QApplication, QWidget, QMessageBox, QInputDialog
 
+from user_paths import user_data_dir, user_file
+
 try:
     import pyautogui
     pyautogui.FAILSAFE = False
@@ -138,13 +140,16 @@ MODELS.mkdir(exist_ok=True)
 HAND_MODEL = MODELS / "hand_landmarker.task"
 HAND_URL = "https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task"
 VOSK_MODEL = MODELS / "vosk-model-small-en-us-0.15"
-GESTURES_FILE = ROOT / "gestures.txt"
-UI_SETTINGS_FILE = ROOT / "ui_settings.json"
-TLI_CALIBRATION_FILE = ROOT / "tli_calibration.json"  # Legacy palm-local TLI anchor calibration
-TPI_SCREEN_CALIBRATION_FILE = ROOT / "tpi_screen_calibration.json"
-HAND_CALIBRATION_FILE = ROOT / "hand_calibration.json"
-CUSTOM_GESTURES_FILE = ROOT / "custom_gestures.json"
-VIRTUAL_DESKTOP_DATA_FILE = ROOT / "virtual_desktop.json"
+USER_DATA_DIR = user_data_dir()
+USER_DATA_DIR.mkdir(parents=True, exist_ok=True)
+# User-owned state lives outside the install directory so application updates cannot overwrite it.
+GESTURES_FILE = user_file("gestures.txt", ROOT)
+UI_SETTINGS_FILE = user_file("ui_settings.json", ROOT)
+TLI_CALIBRATION_FILE = user_file("tli_calibration.json", ROOT)  # Legacy palm-local TLI anchor calibration
+TPI_SCREEN_CALIBRATION_FILE = user_file("tpi_screen_calibration.json", ROOT)
+HAND_CALIBRATION_FILE = user_file("hand_calibration.json", ROOT)
+CUSTOM_GESTURES_FILE = user_file("custom_gestures.json", ROOT)
+VIRTUAL_DESKTOP_DATA_FILE = user_file("virtual_desktop.json", ROOT)
 VIRTUAL_BACKGROUND_STYLES = (
     {"name": "MIDNIGHT BLUE", "background": "#080c16", "grid": "#4b9be8"},
     {"name": "NEON PURPLE", "background": "#10091b", "grid": "#a26bff"},
@@ -264,6 +269,42 @@ def save_virtual_desktop_data(value, path=VIRTUAL_DESKTOP_DATA_FILE):
 
 
 NOTIFICATION_POSITIONS = ("top-left", "top-center", "top-right", "bottom-left", "bottom-center", "bottom-right")
+SOUND_SETTING_ROWS = (
+    ("sound_pinch", "PINCH"),
+    ("sound_pinch_menu", "PINCH MENU"),
+    ("sound_gesture_timer_during", "GESTURE TIMER DURING"),
+    ("sound_gesture_timer", "GESTURE TIMER COMPLETION"),
+    ("sound_glass_buttons", "GLASS MENU BUTTONS"),
+    ("sound_glass_toggle", "GLASS MENU TOGGLE"),
+)
+SOUND_EXTENSIONS = {".wav", ".ogg", ".mp3", ".flac", ".aiff", ".aif"}
+
+def available_ui_sounds():
+    folder = ROOT / "assets" / "sounds"
+    try:
+        return [p.name for p in sorted(folder.iterdir(), key=lambda item: item.name.casefold())
+                if p.is_file() and p.suffix.lower() in SOUND_EXTENSIONS]
+    except OSError:
+        return []
+
+def play_ui_sound(filename):
+    """Play a selected bundled UI sound using an available system audio player."""
+    if not filename or filename == "None":
+        return
+    folder = (ROOT / "assets" / "sounds").resolve()
+    path = (folder / str(filename)).resolve()
+    if path.parent != folder or not path.is_file() or path.suffix.lower() not in SOUND_EXTENSIONS:
+        return
+    try:
+        if shutil.which("paplay"):
+            subprocess.Popen(["paplay", str(path)], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        elif shutil.which("aplay") and path.suffix.lower() == ".wav":
+            subprocess.Popen(["aplay", "-q", str(path)], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        elif shutil.which("ffplay"):
+            subprocess.Popen(["ffplay", "-nodisp", "-autoexit", "-loglevel", "quiet", str(path)],
+                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    except (OSError, ValueError):
+        pass
 # Hand render styles, in the order shown by the Settings -> Hands switch.
 HAND_RENDER_STYLES = ("skeleton", "flat", "3d")
 HAND_RENDER_STYLE_LABELS = {"skeleton": "SKELETON", "flat": "FLAT", "3d": "3D"}
@@ -295,6 +336,7 @@ def load_ui_preferences() -> dict:
         "stt_indicator_position": "top-right",
         "ui_font_scale": 1.2,
         "show_gesture_disabled_indicator": True,
+        **{key: "None" for key, _label in SOUND_SETTING_ROWS},
     }
     try:
         supplied = json.loads(UI_SETTINGS_FILE.read_text(encoding="utf-8"))
@@ -312,6 +354,10 @@ def load_ui_preferences() -> dict:
             elif key == "show_gesture_disabled_indicator":
                 if isinstance(value, bool):
                     result[key] = value
+            elif key in dict(SOUND_SETTING_ROWS):
+                allowed = {"None", *available_ui_sounds()}
+                if value in allowed:
+                    result[key] = value
             elif value in NOTIFICATION_POSITIONS:
                 result[key] = value
     return result
@@ -327,6 +373,10 @@ def save_ui_preferences(values: dict) -> None:
                 pass
         elif key == "show_gesture_disabled_indicator":
             if isinstance(value, bool):
+                current[key] = value
+        elif key in dict(SOUND_SETTING_ROWS):
+            allowed = {"None", *available_ui_sounds()}
+            if value in allowed:
                 current[key] = value
         elif value in NOTIFICATION_POSITIONS:
             current[key] = value
@@ -1861,9 +1911,12 @@ class SpatialDesktop(QWidget):
         self.custom_gesture_message = ""
         self.custom_gesture_rings = {}
         self.custom_gesture_dropdown = None  # row index whose action list is open
+        self.sound_dropdown_key = None
         self.custom_gesture_key_capture = None  # gesture row awaiting a physical keyboard shortcut
         self._native_shortcut_capture = None
         self.custom_gesture_triggers = {"left": HoldTrigger(), "right": HoldTrigger(), "overlap": HoldTrigger()}
+        # Track which timer starts have already played the delayed timer-during sound.
+        self._timer_during_sound_played_at = {}
         self.custom_gesture_live = {}
         self.cursor_smoothing = settings["cursor_smoothing"]
         self.tli_glow_intensity = settings.get("tli_glow_intensity", 1.0)
@@ -1917,6 +1970,15 @@ class SpatialDesktop(QWidget):
         self._garden_background_cache_key = None
         self._garden_grass_specs_size = None
         self._garden_grass_specs = None
+        # Lightweight interactive Garden props; coordinates are normalised to the scene.
+        self._garden_props = {
+            "ball": {"x": 0.70, "y": 0.82, "vx": 0.0, "vy": 0.0, "r": 0.027, "held": None},
+            "sundial": {"x": 0.30, "y": 0.82, "held": None},
+        }
+        self._garden_bird_seed = 19.0
+        self._garden_bird_last_spawn = 0.0
+        self._garden_birds = []
+        self._garden_prop_last_tick = time.monotonic()
         self.d1_ui_log = ["Engine panel ready."]
         self._last_d1_log_signature = None
         # Slider interaction intentionally moves at less than half the cursor speed for finer control.
@@ -2681,6 +2743,42 @@ class SpatialDesktop(QWidget):
         highlight.cubicTo(width*0.64, height*0.85, width*0.82, height*0.70, width, height*0.77)
         painter.drawPath(highlight)
 
+        # Storybook meadow details inspired by the supplied reference: tiny flower
+        # clusters, pale grass flecks and tapered cypress-like trees on the ridges.
+        painter.setPen(Qt.NoPen)
+        for index in range(34):
+            fx = ((index * 0.173 + 0.025) % 1.0) * width
+            ridge_y = height * (0.61 + 0.11 * ((index * 7) % 13) / 13.0)
+            tree_h = height * (0.025 + (index % 4) * 0.008)
+            tree_w = tree_h * 0.22
+            tree = QPainterPath()
+            tree.moveTo(fx, ridge_y-tree_h)
+            tree.cubicTo(fx-tree_w*0.55, ridge_y-tree_h*0.60, fx-tree_w*0.72, ridge_y-tree_h*0.18, fx, ridge_y)
+            tree.cubicTo(fx+tree_w*0.72, ridge_y-tree_h*0.18, fx+tree_w*0.55, ridge_y-tree_h*0.60, fx, ridge_y-tree_h)
+            painter.setBrush(QColor(39, 102, 44, 210 if is_day else 110))
+            painter.drawPath(tree)
+        for index in range(95):
+            fx = ((index * 67.13 + 11.0) % max(1.0, width))
+            fy = height * (0.83 + ((index * 19) % 16) / 100.0)
+            size = max(1.0, height * (0.0012 + (index % 3) * 0.00045))
+            if index % 4 == 0:
+                petal = QColor(255, 246, 214, 230 if is_day else 100)
+            elif index % 4 == 1:
+                petal = QColor(255, 174, 207, 225 if is_day else 90)
+            elif index % 4 == 2:
+                petal = QColor(255, 255, 250, 235 if is_day else 110)
+            else:
+                petal = QColor(179, 208, 255, 210 if is_day else 80)
+            painter.setBrush(petal)
+            painter.drawEllipse(QPointF(fx, fy), size*1.5, size*1.5)
+            painter.setBrush(QColor(255, 205, 70, 230 if is_day else 100))
+            painter.drawEllipse(QPointF(fx, fy), size*0.48, size*0.48)
+        for index in range(125):
+            fx = (index * 83.7 + 5.0) % max(1.0, width)
+            fy = height * (0.78 + ((index * 31) % 22) / 100.0)
+            painter.setPen(QPen(QColor(226, 245, 167, 100 if is_day else 35), max(1.0, height*0.0011), Qt.SolidLine, Qt.RoundCap))
+            painter.drawLine(QPointF(fx, fy), QPointF(fx+height*0.003, fy-height*0.008))
+
         if kind == "fog":
             fog = QLinearGradient(0, height*0.33, 0, height*0.86)
             fog.setColorAt(0.0, QColor(224, 235, 241, 0))
@@ -2821,6 +2919,113 @@ class SpatialDesktop(QWidget):
         painter.drawText(rect.adjusted(9.0, 0.0, -6.0, 0.0), Qt.AlignVCenter | Qt.AlignLeft, text)
         painter.restore()
 
+    def _paint_garden_props(self, painter, width, height, scene):
+        """Animate small birds and hand-pickable garden props with inexpensive 2D physics."""
+        now = time.monotonic()
+        dt = min(0.045, max(0.0, now - getattr(self, "_garden_prop_last_tick", now)))
+        self._garden_prop_last_tick = now
+        props = self._garden_props
+        # A pinch drag picks up the ball or sundial when the cursor is over it.
+        cursors = getattr(self, "side_cursor_positions", {})
+        pinching = getattr(self, "pinch_drag_active", {})
+        for side in ("left", "right"):
+            cursor = cursors.get(side)
+            active = bool(pinching.get(side, False)) if isinstance(pinching, dict) else False
+            if cursor is None:
+                active = False
+            if active and cursor is not None:
+                cx, cy = float(cursor.x()) / max(1.0, width), float(cursor.y()) / max(1.0, height)
+                for name, prop in props.items():
+                    if prop["held"] == side:
+                        prop["x"], prop["y"] = cx, cy
+                        break
+                    if prop["held"] is None:
+                        radius = prop.get("r", 0.045) + (0.025 if name == "ball" else 0.035)
+                        if (cx-prop["x"])**2 + (cy-prop["y"])**2 < radius**2:
+                            prop["held"] = side
+                            prop["x"], prop["y"] = cx, cy
+                            if name == "ball":
+                                prop["vx"] = prop["vy"] = 0.0
+                            break
+            for prop in props.values():
+                if prop["held"] == side and not active:
+                    prop["held"] = None
+        ball = props["ball"]
+        if ball["held"] is None:
+            ball["vy"] += 0.78 * dt
+            ball["x"] += ball["vx"] * dt
+            ball["y"] += ball["vy"] * dt
+            floor = 0.865
+            if ball["y"] + ball["r"] > floor:
+                ball["y"] = floor - ball["r"]
+                if abs(ball["vy"]) > 0.045:
+                    ball["vy"] = -ball["vy"] * 0.53
+                else:
+                    ball["vy"] = 0.0
+                ball["vx"] *= 0.985
+            if ball["x"] < ball["r"] or ball["x"] > 1.0-ball["r"]:
+                ball["x"] = min(1.0-ball["r"], max(ball["r"], ball["x"]))
+                ball["vx"] *= -0.68
+            ball["vx"] *= max(0.0, 1.0 - dt*0.55)
+        # Bird flock: staggered silhouettes fly across the sky, then respawn off-screen.
+        if now - self._garden_bird_last_spawn > 2.8:
+            self._garden_bird_last_spawn = now
+            self._garden_bird_seed = (self._garden_bird_seed * 1.71 + 13.7) % 997.0
+            self._garden_birds.append({
+                "x": -0.06, "y": 0.20 + (self._garden_bird_seed % 100)/1000.0,
+                "speed": 0.10 + (self._garden_bird_seed % 55)/400.0,
+                "scale": 0.7 + (self._garden_bird_seed % 40)/100.0,
+                "phase": self._garden_bird_seed,
+            })
+        self._garden_birds = [b for b in self._garden_birds if b["x"] < 1.08]
+        painter.save()
+        painter.setRenderHint(QPainter.Antialiasing, True)
+        for bird in self._garden_birds:
+            bird["x"] += bird["speed"] * dt
+            bx, by = bird["x"]*width, bird["y"]*height
+            span = height * 0.012 * bird["scale"]
+            flap = math.sin(now*8.0 + bird["phase"]) * span * 0.7
+            pen = QPen(QColor(43, 67, 65, 210 if scene["is_day"] else 170), max(1.2, height*0.0015), Qt.SolidLine, Qt.RoundCap)
+            painter.setPen(pen)
+            painter.drawLine(QPointF(bx-span, by+flap), QPointF(bx, by))
+            painter.drawLine(QPointF(bx, by), QPointF(bx+span, by+flap))
+        # Ball with a soft ground shadow, glossy red/orange surface.
+        bx, by, br = ball["x"]*width, ball["y"]*height, ball["r"]*height
+        painter.setPen(Qt.NoPen)
+        painter.setBrush(QColor(10, 44, 20, 65))
+        painter.drawEllipse(QRectF(bx-br*1.15, height*0.856, br*2.3, br*0.35))
+        ball_grad = QRadialGradient(QPointF(bx-br*0.34, by-br*0.38), br*1.6)
+        ball_grad.setColorAt(0.0, QColor(255, 232, 155))
+        ball_grad.setColorAt(0.35, QColor(255, 105, 56))
+        ball_grad.setColorAt(1.0, QColor(177, 42, 29))
+        painter.setBrush(QBrush(ball_grad))
+        painter.setPen(QPen(QColor(255, 245, 201, 210), max(1.0, br*0.07)))
+        painter.drawEllipse(QPointF(bx, by), br, br)
+        # Sundial: stone plinth, brass rim, and a gnomon whose shadow follows solar time.
+        dial = props["sundial"]
+        dx, dy = dial["x"]*width, dial["y"]*height
+        radius = min(width, height)*0.043
+        painter.setPen(QPen(QColor(86, 87, 61, 220), max(1.0, radius*0.08)))
+        painter.setBrush(QColor(198, 183, 126))
+        painter.drawEllipse(QPointF(dx, dy), radius, radius*0.34)
+        painter.setBrush(QColor(227, 215, 164))
+        painter.drawEllipse(QPointF(dx, dy-radius*0.06), radius*0.88, radius*0.29)
+        painter.setPen(QPen(QColor(122, 104, 63, 180), max(1.0, radius*0.025)))
+        for i in range(12):
+            a = i*math.pi/6
+            painter.drawLine(QPointF(dx+math.cos(a)*radius*0.67, dy-radius*0.06+math.sin(a)*radius*0.20),
+                             QPointF(dx+math.cos(a)*radius*0.80, dy-radius*0.06+math.sin(a)*radius*0.24))
+        progress = float(scene.get("progress", 0.5))
+        angle = (progress-0.5)*math.pi*0.92
+        gnomon_tip = QPointF(dx+math.cos(angle)*radius*0.18, dy-radius*0.06-math.sin(angle)*radius*1.05)
+        painter.setPen(QPen(QColor(91, 75, 43), max(2.0, radius*0.10), Qt.SolidLine, Qt.RoundCap))
+        painter.drawLine(QPointF(dx, dy-radius*0.06), gnomon_tip)
+        shadow_angle = angle + math.pi
+        painter.setPen(QPen(QColor(52, 62, 42, 145), max(2.0, radius*0.09), Qt.SolidLine, Qt.RoundCap))
+        painter.drawLine(QPointF(dx, dy-radius*0.03),
+                         QPointF(dx+math.cos(shadow_angle)*radius*0.83, dy-radius*0.03+math.sin(shadow_angle)*radius*0.25))
+        painter.restore()
+
     def _paint_virtual_garden(self, painter, width, height):
         """Paint a cached, weather-aware Garden scene with hand-reactive foreground grass."""
         width, height = float(width), float(height)
@@ -2849,6 +3054,7 @@ class SpatialDesktop(QWidget):
         painter.setRenderHint(QPainter.Antialiasing, False)
         painter.drawImage(QPointF(0, 0), background)
         self._paint_garden_weather_effects(painter, width, height, scene)
+        self._paint_garden_props(painter, width, height, scene)
         self._paint_garden_grass(painter, width, height, scene)
         self._paint_garden_weather_label(painter, width, height, scene)
         painter.restore()
@@ -3375,6 +3581,11 @@ class SpatialDesktop(QWidget):
             buttons["swatch_left"] = (L, y, half, 70.0)
             buttons["swatch_right"] = (L+half+gap, y, half, 70.0)
             y += 70.0 + gap
+        elif page == "sounds":
+            for key, _label in SOUND_SETTING_ROWS:
+                stack("sound:" + key, h=48.0, after=8.0)
+            texts["help"] = (L, y, W, 42.0)
+            y += 42.0 + gap
         elif page == "notifications":
             for key, _label, _default in NOTIFICATION_SETTING_ROWS:
                 stack("notify:" + key)
@@ -3483,18 +3694,62 @@ class SpatialDesktop(QWidget):
         # same rectangles, so the visible and clickable areas stay aligned.
         tab_gap = 4.5*scale
         tab_height = 40.0*scale
-        widths = [88.0, 64.0, 60.0, 66.0, 88.0, 60.0, 54.0, 56.0, 66.0]
-        total = sum(widths)*scale + tab_gap*8.0
+        widths = [82.0, 55.0, 48.0, 58.0, 76.0, 52.0, 48.0, 58.0, 58.0, 50.0]
+        total = sum(widths)*scale + tab_gap*9.0
         left = cx-total*0.5
         _panel_width, panel_height = self._menu_panel_dimensions()
         y = cy-(panel_height*0.5-25.0)*scale
-        names = ("interaction", "hands", "tli", "notifications", "gestures", "voice", "d1", "update", "virtual")
+        # Keep UPDATE as the final tab at the far right of the strip.
+        names = ("interaction", "hands", "tli", "notifications", "gestures", "voice", "d1", "sounds", "virtual", "update")
         rects = {}
         x = left
         for name, width in zip(names, widths):
             rects[name] = QRectF(x, y, width*scale, tab_height)
             x += (width*scale) + tab_gap
         return rects
+
+    def _sound_dropdown_layout(self, cx, cy, scale):
+        key = self.sound_dropdown_key
+        if key not in dict(SOUND_SETTING_ROWS):
+            return {"panel": QRectF(), "items": []}
+        row_rect = self._settings_control_rects(cx, cy, scale, page="sounds").get("sound:" + key)
+        if row_rect is None:
+            return {"panel": QRectF(), "items": []}
+        options = ["None", *available_ui_sounds()]
+        item_h = 30.0 * scale
+        _panel_width, panel_height = self._menu_panel_dimensions("sounds")
+        panel_top = cy - panel_height * 0.5 * scale
+        panel_bottom = cy + panel_height * 0.5 * scale
+        max_items = max(1, int((panel_height * scale - 96.0 * scale) / max(1.0, item_h)))
+        options = options[:max_items]
+        height = len(options) * item_h
+        top = row_rect.bottom() + 4.0*scale
+        if top + height > panel_bottom - 48.0*scale:
+            top = row_rect.top() - height - 4.0*scale
+        top = max(panel_top + 44.0*scale, min(top, panel_bottom - height - 48.0*scale))
+        width = max(row_rect.width(), 220.0*scale)
+        left = max(row_rect.left(), self.hub_pos.x()*self.width() - 350.0*scale)
+        panel = QRectF(left, top, width, height)
+        return {"panel": panel, "items": [(value, QRectF(left, top+i*item_h, width, item_h))
+                                             for i, value in enumerate(options)]}
+
+    def _paint_sound_dropdown(self, painter, cx, cy, scale):
+        layout = self._sound_dropdown_layout(cx, cy, scale)
+        panel = layout["panel"]
+        if panel.isNull() or panel.isEmpty():
+            return
+        painter.setBrush(QBrush(QColor(5, 22, 35, 248)))
+        painter.setPen(QPen(QColor(155, 245, 255, 235), 1.5*scale))
+        painter.drawRoundedRect(panel, 10*scale, 10*scale)
+        selected = self.ui_preferences.get(self.sound_dropdown_key, "None")
+        for value, rect in layout["items"]:
+            painter.setBrush(QBrush(QColor(40, 115, 82, 235) if value == selected else QColor(18, 55, 75, 235)))
+            painter.setPen(QPen(QColor(110, 200, 220, 100), 0.7*scale))
+            painter.drawRect(rect)
+            painter.setPen(QColor(240, 252, 255))
+            painter.setFont(self._ui_font(max(7, int(9*scale)), QFont.DemiBold))
+            label = "None (silent)" if value == "None" else value
+            painter.drawText(rect.adjusted(10*scale, 0, -8*scale, 0), Qt.AlignVCenter | Qt.AlignLeft, label)
 
     def _notification_rect(self, position, width, height, margin=18):
         """Position a notification in one of six screen anchors."""
@@ -3594,6 +3849,7 @@ class SpatialDesktop(QWidget):
         self.hub_visible = visible
         if not visible:
             self.custom_gesture_dropdown = None
+            self.sound_dropdown_key = None
             if self.custom_gesture_key_capture is not None:
                 self._cancel_custom_gesture_key_capture("Shortcut capture cancelled because the menu closed.")
             else:
@@ -3606,6 +3862,7 @@ class SpatialDesktop(QWidget):
         if reset_settings:
             self.settings_open = False
         if changed:
+            play_ui_sound(self.ui_preferences.get("sound_glass_toggle", "None"))
             if visible and self.desktop_mode == "os":
                 self._capture_glass_backdrop()
             self._begin_menu_transition(now)
@@ -5403,6 +5660,9 @@ class SpatialDesktop(QWidget):
         if self.menu_open and self.hub_visible and not self._canvas_menu_panel_contains(point):
             return
         self.click_side = side
+        play_ui_sound(self.ui_preferences.get("sound_pinch", "None"))
+        if self._canvas_menu_panel_contains(point):
+            play_ui_sound(self.ui_preferences.get("sound_glass_buttons", "None"))
         self.click_flash_until = now+0.24
         self.last_active = now
         cx, cy = self.hub_pos.x()*self.width(), self.hub_pos.y()*self.height()
@@ -5467,6 +5727,21 @@ class SpatialDesktop(QWidget):
             # An open custom-gesture action list takes every press until it closes.
             if self.settings_page == "gestures" and self.custom_gesture_dropdown is not None:
                 self._click_custom_gesture_dropdown(point, cx, cy, scale)
+                return
+            if self.settings_page == "sounds" and self.sound_dropdown_key is not None:
+                popup = self._sound_dropdown_layout(cx, cy, scale)
+                selected = None
+                for value, rect in popup.get("items", []):
+                    if rect.contains(point):
+                        selected = value
+                        break
+                key = self.sound_dropdown_key
+                self.sound_dropdown_key = None
+                if selected is not None:
+                    self.ui_preferences[key] = selected
+                    save_ui_preferences(self.ui_preferences)
+                    self.status = f"{key.replace('sound_', '').replace('_', ' ').title()} sound: {selected}"
+                self.update()
                 return
 
             # Back and the three Settings sub-pages share a stable navigation row.
@@ -5605,6 +5880,14 @@ class SpatialDesktop(QWidget):
                 if pressed("hand_setup"):
                     self._start_hand_onboarding(first_run=False)
                     return
+                return
+
+            if self.settings_page == "sounds":
+                for key, _label in SOUND_SETTING_ROWS:
+                    if pressed("sound:" + key):
+                        self.sound_dropdown_key = key
+                        self.update()
+                        break
                 return
 
             if self.settings_page == "notifications":
@@ -6513,10 +6796,10 @@ class SpatialDesktop(QWidget):
         sides = ("left", "right")
         changed = any(self.gesture_tracking_enabled.get(side, True) != enabled for side in sides)
         if not changed:
-            state = "enabled" if enabled else "disabled"
-            self.status = f"Freehand gestures are already {state}"
+            state = "on" if enabled else "off"
+            self.status = f"Freehand gestures are already {'enabled' if enabled else 'disabled'}"
             if announce:
-                self.tts.speak(f"Freehand gestures are already {state}.")
+                self.tts.speak(f"Left hand gestures {state}. Right hand gestures {state}.")
             self.update()
             return
 
@@ -6560,8 +6843,8 @@ class SpatialDesktop(QWidget):
             self.hand_tracking_notice_until = now + 5.0
         self.status = "Freehand gestures enabled" if enabled else "Freehand gestures disabled"
         if announce:
-            self.tts.speak("Freehand gestures enabled." if enabled else
-                           "Freehand gestures disabled. Say enable Freehand to turn them back on.")
+            state = "on" if enabled else "off"
+            self.tts.speak(f"Left hand gestures {state}. Right hand gestures {state}.")
         self.update()
 
     def set_hand_tracking_paused(self, paused: bool, announce: bool = True):
@@ -8514,6 +8797,8 @@ try {
                 progress = trigger.progress(now, hold)
                 live[candidate] = max(live.get(candidate, 0.0), progress)
                 if self.custom_gestures[candidate].get("timer", True) and not trigger.fired:
+                    self._maybe_play_timer_during_sound(
+                        f"custom:{side}", trigger.since, now)
                     rings[side] = (self.custom_gestures[candidate].get("label", ""), progress,
                                    max(0.0, hold*(1.0-progress)))
             if fired is not None:
@@ -9839,6 +10124,11 @@ try {
                         "color": QColor(self.left_click_color if side == "left" else self.right_click_color),
                     }
             snapshot = None
+        if visible:
+            if timer_completed:
+                play_ui_sound(self.ui_preferences.get("sound_gesture_timer", "None"))
+            else:
+                play_ui_sound(self.ui_preferences.get("sound_pinch_menu", "None"))
         self.fist_action_menu_open[side] = visible
         self.pinch_menu_animation[side] = {
             "started_at": now,
@@ -10167,6 +10457,15 @@ try {
         self.modifier_click_last_pose_at[side] = None
         self.modifier_click_armed[side] = True
 
+    def _maybe_play_timer_during_sound(self, key, started_at, now):
+        """Play timer-during feedback only after a gesture has held for 200 ms."""
+        if started_at is None or now - float(started_at) < 0.2:
+            return
+        if self._timer_during_sound_played_at.get(key) == started_at:
+            return
+        self._timer_during_sound_played_at[key] = started_at
+        play_ui_sound(self.ui_preferences.get("sound_gesture_timer_during", "None"))
+
     def _menu_pinch_elapsed_seconds(self, side, now=None):
         """Count only held pinch time after the continuous pinch confirmation buffer."""
         if now is None:
@@ -10182,6 +10481,7 @@ try {
 
     def _start_menu_pinch_sequence(self, side, cursor, now):
         """Start a fresh, unfilled timer sequence at this pinch-down event."""
+        # Timer-during sound is delayed until the pinch hold survives 200 ms.
         self.menu_pinch_started[side] = float(now)
         self.menu_pinch_accumulated_seconds[side] = 0.0
         self.menu_pinch_pulse_started_at[side] = float(now)
@@ -10609,10 +10909,10 @@ try {
     def _scene_is_idle(self, now):
         """True when no hand is in view and nothing is animating.
 
-        Repainting the full-screen translucent overlay is the most expensive part of
-        each frame, so idle frames are repainted at a lower rate. Any visible hand,
-        gesture, drag, transition or press feedback restores the full frame rate.
+        Garden Mode is continuously animated, so it must never use idle throttling.
         """
+        if getattr(self, "virtual_garden_mode", False):
+            return False
         try:
             if getattr(self, "virtual_pen_active_stroke", None) is not None:
                 stroke = self.virtual_pen_active_stroke
@@ -10654,15 +10954,18 @@ try {
         return True
 
     def _request_scene_repaint(self, now):
-        if (self._scene_is_idle(now) and
+        if (not getattr(self, "virtual_garden_mode", False) and self._scene_is_idle(now) and
                 now-getattr(self, "_last_scene_repaint", 0.0) < self.IDLE_REPAINT_INTERVAL):
             return
         self._last_scene_repaint = now
         self.update()
 
     def _adjust_scene_timer_cadence(self, hand_present, now):
-        """Run gesture/UI work at 20 Hz while active and 10 Hz while idle."""
-        desired_ms = 50 if hand_present or not self._scene_is_idle(now) else 100
+        """Run Garden Mode at 60 Hz; otherwise use active/idle UI cadence."""
+        if getattr(self, "virtual_garden_mode", False):
+            desired_ms = 16
+        else:
+            desired_ms = 50 if hand_present or not self._scene_is_idle(now) else 100
         timer = getattr(self, "timer", None)
         if timer is not None and timer.interval() != desired_ms:
             timer.setInterval(desired_ms)
@@ -11096,6 +11399,8 @@ try {
                 self.thumbs_up_last_seen[side] = now
                 if self.thumbs_up_hold_started[side] is None:
                     self.thumbs_up_hold_started[side] = now
+                self._maybe_play_timer_during_sound(
+                    f"thumbs_up:{side}", self.thumbs_up_hold_started[side], now)
                 if (now-self.thumbs_up_hold_started[side] >= self.gesture_tracking_toggle_hold_seconds and
                         not self.thumbs_up_toggle_latched[side]):
                     self.gesture_tracking_enabled[side] = not self.gesture_tracking_enabled.get(side, True)
@@ -11105,14 +11410,9 @@ try {
                     self.status = f"{side.title()} hand gesture tracking {state}"
                     self.hand_tracking_notice_text = f"{side.title()} hand gestures {state}"
                     self.hand_tracking_notice_until = now + 5.0
-                    # Confirm thumbs-up toggles aloud. If both hands toggle into the same
-                    # state in one brief interval, avoid speaking the identical phrase twice.
+                    # Confirm the specific hand and its new gesture state aloud.
                     spoken_state = "on" if self.gesture_tracking_enabled[side] else "off"
-                    last_toggle_tts = getattr(self, "_last_thumb_toggle_tts", None)
-                    if not (last_toggle_tts and last_toggle_tts[0] == spoken_state and
-                            now-last_toggle_tts[1] < 0.8):
-                        self.tts.speak(f"Freehand gestures {spoken_state}.")
-                        self._last_thumb_toggle_tts = (spoken_state, now)
+                    self.tts.speak(f"{side} hand gestures {spoken_state}.")
                     # Clear only this hand's pending gestures/actions. Never interrupt the
                     # other hand, which remains fully usable throughout the toggle.
                     self.peace_hold_started[side] = None
@@ -12005,6 +12305,8 @@ try {
                 is_fist, is_pinch = True, False
 
             if is_pinch:
+                self._maybe_play_timer_during_sound(
+                    f"pinch_menu:{side}", self.menu_pinch_started[side], now)
                 # The thumb/index pinch opens the Pinch Menu after a confirmation delay.
                 # A quick pinch released before the long-hold threshold is a normal click.
                 if is_fist or (self.fist_started_at[side] is not None and
@@ -12226,6 +12528,9 @@ try {
                 self.fist_open_candidate_since[side] = None
                 # Measure this specific fist hold for quick-click release and the separate
                 # two-hand drag clutch. Right-only scroll itself has no hold-time requirement.
+                if self.fist_action.get(side) != "slider" and not self.fist_start_controls.get(side):
+                    self._maybe_play_timer_during_sound(
+                        f"fist:{side}", self.fist_started_at[side], now)
                 current_fist_held = now-self.fist_started_at[side]
                 origin = self.fist_origin_points[side] or cursor
                 dx_from_origin = cursor.x()-origin.x()
@@ -13016,7 +13321,7 @@ try {
 
                 tab_labels = {"interaction": "INTERACTION", "hands": "HANDS", "tli": "TPI",
                               "notifications": "NOTIFY", "gestures": "GESTURES", "voice": "VOICE",
-                              "d1": "ENGINE", "update": "UPDATE", "virtual": "VIRTUAL"}
+                              "d1": "ENGINE", "update": "UPDATE", "virtual": "VIRTUAL", "sounds": "SOUNDS"}
                 info_pages = ("gesture_map", "speech_commands")
                 if self.settings_page not in info_pages:
                     for page_name, tab in self._settings_tab_rects(cx, cy, scale).items():
@@ -13140,7 +13445,7 @@ try {
                     self._paint_reference_columns(painter, columns, cx, cy, scale)
 
                 elif self.settings_page in ("interaction", "hands", "tli", "gestures",
-                                            "notifications", "voice", "update", "d1", "virtual"):
+                                            "notifications", "voice", "update", "d1", "virtual", "sounds"):
                     # Every control below is placed by _settings_layout(), the same
                     # geometry used for click hit-testing and hover/press feedback.
                     controls = self._settings_control_rects(cx, cy, scale)
@@ -13303,6 +13608,31 @@ try {
                         painter.setPen(QColor(235, 255, 255))
                         self._draw_fitted_button_label(painter, hand_setup_rect, "RUN HAND SCALE & PROXIMITY CALIBRATION",
                                                        base_size=label_size, min_size=6, inset=12*scale)
+
+                    elif self.settings_page == "sounds":
+                        # Render every sound setting as a clearly visible, independent dropdown.
+                        # Keep the label and current selection together so the page remains
+                        # understandable even when assets/sounds contains no audio files yet.
+                        for key, label in SOUND_SETTING_ROWS:
+                            rect = controls.get("sound:" + key)
+                            if rect is None:
+                                continue
+                            selected_sound = self.ui_preferences.get(key, "None") or "None"
+                            painter.setBrush(QBrush(QColor(10, 47, 67, 242)))
+                            painter.setPen(QPen(QColor(140, 230, 240, 235), 1.7*scale))
+                            painter.drawRoundedRect(rect, 10*scale, 10*scale)
+                            painter.setPen(QColor(237, 252, 255))
+                            display_sound = selected_sound if selected_sound != "None" else "None (silent)"
+                            self._draw_fitted_button_label(
+                                painter, rect, f"{label}     {display_sound}   ▾",
+                                base_size=max(7, int(8.5*scale)), min_size=6, inset=12*scale)
+                        help_rect = text_rects.get("help")
+                        if help_rect is not None:
+                            painter.setPen(QColor(205, 235, 242))
+                            self._draw_wrapped_fitted_text(
+                                painter, help_rect,
+                                "Select a row to choose a sound from assets/sounds. Add WAV, OGG, MP3, FLAC or AIFF files to populate the lists. Changes save automatically.",
+                                base_size=max(7, int(8*scale)), min_size=6)
 
                     elif self.settings_page == "notifications":
                         for key, label, default in NOTIFICATION_SETTING_ROWS:
@@ -13472,6 +13802,8 @@ try {
                     if self.settings_page == "gestures" and self.custom_gesture_dropdown is not None:
                         # Painted after the sliders so the open list sits on top of them.
                         self._paint_custom_gesture_dropdown(painter, cx, cy, scale)
+                    if self.settings_page == "sounds" and self.sound_dropdown_key is not None:
+                        self._paint_sound_dropdown(painter, cx, cy, scale)
             painter.restore()
 
         # When move mode is engaged, animate waves and sparkles from the TLI/hand anchor.

@@ -1,0 +1,297 @@
+# Changelog
+
+Historical release notes and implementation milestones moved out of README.md to keep the project guide concise.
+
+## Version checks and updates
+
+The installed app version is recorded in the root `version.txt` file. Open **Settings → Update** and choose **Check for Updates** to compare that file with the repository copy at the raw `main/version.txt`. If a newer version is found, choose **Download Update**, then **Install Update**. The updater stages and validates the source archive, backs up replaced files, preserves settings and calibration, and asks you to restart Spatial Desktop after installation.
+
+When publishing a release, update `version.txt` in the repository to the new dotted numeric version (for example `0.8.1`). Keep the version file at the repository root on the `main` branch so the in-app checker can find it.
+
+## v61 overlay and menu layout updates
+
+- On Windows, the active hand-visual overlay periodically reasserts topmost z-order without activating or stealing keyboard focus. This helps keep hands/TPI visible above ordinary apps, Task Manager, and windowed/borderless video players. Exclusive-fullscreen applications can still suppress ordinary desktop overlays.
+- The main glass menu Close banner is at the bottom of the panel. The left/right TPI calibration buttons have a wider gap so they are easier to distinguish.
+- Interaction Settings allow `scroll_acceleration` up to `10.0×`.
+
+## v55 Pinch drag-and-drop
+
+- A thumb/index pinch that stays stationary continues through the fixed 0.8-second confirmation buffer and circular timer, then opens the Pinch Menu as before.
+- In OS Desktop mode, if the held pinch moves at least 22 screen pixels before the timer completes, Spatial Desktop presses and holds the native left mouse button at the TPI. The pointer continues following the hand, allowing ordinary drag-and-drop in file managers, PowerPoint, image editors, 3D Builder and other applications that accept native mouse dragging.
+- Releasing the pinch drops the item and releases the mouse button. The drag gesture is consumed, so it cannot also fire a quick click or open the Pinch Menu. If tracking is lost, hand tracking is paused, or the application closes, the held button is released safely.
+- This is application-agnostic mouse input; it does not require custom integration with each application. Use OS Desktop mode for dragging objects in external applications.
+
+## v54 changes
+
+- Calibration target centre is transparent so the live hand can be seen behind it; requesting calibration re-enables the selected hand if peace-sign tracking was paused.
+- Palm width defaults to 1.26×. Settings tabs have additional spacing and bottom-centred Back buttons. The Pinch Menu has extra padding below its last action.
+- Skeleton mode includes an adjustable line-thickness slider. Interaction settings expose TPI glow intensity, hue/colour, border thickness, and diameter. Glass and Pinch Menu tints are 15% transparent.
+
+This release carries forward the interaction baseline from Spatial Desktop v40 and later stability patches.
+
+Spatial Desktop uses MediaPipe hand landmarks with a large, vibrant Tap Point Indicator (TPI). Before calibration, the TPI is centred midway between the thumb tip and index fingertip. After calibration, it uses the registered pinch point in a palm-relative 3D coordinate frame, so the TPI follows the hand as it translates, rotates, and changes apparent size. The displayed TPI and activation/click point share the same transformed, smoothed coordinates. The TPI diameter defaults to 30px and can be adjusted in Settings → TPI.
+
+## Hand-interaction baseline carried forward from v25
+
+- **Close the Pinch Menu outside:** after releasing the pinch that opened the Pinch Menu, make a fresh fist/grip or pinch while the TPI is outside the popup bounds. The popup closes, and that gesture is consumed so it cannot click or drag through to the desktop. Gestures inside the popup continue to select options.
+- **Movement-driven right-fist scrolling:** a RIGHT-only fist starts smooth vertical scrolling as soon as deliberate movement is detected over page content; there is no fist timer circle or 0.8-second wait. In `SCROLL WINDOW` mode, a two-fist clutch also scrolls the visible window content; opening either hand stops it. Outside that mode, two fists (hold one hand steady and move the other) grab and move the native window. Linux/X11 window moving uses `wmctrl`; install `wmctrl` and `xdotool` for native window targeting and scrolling (for Debian/Ubuntu: `sudo apt install wmctrl xdotool`). Wayland compositors may restrict external window movement.
+- **Fist timer removed:** quick fist/open still clicks, but right-fist movement—not a completed countdown—starts scrolling. A clearly open hand must remain stable for 0.48 seconds to release active one-hand fist scrolling; other drag release behaviour is unchanged. Timed pinches require a continuous 0.8-second confirmation before the ring fills; a release before confirmation cancels the sequence.
+
+## v43 UI and rendering fixes
+
+- The main glass window and the topmost Search hand overlay no longer paint the same hand/TPI/timer layer simultaneously; Search overlay becomes the sole owner of that layer while visible. The overlay also avoids fabricating a fallback TPI when no cursor position is available.
+- The home glass tile is now **Search** and opens the same local search launcher. Its magnifier icon is distinct from the **Speech Commands** list icon and the live Voice/STT audio-wave icon.
+- Home tiles and floating Pinch Menu labels use bounded font fitting and line wrapping so longer labels remain inside their buttons.
+- The fixed 0.8-second gesture confirmation is enforced as a continuous hold, not a wall-clock timer that keeps running between separate quick pinches.
+
+## Offline voice and fast local search (v29)
+
+- **Vosk STT retained:** audio runs in short bounded blocks. Partial transcripts feed the search box word-by-word as they become available; final recognition still handles voice commands.
+- **Ulauncher-style local search:** say `search bar` or `search files` while voice input is enabled, press `Ctrl+Space`, or click the Search tile. Results update as you type. Press **Dictate** or launch it by voice to stream Vosk partial transcripts into the query field. Use **Add Folder** to include locations; use Up/Down and Enter to select/open. The **Speak** button uses StreamTTS to read the selected filename and excerpt.
+- **No model needed for search:** Python plus SQLite FTS5 indexes file names, paths and bounded text excerpts. Ranking combines BM25, file-name/path weighting, exact phrase boosts, fuzzy filename matching and a small transparent synonym table. It runs locally and does not download embeddings or use cloud services. The initial index is built in a background thread and later updates changed files incrementally.
+- **Indexed file types:** file names for all types; contents for common text/source files, PDF and DOCX. The installer includes the small PDF/Word parsing dependencies. Common personal folders are indexed by default; use Add Folder to choose others. The index is stored under `~/.spatial_desktop`.
+- **Optional local TTS (StreamTTS):** the Windows/Linux installer installs `requirements-voice.txt` and attempts to download StreamTTS ONNX voice files via `install_voice_models.py`. If network/download fails, the installer warns and the core app/search still works. British voice `vits-piper-en_GB-alan-medium` is the default; see `VOICE_SETUP.md`.
+- **Why no EmbeddingGemma/OpenJev yet:** true embeddings can match descriptions with little word overlap, but require a large model/runtime. OpenJev is a local decision-model wrapper rather than a file retrieval index, and the JEV Search project's optional reranking uses a remote API. For this phase we prefer responsive, transparent, local ranking. If testing shows synonym/BM25 search is insufficient, a small embedding model can be evaluated later.
+
+## Compact search, voice commands, and startup greeting (v29)
+
+- **Search window close safety:** the search launcher is a child dialog and closing its title-bar X or its own × button only closes that launcher. It must not exit Spatial Desktop. The application explicitly disables Qt's quit-on-last-window-closed behaviour for the launcher and quits only when the main overlay itself closes.
+- **Compact launcher:** search opens as a short bar with a dropdown arrow. The arrow reveals results and utility actions; typing or live Vosk dictation expands results automatically unless the user deliberately collapses the details.
+- **Voice commands:** `close window` requests WM_CLOSE for the last focused external Windows window. When Search is open, it targets the external window that was active before Search took focus. `open user folder` opens the user's home directory in Explorer/Finder/the default file manager. The commands are handled before search dictation consumes recognised text.
+- **Startup speech:** StreamTTS speaks a time-of-day greeting after launch (morning/afternoon/evening/night), using the enrolled display name if available and the operating-system username otherwise. The greeting is skipped if local TTS is not ready.
+
+## Edge tracking and deliberate fist-shake grab (v30)
+
+- **Taskbar/edge clicks:** MediaPipe tracking and pose thresholds are more tolerant near screen edges, and cursor smoothing uses a smaller edge band so the pointer does not feel stuck near minimise/restore controls. Long holds directly over the Windows taskbar are not treated as window drags; use a quick grasp/open or quick pinch to activate taskbar icons.
+- **Skeleton overscan:** actual cursor positions remain clamped to the physical display, but skeleton joints use an unclamped visual transform. When a hand reaches beyond the calibrated camera region, joints are clipped by the screen rather than all collapsing onto an artificial horizontal/vertical wall.
+- **Window drag:** hold a fist until the confirmation timer appears, then shake side-to-side. Three clear horizontal direction changes over a meaningful span arm move mode; the window does not move during the shake. Once recognised, a cyan highlighted border identifies the grabbed window. Subsequent fist movement moves it; opening the hand releases it.
+- **Scroll disambiguation:** page scrolling starts only after a clearly vertical trajectory in content or over a scrollbar. Title-bar/non-client areas do not start scrolling. Horizontal window movement requires the explicit shake gesture, reducing accidental window drags during page scrolling.
+- **Release cooldown:** an open-hand pose must remain stable for 0.20 seconds to end an active drag/scroll. Short false-open classifications reset the release timer, and missing camera frames retain the separate tracking-loss grace.
+
+The edge pose thresholds are intentionally only slightly more permissive than the central-screen thresholds. This helps targeting near the taskbar without broadly increasing false fist/pinch activations. The shake detector and scroll arbitration have dependency-free unit tests; real camera and native-window behaviour still need to be tested on Windows.
+
+## Voice-controlled PC commands and clipboard lasso (v32)
+
+All commands are handled locally by Vosk phrase matching; no LLM or cloud API is used. Global commands are checked before search dictation so they still work while the local search launcher is open.
+
+### Clipboard and TPI selection
+
+- **`copy this` / `copy selection`** sends the normal Copy shortcut to the active external app. It works with text or an object the app has selected.
+- **`paste here`** closes the search launcher if needed, restores the previous external window, clicks once at the current TPI position, then sends Paste. Use **OS Desktop** mode so the click reaches the underlying app.
+- **`start text selection`** presses and holds the left mouse button at the current TPI. Move your hand to select text, then say **`copy this`** to release and copy, or **`finish selection`** to release without copying. **`cancel selection`** also releases the mouse button.
+- **`copy image` / `copy picture` / `start image lasso`** starts a rectangular image-region capture at the current TPI. Move to the opposite corner and say **`copy this`** or **`finish lasso`**. The screen region is placed on the system clipboard as an image; say **`paste here`** at an image-capable destination. Hover-only image copying depends on the source app; the lasso is the reliable general fallback.
+- **`cut this`**, **`paste`**, **`select all`**, **`undo`**, and **`redo`** send their conventional keyboard shortcuts to the external app. The lasso mode suppresses competing hand gestures and always releases a held mouse button when finished, cancelled, paused or when the app closes.
+
+### Media commands
+
+- `play pause`, `play or pause`, `pause music`, `resume music`
+- `next track`, `next song`, `previous track`, `previous song`
+- `volume up`, `volume down`, `mute`, `unmute`
+
+Windows uses media virtual keys. Linux uses `playerctl` for media when available and `pactl` for audio volume when available. Unsupported controls report a status message rather than crashing the app.
+
+### Window commands
+
+- `minimize window`, `maximize window`, `restore window`
+- `switch window`, `show desktop`, `snap window left`, `snap window right`
+- `close window` continues to target the external focused window and avoids closing Spatial Desktop.
+
+### File browser and navigation commands
+
+- `open file explorer`, `open downloads`, `open documents`, `open desktop folder`, `open pictures`, `open videos`, `open music folder`
+- `create new folder`, `create new text file`, `create new powerpoint`, `new tab`, `close tab`, `go back`, `go forward`, `go up`, `refresh`
+- `rename selected`, `delete selected` (standard Delete key; in Windows Explorer this normally moves the item to the Recycle Bin)
+- `open notepad`, `open calculator`, `open user folder`
+
+Creation commands must start with **create** so a file/folder name beginning with “new folder” is not mistaken for a creation request. Say `create new folder`, `create new text file`, or `create new powerpoint`. On Windows, text files and blank PowerPoint presentations are created in the active File Explorer folder; PowerPoint creation requires Microsoft PowerPoint to be installed.
+
+Some navigation shortcuts depend on the active application; e.g. `new tab` is useful in browsers and Explorer, while `create new folder` is intended for a file manager. Always verify the selected target before saying `delete selected`.
+
+### Selection safety
+
+`start text selection` and image lasso are supported in **OS Desktop** mode. The text workflow uses a real held mouse button so the target app performs native text selection. The image workflow copies a screen rectangle to the clipboard, not the original embedded image object. Clipboard actions remain local; no clipboard contents are uploaded or indexed automatically.
+
+## Voice PC controls and spatial clipboard selection (v32)
+
+The PC voice-command router is local and rule-based; it does not use a language model. Commands are processed before search dictation.
+
+**Clipboard and selection:**
+- `copy this` / `copy selection`: send the standard Copy shortcut to the external app's current selection.
+- `paste here`: in OS Desktop mode, focus the external app, click once at the current TPI, then paste clipboard contents.
+- `start text selection`: begin a native mouse drag at the TPI; move the hand to select text and say `copy this` or `finish selection`.
+- `copy image` / `copy picture` / `start image lasso`: begin a rectangular screen-region selection at the current TPI. Move to the opposite corner and say `copy this` (or `finish lasso`) to copy that screen crop as an image. This is a bitmap capture of a region, not the embedded image object itself.
+- `cut this`, `paste`, `select all`, `undo`, `redo`, and `cancel selection` operate on the current external app. The lasso locks out competing hand gestures and releases the mouse button when finished or cancelled.
+
+**Media:** `play pause`, `next track`, `previous track`, `volume up`, `volume down`, `mute`, `unmute`.
+
+**Window management:** `minimize window`, `maximize window`, `restore window`, `switch window`, `show desktop`, `snap window left`, `snap window right`, `close window`.
+
+**File manager/navigation:** `open file explorer`, `open downloads`, `open documents`, `open desktop folder`, `open pictures`, `open videos`, `open music folder`, `create new folder`, `create new text file`, `create new powerpoint`, `new tab`, `close tab`, `go back`, `go forward`, `go up`, `refresh`, `rename selected`, `delete selected`, `open notepad`, `open calculator`, and `open user folder`.
+
+Text selection uses the app's normal mouse-drag selection, so the source application decides what text is selected. Image lasso captures the rectangular pixels between two TPI positions to the local system clipboard. `paste here` clicks the TPI location first; use it over a text insertion point or an app that accepts pasted images. Lasso and TPI paste require OS Desktop mode. Unknown phrases are not treated as commands, and a command is not sent if Windows/Linux can't safely identify an external target window.
+
+## Settings and interaction feedback (v33)
+
+- **Settings sub-pages:** Interaction, Notifications, and Voice keep the glass settings panel compact and make controls easier to find.
+- **Notification placement:** the tracking-paused banner and Vosk heard/transcript bar can each cycle independently through top-left, top-centre, top-right, bottom-left, bottom-centre and bottom-right. Positions are saved in `ui_settings.json`.
+- **Voice settings:** cycle through the installed StreamTTS voice IDs, enable/disable local TTS, set speech speed from `0.7x` to `1.5x`, test the voice, and manage optional face welcome from the Voice page. The first engine load starts in a background thread at application startup (or when TTS is enabled) to reduce first-speech delay.
+- **Voice navigation:** `show menu` toggles the glass menu; `show context` toggles the Pinch Menu at the current TPI/cursor position. Both are handled before search dictation.
+- **Scroll direction:** the Interaction page includes a `SCROLL · NORMAL/INVERTED` toggle. Its state persists in `gestures.txt` and applies to Windows targeted scrolling and the PyAutoGUI fallback.
+- **Move-mode feedback:** after fist-shake recognition has armed a window drag, expanding cyan waves and sparkles animate from the hand/TPI in addition to the target window highlight. The effect is absent during the shake itself.
+
+## v34 interaction and dictation updates
+
+- **Visible TPI over Search:** a click-through, topmost overlay reasserts its z-order while the search launcher is open. It draws the hand skeleton, TPI, progress ring and Pinch Menu above the launcher without taking keyboard focus or intercepting clicks.
+- **More reliable Pinch Menu:** the menu timer defaults to a 1.0-second fill after the existing 0.8-second confirmation pause (about 1.8 seconds total). Pinch detection allows a naturally bent index finger and requires at least two of the other three long fingers to remain extended. Short tracking/pinch recognition gaps reuse the same timer for up to 0.70 seconds.
+- **Progressive grip-scroll:** small movements remain slow and precise; accumulated hand travel ramps scroll gain smoothly for longer movement. Scroll inversion remains configurable.
+- **Focused-field dictation:** say `begin dictation` to stream recognised words into the currently focused application field, then say `end dictation` to stop. Stable words are typed while Vosk emits partials; the stop phrase is not typed into the field.
+- **Pinch Menu controls:** the menu includes persistent `DICTATION` and `STT VOICE INPUT` options. The former toggles dictation to the search field or current focused OS field; the latter starts/stops Vosk itself.
+
+When the search launcher is open, the transparent visual layer is periodically reasserted as a non-activating topmost window. This keeps the hands/TPI and Pinch Menu visible above the compact search bar while preserving mouse and keyboard input to the underlying search controls.
+
+## v35 interaction fixes
+
+- Window dragging now uses a two-fist clutch: make both hands fists, hold one still and move the other. The moving hand must travel decisively while the other remains steady; the movement gesture itself does not arm drag until the distinction is clear. Opening either hand releases the drag.
+- Cursor lock priority is configurable in Interaction Settings and persists as `cursor_lock_priority=right` or `cursor_lock_priority=left` in `gestures.txt`. Right remains the default. An already active gesture retains its owner.
+- TPI anchor is the thumb/index base midpoint with a small outward-from-wrist offset to keep it away from the index joint.
+- Voice commands include `pause dictation`, `resume dictation`, and `stop dictation`. The terminal phrase recognises both “end dictation” and the common Vosk misrecognition “and dictation”.
+- The Pinch Menu's Right Click item performs a right-click at the selection TPI position immediately instead of toggling persistent right-click mode.
+
+## v36 gesture stability updates
+
+- Pinch can grab Settings sliders using the same knob snap/pinned TPI flow as a fist.
+- Cursor smoothing slider ignores isolated large cursor jumps so a transient malformed hand doesn't slam it to an endpoint.
+- Right/left handedness labels are normalised once at the camera tracker boundary; colour swatches and their click targets use matching physical-hand labels. Cursor priority now uses the selected priority consistently for idle gesture initiation.
+- Stronger confidence, hand-geometry and consecutive-frame checks reject stray/phantom hands when no hand is actually in view.
+- Glass menu, Pinch Menu and Settings sheets have a frosted translucent treatment and soft layered edge blur.
+
+## v36 interaction reliability
+
+- Pinch and fist both snap to Settings sliders and pin the TPI to the knob while dragging.
+- The cursor-smoothing slider rejects sudden single-frame cursor/landmark jumps; a new location must remain consistent for three frames before it can move the value.
+- MediaPipe's handedness labels are normalized at the tracker boundary for the physical LEFT/RIGHT hands, and the cursor-priority setting controls gesture initiation consistently.
+- LEFT and RIGHT colour swatches, click targets, and displayed labels are matched to the same physical-hand keys.
+- Stray hands are filtered by confidence, plausible landmark extent/palm geometry, and consecutive-frame position stability.
+- The glass menu, Pinch Menu and Settings pages use a more translucent frosted-glass finish with soft halo edges.
+
+## v37 frosted backdrop, v38 in-menu help and modifier drag
+
+- **Help pages are in the glass menu:** Gesture Map and Speech Commands each open as their own glass-menu page with a Back control; neither uses a system message box that can appear behind the app.
+- Hold the **LEFT hand in a fist** as a temporary modifier. A quick **RIGHT-hand pinch and release** sends a right-click at the pinch start point. A held **RIGHT-hand grip** starts dragging the native window under the TPI; open the right hand to release. The left fist itself does not trigger a click or hold timer.
+- Modifier inputs use a dedicated path so rapid right-hand pinches never build the Pinch Menu timer. The existing Pinch Menu and native drag paths remain otherwise independent.
+- Hold a peace sign (index and middle fingers raised) for **1.5 seconds** to detach/reattach that hand from native OS mouse movement. A ring and numeric countdown show progress; TPI tracking and glass/Pinch Menu gestures remain active.
+- The TPI has a small bias toward the thumb side of the thumb/index web space.
+- The main glass menu and floating Pinch Menu use a Gaussian-blurred backdrop clipped to their rounded panels, plus a darker frosted tint for stronger text contrast.
+
+## v39 tracking, 3D modifier, timer and glass updates
+
+- A left fist now modifies right-hand gestures in both OS Desktop and virtual/3D mode. In OS mode, right pinch-release performs a native right-click and right grip drags the native window. In virtual/3D mode, right pinch-release opens the floating 3D context menu and right grip drags the virtual canvas/application surface; opening the right hand releases the drag.
+- A hand paused by the peace-sign toggle no longer contributes a cursor point or moves the OS mouse. Its last TPI stays frozen while the hand remains visible for the peace-sign re-enable gesture. Active interactions are cancelled safely when a hand is disabled.
+- A detached-hand notice remains on screen while either hand is detached, at the configured notice position. Reattaching the final detached hand shows a brief “Hand mouse attached” notice. Toggles do not queue delayed TTS.
+- Fist/grip and timed pinch progress now show a visible ring and numeric seconds-to-trigger from the start of their timer, matching the peace-sign countdown style.
+- Glass backdrop Gaussian blur is stronger in OS and virtual modes, and the modifier notification now follows the configured notification anchor instead of being fixed at top-centre.
+
+## v40 Pinch Menu, hand visual and tracking feedback fixes
+
+- The provided CGTrader mannequin asset is listed as unrigged and untextured, so it cannot deform directly from MediaPipe landmarks without a rig/skin-weight conversion pipeline. The live hand display now uses a thickened, rounded, warm skin-toned rendering with a shaded palm instead of thin skeleton sticks. See the [CGTrader hand model listing](https://www.cgtrader.com/free-3d-models/character/human-anatomy/hand-model-5007cc3c-effe-4560-b50e-719d56c8e37d).
+- Pinch detection is more tolerant of natural tracking jitter, while still requiring two extended non-index fingers so a closed fist alone does not qualify. A stable pinch can re-arm after a fist; a bounded 0.8-second soft buffer avoids getting stuck waiting for a perfect open-hand classification.
+- Active drag/scroll stops after a stable open hand for 0.20 seconds, while the Pinch Menu keeps a separate 0.8-second soft re-arm/sequence buffer for gesture jitter.
+- The Pinch Menu fades in on completion while its full timer ring fades out; closing the menu also fades out rather than disappearing abruptly.
+- Mouse-detachment state is visual-only. If either hand is detached, the notification remains until that hand is reattached. Reattaching the final detached hand shows a brief attached notice. TPI and glass gestures remain live while detached.
+
+## v40.1 pinch transition and responsiveness fixes
+
+- Pinch Menu no longer blocks on a synchronous full-screen capture when its hold timer completes. It fades in immediately using the cached backdrop or a blurred fallback, while the finished timer ring fades out.
+- Desktop blur now uses a stronger reduced-resolution Gaussian pass, preserving a wide soft blur radius while reducing UI stalls.
+- A confirmed pinch can transition directly out of a previous fist timer. If scrolling is active, a stable pinch immediately stops scroll input and starts the Pinch Menu timer.
+- The 0.8-second pinch re-arm/sequence buffer is restored. Active drag/scroll ends after a stable open hand for 0.20 seconds, so page scrolling does not feel stuck after release.
+- Mouse detachment remains visual-only: a detached hand keeps its persistent notice while TPI and glass interactions remain live.
+
+## v41 updates
+
+- Interaction settings include a **Skin Tone Darkness** slider (0–100%) for the live hand mesh; it is saved in `gestures.txt`.
+- Default TPI colours are **left red** and **right blue**; both swatches remain independently configurable.
+- Side-on hand views use relaxed projected-geometry checks and lower MediaPipe confidence thresholds, with two stable frames and a 160ms confirmed-landmark grace period to bridge brief dropouts.
+- The Pinch Menu's **0.8-second soft gesture/re-arm buffer remains fixed**, independent of the 0.20-second active drag/scroll release cooldown. It is intentionally not configurable or removed by the new settings.
+
+## v42 phantom-hand stabilisation
+
+The tracker now uses more conservative MediaPipe confidence thresholds and requires three spatially consistent detections before drawing a hand. It no longer paints a cached skeleton after detection is lost, preventing stale landmarks from appearing as a phantom hand. Side-on hand geometry is still supported through a narrow exception that requires a substantial other image axis, non-trivial landmark depth, a valid wrist-to-palm span, and higher handedness confidence. The fixed 0.8-second gesture confirmation and pinch re-arm buffers are unchanged.
+
+## v44 interaction refinements
+
+- **Finger thickness control (historical v44):** Interaction Settings includes a saved slider; the current v51 range is documented below and adjusts the connected hand mesh.
+- **Gentler grip-scroll:** a scroll action starts from the current hand position rather than replaying travel from the gesture-confirmation period. Frame-to-frame vertical deltas are clamped and low-pass filtered; scroll gain starts low and ramps gradually over sustained movement. Edge auto-scroll adds fractional movement instead of jumping by a whole wheel notch after only a few frames.
+- **Translucent, non-overlapping notifications:** modifier, transcript, tracking-state and paused-tracking bars now use semi-transparent fills. Notifications sharing the same configured anchor are stacked vertically with a consistent gap, and the saved top/bottom and left/centre/right placement preferences are retained.
+- The separate 0.8-second gesture confirmation and Pinch Menu re-arm buffers remain unchanged.
+
+## v46 hand sizing and right-fist scrolling
+
+- **Hand scale:** the saved hand skeleton/TPI scale slider now spans 0.1×–2.0×. At the small end, the rendered hand remains anchored around the fingertip group as in v45.
+- **Finger thickness:** the saved finger-only thickness slider now spans 0.8×–5.0×.
+- **Right-fist scrolling:** there is no fist countdown ring. With only the RIGHT hand in a fist, deliberate vertical movement over page content arms scrolling directly; frame deltas still use the prior smoothing and spike clamp. The LEFT fist remains the modifier, and the fixed Pinch Menu 0.8-second buffers are unchanged.
+
+## v47 hand scaling and pinch timer fixes
+
+- **Hand scale:** the slider is limited to 0.1×–1.0×. The hand and TPI share one transform, so interaction stays attached to the shrunken hand. The later v49 fix changes the transform origin to the wrist to stop grip-induced jumps.
+- **Finger thickness:** the saved Interaction Settings slider now spans 0.8×–8.0×.
+- **Pinch timer:** the circle remains empty for a continuous 0.8-second confirmation hold. Any confirmed release before the buffer expires cancels that sequence; a quick second pinch starts a new 0.8-second buffer and cannot inherit the first pinch's elapsed time. Once confirmed, the circle accumulates only actual pinch-down time; release gaps and duplicate frames contribute nothing.
+
+## v48 changes
+
+- The live TPI interaction point follows the same scaled transform as the visible hand, including clicks and hit-testing.
+- Default hand size is 0.3× and startup mode is OS Desktop.
+
+## v49 changes
+
+- **Stable hand mapping:** the wrist is the fixed scale origin. The same wrist-anchored transform is applied to all 21 tracked landmarks and the actual TPI interaction point, including the points used for clicks, drags, and hit-testing. Curling the fingers into a grip no longer changes the transform origin and shifts the whole hand.
+- **Continuous pinch buffer:** a real pinch release before the initial 0.8 seconds cancels the timer sequence. A quick double-pinch cannot pool elapsed time across releases; the next pinch starts a fresh buffer. The ring stays empty and shows the buffer countdown first, then shows the remaining fill duration.
+- Cursor smoothing is applied after mapping the hand anchor through the common wrist scale transform, so the OS pointer and the displayed TPI follow the same mapped point.
+
+## v50 changes
+
+- **Finger thickness:** Interaction Settings now ranges from **0.8× to 10×**, with **8× as the default**. Thickness is scaled uniformly with a palm-size estimate from the tracked landmarks, so apparent finger width grows as the hand gets closer and shrinks as it moves farther away.
+- **Continuous hand colouring:** rounded finger shafts, tips, knuckles and palm are merged into one connected silhouette before a single skin gradient is applied. This removes the visibly separate coloured circles formerly painted over line ends.
+- **TPI placement and feedback:** the TPI is centred midway between the thumb tip and index fingertip; the same point drives the activation/click location. Its 54px diameter, vivid colour and layered glow improve visibility, while the progress ring is moved outward to remain visible.
+
+## v51 contact tracking and quick-pinch double-click
+
+- **Contact-aware hand scaling:** each hand normally scales around its wrist to prevent grip-induced drift. When both hands approach, the pivots blend toward the nearest pair of real fingertips; at fingertip contact, that contact remains fixed during shrinking. The same pivot and scale transform is used for all 21 landmarks and the transformed TPI/activation point.
+- **Quick-pinch double-click:** two distinct short pinches at approximately the same point send two ordinary native click events at the same location, within the platform's double-click interval. A release gap as short as one tracked frame can complete the first click before the second pinch returns; the pinch click path is separate from quick-grip clicks.
+- **Strict confirmation buffer:** any detected pinch release before the initial 0.8 seconds completes cancels that timer sequence, even when the release gap is shorter than the click debounce. Each re-pinch starts a fresh buffer; quick pulses cannot pool time against an old start.
+- **Two-hand fingertip contact:** the contact-aware pivot blends toward the nearest real fingertips as the hands converge. A wider near-contact zone keeps their drawn tips aligned when perspective and landmark error mean the detected points do not measure exactly zero distance.
+- **Distance-scaled thickness:** one direct geometric-mean palm-size factor multiplies every rendered finger/joint/palm stroke width. Larger projected hands make the mesh thicker; smaller projected hands make it thinner. One merged silhouette keeps the skin gradient continuous at line ends.
+- **TPI:** diameter increased to 54px with a stronger multilayer glow. The visible TPI, transformed input cursor and activation point still share one position; the timer ring is larger to leave a clear margin around it.
+
+## v53 hand controls, TPI calibration window, and responsive settings
+
+- **Hand Settings tab:** hand scale, finger thickness, palm width, skin-tone darkness, per-hand TPI colour swatches, skin/skeleton rendering toggle, and separate left/right TPI calibration buttons now live together on a dedicated tab.
+- **Palm width:** the 0.65×–1.80× slider expands/contracts the palm contour across the hand's transverse axis without moving the live tracker landmarks or TPI activation point. Default is 1.00×.
+- **Skin/skeleton effect:** `SKIN EFFECT` renders the joined gradient hand surface; `SKELETON` switches to connected landmark lines and joints while keeping the same live tracking transform.
+- **Interaction tab:** drag/scroll sensitivity defaults to 1.50×, cursor smoothing defaults to 0.90, and controls are available for the pinch-menu fill duration, TPI glow intensity, TPI hue shift, and TPI border thickness.
+- **Default finger thickness:** 4.24×. The saved slider range remains 0.8×–10×.
+- **TPI calibration:** the current workflow guides each hand through nine fullscreen targets (corners, edge midpoints, and centre), sampling 12 stable frames at each point. Escape cancels without replacing the last saved mesh. The screen correction for each hand is stored in `tpi_screen_calibration.json`; legacy palm-local anchor settings in `tli_calibration.json` remain compatible.
+- **Responsive glass settings:** panel dimensions are selected per page and scaled to the display size, with four non-overlapping tabs for Interaction, Hands, Notifications, and Voice.
+
+## v54 visual and calibration updates
+
+- The TPI calibration target has a transparent interior so live hand tracking remains visible through the window.
+- Starting calibration for a peace-paused hand automatically resumes that hand and clears stale cursor smoothing.
+- Palm width defaults to 1.26x.
+- Interaction settings now expose TPI hue, glow, border thickness and TPI diameter (24–96px); Hands settings expose skeleton stroke thickness.
+- Settings sliders have more room below the page tabs; the Back control is bottom-centred on each page.
+- The Pinch Menu has additional padding below the lowest buttons. Glass and Pinch Menu panel tints are set to approximately 15% transparency.
+
+## v56 — hand onboarding and more compatible scrolling
+
+The first launch now opens a dedicated hand setup wizard. It captures a screen-touch anchor (extend an arm and touch the display just under the camera), a palm-facing size reference, and the relative distance between two hands when their fingertips meet. Samples are averaged over 20 valid camera frames. The resulting `hand_calibration.json` stores a screen translation anchor, per-hand apparent palm references, and palm-relative proximity thresholds. It is created on successful calibration and is intentionally not bundled, so a fresh install offers onboarding once. Skipping also records that choice; use **Settings → Hands → Run Hand Scale & Proximity Calibration** to run it again.
+
+During onboarding all normal mouse/gesture actions are suspended. Live landmarks and the TPI are rendered directly over the wizard/target window so they remain visible above the calibration outline. TPI target hit-testing now uses the same transformed activation point as the visible indicator. Two-hand pivot blending and rendered hand-stroke width use the current palm size relative to calibration references instead of relying only on display-sized constants.
+
+Scroll input is sent as native wheel input at the live TPI position instead of posting `WM_MOUSEWHEEL` directly to a captured top-level window. This allows Windows to route the wheel event to the child content control under the pointer, which is more compatible with File Explorer and PowerPoint.
+
+## v60 interaction refinements
+
+- **Scroll acceleration:** the Interaction tab adds a saved `SCROLL ACCELERATION` slider from `0.5×` to `10.0×`. It controls how quickly fist-drag scrolling ramps up as the hand moves farther from its original grab point; default is `1.0×`.
+- **Main glass menu Close:** a wide `CLOSE ×` banner at the top of the main menu hides the glass menu without entering another page.
+- **Gesture timer default:** the Pinch Menu ring-fill duration defaults to `0.6` seconds. The separate `0.8`-second confirmation buffer remains unchanged.

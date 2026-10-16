@@ -11,6 +11,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 ROOT = Path(__file__).resolve().parent
+from user_paths import user_file
 MODELS = {
     "600m": ("LiquidAI/d1-omni-600M-GGUF", "d1-omni-600M-Q8_0.gguf", "mmproj-d1-omni-600M-Q8_0.gguf"),
 }
@@ -705,7 +706,7 @@ def main() -> int:
         download_file(f"https://huggingface.co/{repo}/resolve/main/{model_name}", folder / model_name)
         download_file(f"https://huggingface.co/{repo}/resolve/main/{mmproj_name}", folder / mmproj_name)
         llama_ok = install_llama_server(force="--force" in sys.argv[1:])
-        settings = ROOT / "d1_settings.json"
+        settings = user_file("d1_settings.json", ROOT)
         settings.write_text(json.dumps({"model": key}, indent=2) + "\n", encoding="utf-8")
         if not llama_ok:
             retry = (r".venv\Scripts\python.exe install_d1_model.py 600m" if IS_WINDOWS

@@ -12,7 +12,8 @@ from pathlib import Path
 from tkinter import ttk, messagebox, filedialog, simpledialog
 
 ROOT = Path(__file__).resolve().parent
-SETTINGS = ROOT / "voice_settings.json"
+from user_paths import user_file
+SETTINGS = user_file("voice_settings.json", ROOT)
 MODELS_DIR = ROOT / "models"
 STREAMTTS_PY = ROOT / "streamtts" / "python"
 if str(STREAMTTS_PY) not in sys.path:

@@ -12,10 +12,11 @@ from pathlib import Path
 from typing import Callable, Optional
 
 ROOT = Path(__file__).resolve().parent
+from user_paths import user_file
 VOSK_MODEL = ROOT / "models" / "vosk-model-small-en-us-0.15"
 STREAMTTS_DIR = ROOT / "streamtts"
 TTS_MODELS_DIR = ROOT / "models"
-TTS_SETTINGS = ROOT / "voice_settings.json"
+TTS_SETTINGS = user_file("voice_settings.json", ROOT)
 
 try:
     import sounddevice as sd

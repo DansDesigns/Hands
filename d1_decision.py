@@ -17,8 +17,9 @@ from pathlib import Path
 from typing import Any
 
 ROOT = Path(__file__).resolve().parent
+from user_paths import user_file
 MODELS_DIR = ROOT / "models" / "d1"
-SETTINGS_FILE = ROOT / "d1_settings.json"
+SETTINGS_FILE = user_file("d1_settings.json", ROOT)
 SERVER_LOG = ROOT / "logs" / "llama-server.log"
 SERVER_PORT = 18080
 BASE_URL = f"http://127.0.0.1:{SERVER_PORT}"
