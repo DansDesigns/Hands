@@ -299,12 +299,14 @@ SOUND_SETTING_ROWS = (
     ("sound_gesture_timer", "GESTURE TIMER COMPLETION"),
     ("sound_glass_buttons", "GLASS MENU BUTTONS"),
     ("sound_glass_toggle", "GLASS MENU TOGGLE"),
+    ("sound_scroll_notch", "GRIP SCROLL NOTCH"),
 )
 DEFAULT_UI_SOUNDS = {
     'sound_gesture_timer_during': 'gesture_timer_during.mp3',
     'sound_pinch': 'pinch.mp3',
     'sound_glass_toggle': 'glass_menu_toggle.mp3',
     'sound_glass_buttons': 'glass_menu_buttons.mp3',
+    'sound_scroll_notch': 'notch_blip.mp3',
 }
 SOUND_EXTENSIONS = {".wav", ".ogg", ".mp3", ".flac", ".aiff", ".aif"}
 
@@ -614,6 +616,7 @@ def save_gesture_settings(values: dict) -> None:
         "# default_gesture_hold_seconds: shared activation duration for peace sign, thumbs up, and Pinch Menu, 0.5 to 5.0 seconds; default 0.5.",
         "# invert_scroll: true reverses vertical scroll direction; false is normal.",
         "# swap_drag_scroll_notches: true swaps the drag-scroll Back/Forward navigation notch directions.",
+        "# scroll_nav_hold_seconds: hold a fist on an outer Back/Forward side notch to navigate, 1.0 to 5.0 seconds; default 3.0.",
         "# cursor_lock_priority: right or left; selected physical hand gets first refusal for new gestures when both are visible.",
         "# Quick pinch clicks require a discrete short pulse before the 0.8s timer buffer; two quick pinches at one point form a native double-click.",
         "# Settings slider drag uses a reduced gain (0.42x) for finer control; initial pickup preserves the value.",
@@ -637,6 +640,7 @@ def save_gesture_settings(values: dict) -> None:
         f"scroll_backdrop_opacity={clamped('scroll_backdrop_opacity', 0.0, 100.0, 45.0):.1f}",
         f"scroll_backdrop_hue={clamped('scroll_backdrop_hue', 0.0, 255.0, 145.0):.1f}",
         f"scroll_notch_hue={clamped('scroll_notch_hue', 0.0, 360.0, 120.0):.1f}",
+        f"scroll_nav_hold_seconds={clamped('scroll_nav_hold_seconds', 1.0, 5.0, 3.0):.2f}",
         f"detached_notice_opacity={clamped('detached_notice_opacity', 0.0, 100.0, 30.0):.1f}",
         f"custom_gesture_hold_seconds={clamped('custom_gesture_hold_seconds', 0.2, 1.5, 0.5):.2f}",
         f"custom_gesture_tolerance={clamped('custom_gesture_tolerance', 0.08, 0.40, 0.18):.3f}",
@@ -686,6 +690,7 @@ def load_gesture_settings() -> dict:
         "scroll_backdrop_opacity": 45.0,
         "scroll_backdrop_hue": 145.0,
         "scroll_notch_hue": 120.0,
+        "scroll_nav_hold_seconds": 3.0,
         "detached_notice_opacity": 30.0,
         "custom_gesture_hold_seconds": 0.5,
         "custom_gesture_tolerance": 0.18,
@@ -720,6 +725,7 @@ def load_gesture_settings() -> dict:
         "scroll_backdrop_opacity": (0.0, 100.0),
         "scroll_backdrop_hue": (0.0, 255.0),
         "scroll_notch_hue": (0.0, 360.0),
+        "scroll_nav_hold_seconds": (1.0, 5.0),
         "detached_notice_opacity": (0.0, 100.0),
         "custom_gesture_hold_seconds": (0.2, 1.5),
         "custom_gesture_tolerance": (0.08, 0.40),
@@ -809,18 +815,116 @@ def _finger_straightness_values(landmarks):
             ((5, 6, 7, 8), (9, 10, 11, 12), (13, 14, 15, 16), (17, 18, 19, 20))]
 
 
+def _finger_knuckle_forward(landmarks, mcp, pip):
+    """Cosine of one proximal finger bone along the palm's forward axis.
+
+    A claw keeps its main knuckles relatively straight, even when distal
+    fingertip joints are hooked. A fist bends those knuckles in towards the
+    palm. This angle is orientation-independent, but MediaPipe's occluded
+    joints can be inaccurate: never demand a perfect reading on *each* finger.
+    """
+    wrist = lm_xyz(landmarks, 0)
+    palm = lm_xyz(landmarks, 9)
+    base = lm_xyz(landmarks, mcp)
+    joint = lm_xyz(landmarks, pip)
+    # Mediapipe y uses image height, x and z use image width.
+    palm_axis = (palm[0]-wrist[0], (palm[1]-wrist[1])*0.5625, palm[2]-wrist[2])
+    proximal = (joint[0]-base[0], (joint[1]-base[1])*0.5625, joint[2]-base[2])
+    lengths = math.sqrt(sum(a*a for a in palm_axis)*sum(b*b for b in proximal))
+    if lengths < 1e-6:
+        return None
+    cosine = sum(a*b for a,b in zip(palm_axis, proximal)) / lengths
+    return cosine if math.isfinite(cosine) else None
+
+
+def _finger_tip_reach(landmarks, mcp, tip):
+    """How far a fingertip projects beyond its base along the palm axis.
+
+    A normally clenched fingertip folds back toward the palm. A single claw
+    finger instead has both a straight main knuckle and a tip reaching outward.
+    This extra check avoids mistaking a partly open fist for a complete fist.
+    """
+    wrist, centre = lm_xyz(landmarks, 0), lm_xyz(landmarks, 9)
+    base, end = lm_xyz(landmarks, mcp), lm_xyz(landmarks, tip)
+    axis = (centre[0]-wrist[0], (centre[1]-wrist[1])*0.5625, centre[2]-wrist[2])
+    reach = (end[0]-base[0], (end[1]-base[1])*0.5625, end[2]-base[2])
+    length_sq = sum(component*component for component in axis)
+    if length_sq < 1e-8:
+        return float("inf")
+    return sum(a*b for a,b in zip(axis, reach))/length_sq
+
+
 def is_fist_or_grip_pose(landmarks, edge_tolerant=False):
-    """Require a clearly curled four-finger grip before scrolling or dragging."""
+    """Recognise a real closed fist, while rejecting four hooked claw fingers.
+
+    Retain the previously reliable four-finger curl and tucked-thumb checks.
+    Reject a claw by its overall *straight-knuckle* pattern, not by insisting
+    every (often occluded) knuckle and fingertip passes a hard 3D angle test.
+    """
     if landmarks is None or len(landmarks) < 21:
         return False
     straight = _finger_straightness_values(landmarks)
-    # Three curled fingers plus a half-open index was triggering scroll while
-    # pointing or pinching. Require all four to curl, including at screen edges.
     index_limit = 0.79 if edge_tolerant else 0.77
     other_limit = 0.83 if edge_tolerant else 0.81
-    fingers_closed = straight[0] <= index_limit and all(
-        value <= other_limit for value in straight[1:])
-    return fingers_closed and not thumb_sticking_out(landmarks, threshold=-0.55)
+    if straight[0] > index_limit or any(value > other_limit for value in straight[1:]):
+        return False
+    if thumb_sticking_out(landmarks, threshold=-0.55):
+        return False
+    # Keep an unmistakably outstretched side thumb from becoming a fist, but
+    # measure it against the nearest knuckle rather than only the index MCP:
+    # an ordinary clenched thumb often rests across the middle/ring fingers.
+    palm_width = max(1e-5, distance3d(landmarks, 5, 17),
+                     0.65 * distance3d(landmarks, 0, 9))
+    if min(distance3d(landmarks, 4, mcp) for mcp in (5, 9, 13)) > palm_width * 1.45:
+        return False
+
+    knuckles = [_finger_knuckle_forward(landmarks, mcp, pip)
+                for mcp, pip in ((5, 6), (9, 10), (13, 14), (17, 18))]
+    usable = [value for value in knuckles if value is not None]
+    if len(usable) < 3:
+        return False
+    # A complete curled fist bends most knuckles at the base. One badly
+    # estimated/hidden joint must not disable grab or scroll. For borderline
+    # readings accept two bent knuckles only if the remaining ones are not
+    # clearly extended and the whole hand is bent on average.
+    bent_limit = 0.88 if edge_tolerant else 0.86
+    bent = sum(value <= bent_limit for value in usable)
+    clearly_extended = sum(value >= 0.94 for value in usable)
+    if clearly_extended >= 3:
+        return False  # hooked distal joints but straight MCPs: a claw
+    # An isolated clearly extended index/ring/etc should not be accepted as
+    # a *full* fist when its tip actually reaches away from the palm. But a
+    # misestimated hidden knuckle with the fingertip still folded is OK.
+    for score, (mcp, tip) in zip(knuckles, ((5, 8), (9, 12), (13, 16), (17, 20))):
+        if score is not None and score >= 0.94 and _finger_tip_reach(landmarks, mcp, tip) >= 0.27:
+            return False
+    if bent >= max(2, len(usable)-1):
+        return True
+    return (bent >= 2 and clearly_extended == 0 and
+            sum(usable)/len(usable) <= (0.86 if edge_tolerant else 0.84))
+
+
+def is_claw_pose(landmarks, edge_tolerant=False):
+    """A distinct four-finger hook, available for custom gesture recording."""
+    if landmarks is None or len(landmarks) < 21:
+        return False
+    straight = _finger_straightness_values(landmarks)
+    if straight[0] > 0.79 or any(value > 0.83 for value in straight[1:]):
+        return False
+    if is_fist_or_grip_pose(landmarks, edge_tolerant):
+        return False
+    # At least three proximal segments remain pointing away from the wrist.
+    # Their distal segments can still curl like hooks.
+    def extended_knuckle(mcp, pip):
+        wrist, centre = lm_xyz(landmarks,0), lm_xyz(landmarks,9)
+        base, joint = lm_xyz(landmarks,mcp), lm_xyz(landmarks,pip)
+        a = (centre[0]-wrist[0], (centre[1]-wrist[1])*0.5625,
+             centre[2]-wrist[2])
+        b = (joint[0]-base[0], (joint[1]-base[1])*0.5625,
+             joint[2]-base[2])
+        denom = math.sqrt(sum(v*v for v in a)*sum(v*v for v in b))
+        return denom > 1e-6 and sum(x*y for x,y in zip(a,b))/denom >= 0.78
+    return sum(extended_knuckle(a,b) for a,b in ((5,6),(9,10),(13,14),(17,18))) >= 3
 
 
 
@@ -2105,6 +2209,7 @@ class SpatialDesktop(QWidget):
         self.scroll_backdrop_opacity = float(settings.get("scroll_backdrop_opacity", 45.0))
         self.scroll_backdrop_hue = float(settings.get("scroll_backdrop_hue", 145.0))
         self.scroll_notch_hue = float(settings.get("scroll_notch_hue", 120.0))
+        self.scroll_nav_hold_seconds = float(settings.get("scroll_nav_hold_seconds", 3.0))
         # Persistent "mouse detached" notice: full while the glass menu is open and for
         # 5 s after it closes or after the notification stack changes, then it fades.
         self.detached_notice_opacity = settings.get("detached_notice_opacity", 30.0)
@@ -2537,6 +2642,15 @@ class SpatialDesktop(QWidget):
         # After a fist, require a clearly open (non-pinched) hand before another timed
         # pinch can arm. This prevents fist/grip landmark flicker opening the Pinch Menu.
         self.fist_release_required_for_pinch = {side: False for side in sides}
+        # Suppress incidental thumb/index contact during finger-first fist closure.
+        # This does not label a partially closed hand as a valid fist.
+        self._forming_fist_pinch_guard = {side: False for side in sides}
+        # Keep fist ownership through brief open frames between quick punches;
+        # do not rearm pinch until the full hand has stayed open briefly.
+        self._fist_guard_open_since = {side: None for side in sides}
+        # Raw pinch can transiently look valid as the thumb crosses the index
+        # during a fist. Two consecutive convincing pinch frames must agree.
+        self._pinch_pose_confirm_frames = {side: 0 for side in sides}
         self.fist_pose_confirmation_frames = {side: 0 for side in sides}
         self.pinch_recovery_frames = {side: 0 for side in sides}
         self.fist_release_buffer_started_at = {side: None for side in sides}
@@ -2621,6 +2735,7 @@ class SpatialDesktop(QWidget):
             "scroll_backdrop_opacity": self.scroll_backdrop_opacity,
             "scroll_backdrop_hue": self.scroll_backdrop_hue,
             "scroll_notch_hue": self.scroll_notch_hue,
+            "scroll_nav_hold_seconds": self.scroll_nav_hold_seconds,
             "detached_notice_opacity": self.detached_notice_opacity,
             "custom_gesture_hold_seconds": self.custom_gesture_hold_seconds,
             "custom_gesture_tolerance": self.custom_gesture_tolerance,
@@ -5846,6 +5961,7 @@ class SpatialDesktop(QWidget):
                 ("scroll_backdrop_opacity", self.scroll_backdrop_opacity, 0.0, 100.0, "SCROLL CIRCLE TRANSPARENCY"),
                 ("scroll_backdrop_hue", self.scroll_backdrop_hue, 0.0, 255.0, "SCROLL CIRCLE GREY SHADE"),
                 ("scroll_notch_hue", self.scroll_notch_hue, 0.0, 360.0, "SCROLL NOTCH COLOUR"),
+                ("scroll_nav_hold_seconds", self.scroll_nav_hold_seconds, 1.0, 5.0, "BACK / FORWARD HOLD TIMER"),
             ]
         if page == "tli":
             return [
@@ -7046,15 +7162,24 @@ class SpatialDesktop(QWidget):
             "scroll_total_travel": 0.0,
             "scroll_smoothed_dy": 0.0,
             "scroll_smoothed_dx": 0.0,
-            "scroll_axis": "vertical",
+            # Decide once from the first deliberate fist travel. None means
+            # only the centre marker is active; vertical wins ambiguous motion.
+            "scroll_axis": None,
             "horizontal_scroll_supported": None,
             "scroll_nav_fired": False,
+            "scroll_nav_hold_direction": None,
+            "scroll_nav_hold_started_at": None,
             "scroll_stage": 0,
+            # Stage and direction are independent: entering a fresh level makes one
+            # audible notch, not a sound on every frame or native wheel event.
+            "scroll_notch_direction": 0,
+            "scroll_notch_sound_at": float("-inf"),
             "scroll_open_candidate_since": None,
         }
         if mode == "scroll_window":
             active["mode"] = "scroll_window"
-            self.fist_scroll_markers[side] = {"point": QPointF(origin), "until": 0.0}
+            self.fist_scroll_markers[side] = {"point": QPointF(origin), "until": 0.0,
+                                              "axis": None}
             self.active_action[side] = active
             self.fist_action[side] = "native_action"
             self.status = "Scroll action active — keep fist closed; open hand to stop"
@@ -7181,6 +7306,63 @@ class SpatialDesktop(QWidget):
             except Exception:
                 pass
         return False
+
+    def _choose_fist_scroll_axis(self, active, dx, dy):
+        """Lock one scrolling axis per fist, favouring up/down over sideways.
+
+        Require meaningful initial motion to avoid hand pose noise. A sideways
+        direction only needs 20% more horizontal than vertical travel, instead
+        of the old 65% excess. Diagonals still favour vertical. Returning to
+        centre cannot change the axis: fully release the fist to choose again.
+        """
+        chosen = active.get("scroll_axis")
+        if chosen in ("vertical", "horizontal"):
+            return chosen
+        minimum = max(22.0, min(38.0, float(self.scroll_deadzone) * 0.45))
+        if math.hypot(float(dx), float(dy)) < minimum:
+            return None
+        chosen = ("horizontal" if abs(float(dx)) >= 1.20 * abs(float(dy))
+                  else "vertical")
+        active["scroll_axis"] = chosen
+        marker = self.fist_scroll_markers.get(active.get("side"))
+        if marker is not None:
+            marker["axis"] = chosen
+        active["scroll_stage"] = 0
+        active["scroll_remainder"] = 0.0
+        active["scroll_horizontal_remainder"] = 0.0
+        return chosen
+
+    def _scroll_navigation_hold_step(self, active, dx, dy, now, horizontal_supported,
+                                     deadzone, notch_spacing):
+        """Hold an outer side notch before one Back/Forward navigation command.
+
+        Uses the existing scrolling action's monotonic time and smoothed offsets.
+        Reaching a side notch starts the timer; leaving it, moving mostly vertically,
+        or switching sides resets progress. The fired latch is cleared only when the
+        fist returns to the scroll origin (handled in the scrolling frame loop).
+        """
+        candidate = None
+        if not horizontal_supported and not active.get("scroll_nav_fired", False):
+            outer = float(deadzone) + 2.0 * float(notch_spacing)
+            previous = active.get("scroll_nav_hold_direction")
+            # Small hysteresis prevents a genuinely held fist wobbling across the
+            # outer ring by a few pixels. It does NOT count time outside that ring.
+            threshold = outer - (12.0 if previous is not None else 0.0)
+            if abs(dx) >= threshold and abs(dx) >= abs(dy):
+                candidate = -1 if dx < 0.0 else 1
+        if candidate is None:
+            active["scroll_nav_hold_direction"] = None
+            active["scroll_nav_hold_started_at"] = None
+            return None
+        if (candidate != active.get("scroll_nav_hold_direction") or
+                active.get("scroll_nav_hold_started_at") is None):
+            active["scroll_nav_hold_direction"] = candidate
+            active["scroll_nav_hold_started_at"] = now
+            return None
+        if now - float(active["scroll_nav_hold_started_at"]) < self.scroll_nav_hold_seconds:
+            return None
+        active["scroll_nav_fired"] = True
+        return -candidate if self.swap_drag_scroll_notches else candidate
 
     def _scroll_target_window(self, active, steps, cursor=None, horizontal=False):
         """Scroll at the tracked point without moving a detached hand's OS cursor.
@@ -7377,6 +7559,7 @@ class SpatialDesktop(QWidget):
             "scroll_backdrop_opacity": ("scroll_backdrop_opacity", 0.5),
             "scroll_backdrop_hue": ("scroll_backdrop_hue", 1.0),
             "scroll_notch_hue": ("scroll_notch_hue", 1.0),
+            "scroll_nav_hold_seconds": ("scroll_nav_hold_seconds", 0.02),
             "detached_notice_opacity": ("detached_notice_opacity", 0.5),
             "ui_font_scale": ("ui_font_scale", 0.005),
             "custom_gesture_hold_seconds": ("custom_gesture_hold_seconds", 0.01),
@@ -8150,6 +8333,9 @@ class SpatialDesktop(QWidget):
         self.action_stop_wait_open[side] = False
         self.action_stop_open_since[side] = None
         self._clear_menu_pinch_sequence(side)
+        self._forming_fist_pinch_guard[side] = False
+        self._fist_guard_open_since[side] = None
+        self._pinch_pose_confirm_frames[side] = 0
         self.menu_pinch_started[side] = None
         self.menu_pinch_accumulated_seconds[side] = 0.0
         self.menu_pinch_pulse_started_at[side] = None
@@ -8722,6 +8908,9 @@ class SpatialDesktop(QWidget):
                 self.right_click_context_active[side] = False
                 self._clear_menu_pinch_sequence(side)
                 self.fist_release_required_for_pinch[side] = False
+                self._forming_fist_pinch_guard[side] = False
+                self._fist_guard_open_since[side] = None
+                self._pinch_pose_confirm_frames[side] = 0
                 self.fist_pose_confirmation_frames[side] = 0
                 self.side_cursor_positions[side] = None
                 self.smoothed_side_cursor_positions[side] = None
@@ -10475,7 +10664,8 @@ try {
         if len(self.custom_gestures) >= CUSTOM_GESTURE_MAX:
             self.custom_gesture_message = f"All {CUSTOM_GESTURE_MAX} slots are used. Delete one first."
             return
-        self.custom_gesture_recording = {"side": side, "started": now, "samples": [], "pinch": []}
+        self.custom_gesture_recording = {"side": side, "started": now, "samples": [],
+                                         "pinch": [], "claw_frames": 0}
         self._reset_custom_gesture_triggers()
         self.custom_gesture_message = f"Make the pose with your {side.upper()} hand and hold it still…"
 
@@ -10492,6 +10682,8 @@ try {
             features = hand_features(entry[0])
             if features is not None:
                 rec["samples"].append(features)
+                if is_claw_pose(entry[0]):
+                    rec["claw_frames"] += 1
                 ratio = custom_pinch_ratio(entry[0])
                 if ratio is not None:
                     rec["pinch"].append(ratio)
@@ -10513,6 +10705,13 @@ try {
             return
         pinch = sorted(rec["pinch"])[len(rec["pinch"])//2] if rec["pinch"] else None
         conflict = builtin_conflict(features, pinch)
+        # The generic custom-pose recognizer calls every four-finger curl a fist.
+        # Exempt ONLY a consistently recorded true claw (open MCP knuckles); an
+        # actual clenched fist remains reserved for built-in grabs and scrolling.
+        recorded_claw = (rec.get("claw_frames", 0) >=
+                         max(1, math.ceil(len(rec["samples"]) * 0.75)))
+        if recorded_claw and conflict == "That looks like a fist, which is already a built-in gesture.":
+            conflict = None
         if conflict:
             self.custom_gesture_message = conflict + " Try a different pose."
             return
@@ -10521,7 +10720,7 @@ try {
             self.custom_gesture_message = (f"Too similar to slot {similar+1} "
                                            f"({self.custom_gestures[similar]['label']}). Try a different pose.")
             return
-        label = describe_pose(features)
+        label = "CLAW" if recorded_claw else describe_pose(features)
         self.custom_gestures.append({"kind": "pose", "side": side, "features": features,
                                      "label": label, "action": "none", "timer": True})
         self._save_custom_gestures_now()
@@ -11129,7 +11328,7 @@ try {
             return f"{value:.2f}"
         if name == "pinch_timer":
             return f"{value:.1f}s"
-        if name in ("custom_gesture_hold_seconds", "default_gesture_hold_seconds", "pinch_buffer_seconds"):
+        if name in ("custom_gesture_hold_seconds", "default_gesture_hold_seconds", "pinch_buffer_seconds", "scroll_nav_hold_seconds"):
             return f"{value:.2f}s"
         if name == "custom_gesture_tolerance":
             return f"{value:.2f}"
@@ -11573,13 +11772,30 @@ try {
                                  palm_width_scale, base_skin)
         painter.restore()
 
+    @staticmethod
+    def _hand_mesh_pose_changed(target, previous):
+        """Ignore whole-hand translation and subpixel landmark jitter for GL poses.
+
+        The hand image is translated to follow the wrist in every paint, even if
+        its expensive OpenGL pose and pixel readback are reused. An actual finger
+        bend or wrist rotation still causes a prompt new render.
+        """
+        if previous is None or target.shape != previous.shape:
+            return True
+        change = target - previous
+        change -= change[0]  # Pure wrist/palm translation doesn't change the rig.
+        squared = (change[:, 0] ** 2 + change[:, 1] ** 2 +
+                   (change[:, 2] * 0.35) ** 2)
+        return bool(float(squared.max()) > 7.5**2 or
+                    float(squared.mean()) > 3.0**2)
+
     def _paint_hand_mesh_3d(self, painter, points, joints, side, user_scale, base):
         """Draw a lower-cost, cached frame of the rigged 3D hand mesh.
 
-        The GL render/readback path is CPU-expensive on software OpenGL (common on
-        Linux desktops). Render at 72% resolution and cap expensive pose renders to
-        the selected Hand Display FPS, repositioning the cached image between
-        pose renders. Gesture input stays independent of this visual limit.
+        The GL render/readback path is expensive on software OpenGL. Render at
+        a smaller offscreen resolution, and reuse the rendered hand whenever the
+        pose has not meaningfully changed. The image is still translated every
+        frame, and gesture recognition remains completely independent.
         """
         if self._hand_mesh_renderer is None:
             try:
@@ -11600,11 +11816,17 @@ try {
         model_side = side if side in ("left", "right") else "right"
         now = time.monotonic()
         colour = (base.red(), base.green(), base.blue())
-        render_scale = 0.72
+        # 0.64 versus the previous 0.72 uses ~21% fewer offscreen pixels per
+        # actual pose render (without reducing hand or cursor coordinate scale).
+        render_scale = 0.64
         render_interval = 1.0 / max(5, min(30, self.hand_display_fps))
         cache = self._hand_mesh_frame_cache.get(model_side)
-        render_now = (cache is None or now - cache["rendered_at"] >= render_interval or
-                      (cache is not None and colour != cache["colour"]))
+        render_now = (cache is None or colour != cache["colour"])
+        if not render_now and now-cache["rendered_at"] >= render_interval:
+            # Steady hands should not request a fresh GL render/readback at the
+            # full visual FPS. Refresh at least every 260ms for gradual changes.
+            render_now = (now-cache["rendered_at"] >= 0.26 or
+                          self._hand_mesh_pose_changed(target, cache["target"]))
 
         if render_now:
             # Lower pixel workload matters much more than multisampling on CPU-backed
@@ -12420,6 +12642,63 @@ try {
         self.menu_pinch_click_fired[side] = False
         self.menu_pinch_latched.discard(side)
 
+    def _fist_closing_blocks_pinch(self, side, landmarks, now, edge_tolerant=False):
+        """Keep quick successive fists from ever becoming a Pinch Menu gesture.
+
+        Watch the *other* fingers start folding even before the tucked thumb
+        makes a full fist. Ignore one-frame open readings between quick fists:
+        a continuous, fully open hand for 0.30 seconds releases the guard.
+        This never relaxes the actual fist/claw classifier.
+        """
+        if landmarks is None or len(landmarks) < 21:
+            return bool(self._forming_fist_pinch_guard[side])
+        straight = _finger_straightness_values(landmarks)
+        # An intentional thumb/index pinch typically leaves middle, ring and
+        # little fingers extended. Two clearly folding fingers (or three just
+        # starting to fold) indicate a fist being formed, not a pinch.
+        forming_fist = (fingers_closed_pose(landmarks, edge_tolerant=edge_tolerant)
+                         or sum(value < 0.88 for value in straight[1:]) >= 2
+                         or sum(value < 0.91 for value in straight[1:]) == 3)
+        if forming_fist:
+            self._forming_fist_pinch_guard[side] = True
+            self._fist_guard_open_since[side] = None
+        elif self._forming_fist_pinch_guard[side]:
+            if is_fully_open_hand_pose(landmarks, edge_tolerant=edge_tolerant):
+                if self._fist_guard_open_since[side] is None:
+                    self._fist_guard_open_since[side] = now
+                elif now - self._fist_guard_open_since[side] >= 0.30:
+                    self._forming_fist_pinch_guard[side] = False
+                    self._fist_guard_open_since[side] = None
+            else:
+                # A momentary open landmark amid fingers curling must not
+                # rearm pinches or inherit previous open time.
+                self._fist_guard_open_since[side] = None
+        if self._forming_fist_pinch_guard[side]:
+            self._pinch_pose_confirm_frames[side] = 0
+            if self.menu_pinch_started[side] is not None:
+                self._clear_menu_pinch_sequence(side)
+            return True
+        return False
+
+    def _confirm_intentional_pinch(self, side, raw_pinch, landmarks):
+        """Require two consecutive frames with independent open-finger evidence.
+
+        A thumb grazing the index during a quick fist is not enough to start
+        pinch countdown visuals or their sound. Existing confirmed pinch holds
+        and quick/double-pinch click timings are otherwise unchanged.
+        """
+        if (not raw_pinch or self._forming_fist_pinch_guard[side] or
+                landmarks is None or len(landmarks) < 21):
+            self._pinch_pose_confirm_frames[side] = 0
+            return False
+        straight = _finger_straightness_values(landmarks)
+        if sum(value >= 0.89 for value in straight[1:]) < 2:
+            self._pinch_pose_confirm_frames[side] = 0
+            return False
+        self._pinch_pose_confirm_frames[side] = min(
+            2, self._pinch_pose_confirm_frames[side] + 1)
+        return self._pinch_pose_confirm_frames[side] >= 2
+
     def _suppress_hand_for_modifier(self, side):
         """Cancel normal hold/menu paths for a hand temporarily dedicated to modifier clicking."""
         self._end_pinch_drag(side, status=False)
@@ -12880,8 +13159,26 @@ try {
         return True
 
     def _request_scene_repaint(self, now):
-        if (self._scene_is_idle(now) and
-                now-getattr(self, "_last_scene_repaint", 0.0) < self.IDLE_REPAINT_INTERVAL):
+        # The camera delivers at most 15 new pose frames per second. Painting the
+        # whole fullscreen overlay at 20-30 FPS adds little responsiveness but
+        # redraws large translucent/antialiased regions, especially in Garden.
+        # Keep the gesture/update timer running independently at its original rate.
+        elapsed = now - getattr(self, "_last_scene_repaint", 0.0)
+        if self._scene_is_idle(now):
+            minimum_interval = self.IDLE_REPAINT_INTERVAL
+        elif self._scene_transition is not None:
+            # The Garden/Space slide is a real animation with cached scene images.
+            minimum_interval = 1.0 / 30.0
+        elif (self.desktop_mode == "virtual" and self.virtual_garden_mode and
+              not any(now-float(seen or 0.0) < 0.6 for seen in self.hand_last_seen.values())):
+            # Gentle idle Garden animation: 10 FPS rather than repainting the
+            # entire scenery every scene-timer tick.
+            minimum_interval = 1.0 / 10.0
+        else:
+            # Honour the existing hand-display FPS setting (including 30 FPS),
+            # without tying gesture inference or wheel injection to paint timing.
+            minimum_interval = 1.0 / max(5, min(30, int(self.hand_display_fps)))
+        if elapsed < minimum_interval:
             return
         self._last_scene_repaint = now
         self.update()
@@ -13489,6 +13786,15 @@ try {
             if calibration_modal_frame or calibration_consumes_gesture:
                 # Calibration pinches must never also click, drag, or start built-in timers.
                 raw_fist = raw_pinch = raw_middle_pinch = raw_open = False
+            # Closing the fingers before the thumb forms a temporary near-index
+            # contact. Suppress it for either hand without relaxing fist recognition
+            # or depending on the TPI pointer's visual location.
+            if (self.gesture_tracking_enabled.get(side, True) and not peace and
+                    self._fist_closing_blocks_pinch(side, landmarks, now, edge_tolerant)):
+                raw_pinch = False
+            # Confirm that a pinch persists with at least two other fingers
+            # actually extended. Do this before the left-hand pinch exception.
+            raw_pinch = self._confirm_intentional_pinch(side, raw_pinch, landmarks)
             # Treat the open glass menu/settings as a gesture-modal surface. A hand
             # outside the visible panel may still be tracked/rendered, but its pose
             # cannot start a pinch timer, drag, scroll, or click through to an app.
@@ -13726,6 +14032,9 @@ try {
             self.right_click_context_active[side] = False
             self.hand_missing_since[side] = None
             self.fist_release_required_for_pinch[side] = False
+            self._forming_fist_pinch_guard[side] = False
+            self._fist_guard_open_since[side] = None
+            self._pinch_pose_confirm_frames[side] = 0
             self.fist_pose_confirmation_frames[side] = 0
             if self.gesture_owner == side:
                 self.gesture_owner = None
@@ -14123,72 +14432,100 @@ try {
                         active["scroll_smoothed_dy"] = smoothed_dy
                         deadzone = max(4.0, float(self.scroll_deadzone))
                         notch_spacing = 72.0
-                        # Scroll activation uses circular distance from the grab anchor,
-                        # so diagonal movement can drive both axes together. The existing
-                        # deadzone/notch spacing is preserved: deadzone, +1 notch, +2 notches.
-                        radial_distance = math.hypot(smoothed_dx, smoothed_dy)
-                        deadzone = max(4.0, float(self.scroll_deadzone))
-                        notch_spacing = 72.0
-                        if radial_distance <= deadzone:
+                        # The first deliberate motion fixes a SINGLE axis for this
+                        # fist. Crossing into another direction cannot scroll or
+                        # navigate on that axis until the fist is fully released.
+                        axis = self._choose_fist_scroll_axis(
+                            active, smoothed_dx, smoothed_dy)
+                        if axis is None:
+                            active["scroll_nav_hold_direction"] = None
+                            active["scroll_nav_hold_started_at"] = None
+                            active["last_cursor"] = QPointF(cursor)
+                            continue
+                        selected_delta = smoothed_dy if axis == "vertical" else smoothed_dx
+                        selected_distance = abs(selected_delta)
+                        if selected_distance <= deadzone:
                             scroll_stage = 0
-                        elif radial_distance < deadzone + notch_spacing:
+                        elif selected_distance < deadzone + notch_spacing:
                             scroll_stage = 1
-                        elif radial_distance < deadzone + notch_spacing * 2.0:
+                        elif selected_distance < deadzone + notch_spacing * 2.0:
                             scroll_stage = 2
                         else:
                             scroll_stage = 3
                         previous_stage = int(active.get("scroll_stage", 0))
+                        previous_notch_direction = int(active.get("scroll_notch_direction", 0))
+                        notch_direction = (-1 if selected_delta < 0.0 else 1) if scroll_stage else 0
                         active["scroll_stage"] = scroll_stage
+                        active["scroll_notch_direction"] = notch_direction
+                        # One blip upon entering a new visible notch (or the same
+                        # notch on the opposite side). Never blip at the centre or
+                        # for each wheel packet while a notch remains engaged.
+                        # A short throttle avoids sound storms if hand jitter hovers
+                        # exactly on a notch boundary; wheel timing is unaffected.
+                        if (scroll_stage > 0 and
+                                (scroll_stage != previous_stage or
+                                 notch_direction != previous_notch_direction) and
+                                now - float(active.get("scroll_notch_sound_at", float("-inf"))) >= 0.11):
+                            active["scroll_notch_sound_at"] = now
+                            chosen_sound = self.ui_preferences.get("sound_scroll_notch", "None")
+                            if chosen_sound and chosen_sound != "None":
+                                play_ui_sound(chosen_sound)
                         if scroll_stage == 0:
                             active["scroll_nav_fired"] = False
 
-                        horizontal_supported = active.get("horizontal_scroll_supported")
-                        if horizontal_supported is None:
-                            horizontal_supported = self._window_has_horizontal_scrollbar(active, cursor)
-                            active["horizontal_scroll_supported"] = horizontal_supported
-                        horizontal_supported = bool(horizontal_supported)
+                        # Checking native scrollbars can be costly; only probe
+                        # horizontal support when the initial travel chose it.
+                        if axis == "horizontal":
+                            horizontal_supported = active.get("horizontal_scroll_supported")
+                            if horizontal_supported is None:
+                                horizontal_supported = self._window_has_horizontal_scrollbar(active, cursor)
+                                active["horizontal_scroll_supported"] = horizontal_supported
+                            horizontal_supported = bool(horizontal_supported)
+                        else:
+                            horizontal_supported = False
 
-                        # Stage one gives a discrete nudge on each axis that has meaningful
-                        # displacement; higher stages continuously scroll both components.
-                        if scroll_stage == 1 and previous_stage == 0:
+                        # Stage one delivers a single nudge on the chosen axis;
+                        # later stages give a steady rate controlled by distance.
+                        if scroll_stage == 1 and previous_stage == 0 and (
+                                axis == "vertical" or horizontal_supported):
                             try:
-                                if abs(smoothed_dy) > 0.5:
-                                    self._scroll_target_window(active, 120 if smoothed_dy > 0 else -120,
-                                                               cursor=cursor)
-                                if horizontal_supported and abs(smoothed_dx) > 0.5:
-                                    self._scroll_target_window(active, 120 if smoothed_dx > 0 else -120,
-                                                               cursor=cursor, horizontal=True)
+                                self._scroll_target_window(
+                                    active, 120 if selected_delta > 0 else -120,
+                                    cursor=cursor, horizontal=(axis == "horizontal"))
                             except Exception as exc:
                                 self.status = f"Scroll failed: {exc}"
-
                         if scroll_stage < 2:
-                            vertical_rate = horizontal_rate = 0.0
+                            selected_rate = 0.0
+                        elif scroll_stage == 2:
+                            selected_rate = 1.5
                         else:
-                            if scroll_stage == 2:
-                                radial_rate = 1.5
-                            else:
-                                radial_rate = max(1.2, min(24.0, float(self.scroll_acceleration) * 2.4))
-                            # Preserve direction and blend by the radial vector, allowing
-                            # simultaneous diagonal scrolling without either axis taking over.
-                            vertical_rate = radial_rate * (smoothed_dy / radial_distance) if radial_distance else 0.0
-                            horizontal_rate = radial_rate * (smoothed_dx / radial_distance) if radial_distance else 0.0
-                        vertical_notches_per_second = vertical_rate * self.hand_tracking_sensitivity * 0.8
-                        horizontal_notches_per_second = horizontal_rate * self.hand_tracking_sensitivity * 0.8
-                        if not horizontal_supported:
-                            horizontal_notches_per_second = 0.0
-                            if scroll_stage == 3 and previous_stage != 3 and abs(smoothed_dx) > deadzone and not active.get("scroll_nav_fired", False):
-                                direction = -1 if smoothed_dx < 0 else 1
-                                if self.swap_drag_scroll_notches:
-                                    direction = -direction
+                            selected_rate = max(
+                                1.2, min(24.0, float(self.scroll_acceleration) * 2.4))
+                        selected_rate *= (1.0 if selected_delta > 0 else -1.0)
+                        selected_rate *= self.hand_tracking_sensitivity * 0.8
+                        vertical_notches_per_second = selected_rate if axis == "vertical" else 0.0
+                        horizontal_notches_per_second = (
+                            selected_rate if axis == "horizontal" and horizontal_supported else 0.0)
+                        # Only the locked horizontal axis can start the existing
+                        # configurable Back/Forward hold timer. Vertical scrolling
+                        # cannot accidentally enter this timer, even diagonally.
+                        if axis == "horizontal":
+                            direction = self._scroll_navigation_hold_step(
+                                active, smoothed_dx, 0.0, now,
+                                horizontal_supported, deadzone, notch_spacing)
+                            if direction is not None:
                                 if self._send_browser_navigation(direction):
-                                    self.status = "Back button sent" if direction < 0 else "Forward button sent"
-                                active["scroll_nav_fired"] = True
+                                    self.status = ("Back button sent" if direction < 0
+                                                   else "Forward button sent")
+                        else:
+                            active["scroll_nav_hold_direction"] = None
+                            active["scroll_nav_hold_started_at"] = None
                         # Edge auto-scroll: while the same fist remains closed near
                         # the top/bottom edge of its target window, scroll steadily even
                         # when the hand stops moving. The rate ramps gently with proximity.
                         hwnd = active.get("hwnd")
                         rect = self._native_window_rect(hwnd) if hwnd else None
-                        if rect is not None:
+                        if rect is not None and axis == "vertical":
                             left, top, right, bottom = rect
                             screen_cursor = self._virtual_point_to_global(cursor)
                             edge_band = 58.0
@@ -14200,8 +14537,8 @@ try {
                                     edge_rate = 3.0 * min(1.0, (screen_cursor.y() - (bottom - edge_band)) / edge_band)
                             # Edge auto-scroll adds up to 3 notches/s near the window edge.
                             vertical_notches_per_second += edge_rate
-                        # Independent accumulators allow horizontal and vertical wheel
-                        # messages in the same frame, preserving diagonal scroll direction.
+                        # Independent remainders are retained for compatibility,
+                        # but exactly one wheel axis is nonzero for this fist.
                         chunk = 40.0 if sys.platform.startswith("win") else 120.0
                         for axis_name, rate, horizontal in (
                                 ("scroll_remainder", vertical_notches_per_second, False),
@@ -14568,41 +14905,64 @@ try {
                             self.fist_target_window[side], origin)
 
                 # A RIGHT-only fist is a movement scroll gesture: no circle timer or
-                # 0.8s wait. A deliberate vertical displacement over client/scrollbar
-                # content arms the already-smoothed scroll path. The LEFT fist remains
-                # reserved as the modifier / two-hand drag clutch.
+                # 0.8s wait. The original scroll-arm helper only accepts vertical
+                # travel, so a sideways fist could NEVER arm scrolling regardless of
+                # the axis selector below. Recognise an independent deliberate
+                # horizontal start, keeping vertical preference on diagonals.
+                # The LEFT fist remains reserved for modifier / two-hand drag.
                 right_only_fist = (side == "right" and
                                    not poses.get("left", {}).get("fist", False) and
                                    not self.left_click_modifier_active)
                 scroll_candidate = False
+                horizontal_scroll_start = False
                 if right_only_fist and not self.fist_hold_armed[side]:
-                    proposed = should_start_right_fist_scroll(
-                        side=side, is_fist=is_fist,
-                        left_fist_active=poses.get("left", {}).get("fist", False),
-                        modifier_active=self.left_click_modifier_active,
-                        already_armed=self.fist_hold_armed[side],
-                        dx=dx_from_origin, dy=dy_from_origin,
-                        hit_test=self.fist_start_hit_test.get(side),
-                    )
-                    if proposed and not self.fist_target_window_resolved[side]:
-                        # Resolve the scroll target only once the hand actually moves,
-                        # not during ordinary quick fist-open clicks.
-                        self.fist_target_window[side] = self._find_native_window_at(origin)
-                        self.fist_start_hit_test[side] = self._native_nonclient_hit_test(
-                            self.fist_target_window[side], origin)
-                        self.fist_target_window_resolved[side] = True
-                    if proposed:
-                        scroll_candidate = should_start_right_fist_scroll(
+                    # Require a larger sideways displacement than the old 8 px
+                    # vertical trigger: closing the fist can move its TPI slightly.
+                    # 1.20x keeps truly diagonal starts reserved for vertical.
+                    sideways_intent = bool(
+                        is_fist and abs(dx_from_origin) >= 20.0 and
+                        abs(dx_from_origin) >= 1.20 * abs(dy_from_origin))
+                    hit_test = self.fist_start_hit_test.get(side)
+                    proposed = (
+                        should_start_right_fist_scroll(
                             side=side, is_fist=is_fist,
                             left_fist_active=poses.get("left", {}).get("fist", False),
                             modifier_active=self.left_click_modifier_active,
                             already_armed=self.fist_hold_armed[side],
                             dx=dx_from_origin, dy=dy_from_origin,
-                            hit_test=self.fist_start_hit_test.get(side),
-                        )
+                            hit_test=hit_test)
+                        or (sideways_intent and hit_test in (None, 0, 1, 6, 7)))
+                    if proposed and not self.fist_target_window_resolved[side]:
+                        # Resolve only on meaningful motion; do not arm from a
+                        # native title bar, toolbar control, or taskbar.
+                        self.fist_target_window[side] = self._find_native_window_at(origin)
+                        self.fist_start_hit_test[side] = self._native_nonclient_hit_test(
+                            self.fist_target_window[side], origin)
+                        self.fist_target_window_resolved[side] = True
+                    if proposed:
+                        hit_test = self.fist_start_hit_test.get(side)
+                        scroll_candidate = (
+                            should_start_right_fist_scroll(
+                                side=side, is_fist=is_fist,
+                                left_fist_active=poses.get("left", {}).get("fist", False),
+                                modifier_active=self.left_click_modifier_active,
+                                already_armed=self.fist_hold_armed[side],
+                                dx=dx_from_origin, dy=dy_from_origin,
+                                hit_test=hit_test)
+                            or (sideways_intent and hit_test in (None, 0, 1, 6, 7)))
+                        # The vertical rule and 1.20x sideways rule do not overlap:
+                        # a sideways start can safely lock horizontal immediately.
+                        horizontal_scroll_start = bool(scroll_candidate and sideways_intent)
                 if scroll_candidate:
                     self._arm_fist_hold_action(side, cursor, now, automatic_motion=True,
                                                force_mode="scroll_window")
+                    if horizontal_scroll_start:
+                        active_scroll = self.active_action.get(side)
+                        if active_scroll is not None and active_scroll.get("mode") == "scroll_window":
+                            active_scroll["scroll_axis"] = "horizontal"
+                            marker = self.fist_scroll_markers.get(side)
+                            if marker is not None:
+                                marker["axis"] = "horizontal"
                 elif (side == "right" and not self.fist_hold_armed[side] and
                       current_fist_held >= self.gesture_timer_delay_seconds and
                       poses.get("left", {}).get("fist", False) and
@@ -15158,7 +15518,14 @@ try {
             grey_level = int(max(0.0, min(255.0, self.scroll_backdrop_hue)))
             painter.setPen(Qt.NoPen)
             painter.setBrush(QBrush(QColor(grey_level, grey_level, grey_level, backdrop_alpha)))
-            painter.drawEllipse(point, backdrop_radius, backdrop_radius)
+            axis_visual = (action.get("scroll_axis") if scrolling else marker.get("axis"))
+            if axis_visual == "vertical":
+                painter.drawEllipse(point, max(30.0, deadzone_mark * 0.78), backdrop_radius)
+            elif axis_visual == "horizontal":
+                painter.drawEllipse(point, backdrop_radius, max(30.0, deadzone_mark * 0.78))
+            else:
+                painter.drawEllipse(point, max(16.0, deadzone_mark * 0.45),
+                                    max(16.0, deadzone_mark * 0.45))
 
         cx, cy = self.hub_pos.x()*width, self.hub_pos.y()*height
         scale = self.menu_ui_scale()
@@ -16091,8 +16458,9 @@ try {
             painter.drawLine(QPointF(point.x()+5, point.y()), QPointF(point.x()+15, point.y()))
             painter.drawLine(QPointF(point.x(), point.y()-15), QPointF(point.x(), point.y()-5))
             painter.drawLine(QPointF(point.x(), point.y()+5), QPointF(point.x(), point.y()+15))
-            # Show both control rulers simultaneously: up/down scrolling above/below
-            # the anchor, and horizontal scrolling or Back/Forward at its sides.
+            # Show only the ruler selected by initial fist travel; the other
+            # direction is invisible and cannot receive scrolling input.
+            axis_visual = (action.get("scroll_axis") if scrolling else marker.get("axis"))
             try:
                 smoothed_dx = float(action.get("scroll_smoothed_dx", 0.0)) if scrolling else 0.0
                 smoothed_dy = float(action.get("scroll_smoothed_dy", 0.0)) if scrolling else 0.0
@@ -16107,67 +16475,74 @@ try {
                 if distance < deadzone_mark + notch_spacing * 2.0:
                     return 2
                 return 3
-            vertical_stage = notch_stage(smoothed_dy)
-            horizontal_stage = notch_stage(smoothed_dx)
-            horizontal_fallback = bool(action.get("horizontal_scroll_supported") is False) if scrolling else False
-            for notch_index in range(3):
-                offset = deadzone_mark + notch_spacing*notch_index
-                half_width = 10.0 + notch_index*2.0
-                # Vertical ruler: white means that notch's distance stage is active.
-                vertical_active = vertical_stage == notch_index+1
-                vertical_color = QColor(255, 255, 255, alpha) if vertical_active else QColor.fromHsv(int(self.scroll_notch_hue) % 360, 190, 255, alpha)
-                if vertical_active:
-                    glow = QColor(255, 255, 255, int(alpha * 0.42))
-                    painter.setPen(QPen(glow, 11.0, Qt.SolidLine, Qt.RoundCap))
-                    for sign in (-1.0, 1.0):
-                        notch_y = point.y() + sign*offset
-                        if notch_index == 2 and scrolling:
-                            direction = sign
-                            painter.drawLine(QPointF(point.x()-7, notch_y-direction*7),
-                                             QPointF(point.x(), notch_y+direction*7))
-                            painter.drawLine(QPointF(point.x(), notch_y+direction*7),
-                                             QPointF(point.x()+7, notch_y-direction*7))
-                        else:
-                            painter.drawLine(QPointF(point.x()-half_width, notch_y), QPointF(point.x()+half_width, notch_y))
-                painter.setPen(QPen(vertical_color, 4.0, Qt.SolidLine, Qt.RoundCap))
-                for sign in (-1.0, 1.0):
-                    notch_y = point.y() + sign*offset
-                    if notch_index == 2 and scrolling:
-                        direction = sign
-                        painter.drawLine(QPointF(point.x()-7, notch_y-direction*7),
-                                         QPointF(point.x(), notch_y+direction*7))
-                        painter.drawLine(QPointF(point.x(), notch_y+direction*7),
-                                         QPointF(point.x()+7, notch_y-direction*7))
-                    else:
-                        painter.drawLine(QPointF(point.x()-half_width, notch_y),
-                                         QPointF(point.x()+half_width, notch_y))
-                # Horizontal ruler: if the target has no horizontal scroll range, the
-                # outer marks become left/right navigation arrows instead.
-                horizontal_active = horizontal_stage == notch_index+1
-                horizontal_color = QColor(255, 255, 255, alpha) if horizontal_active else QColor.fromHsv(int(self.scroll_notch_hue) % 360, 190, 255, alpha)
-                if horizontal_active:
-                    glow = QColor(255, 255, 255, int(alpha * 0.42))
-                    painter.setPen(QPen(glow, 11.0, Qt.SolidLine, Qt.RoundCap))
-                    for sign in (-1.0, 1.0):
-                        notch_x = point.x() + sign*offset
-                        if horizontal_fallback and notch_index == 2:
-                            direction = sign * (-1.0 if self.swap_drag_scroll_notches else 1.0)
-                            painter.drawLine(QPointF(notch_x-direction*7, point.y()-8), QPointF(notch_x+direction*7, point.y()))
-                            painter.drawLine(QPointF(notch_x+direction*7, point.y()), QPointF(notch_x-direction*7, point.y()+8))
-                        else:
-                            painter.drawLine(QPointF(notch_x, point.y()-half_width), QPointF(notch_x, point.y()+half_width))
-                painter.setPen(QPen(horizontal_color, 4.0, Qt.SolidLine, Qt.RoundCap))
-                for sign in (-1.0, 1.0):
-                    notch_x = point.x() + sign*offset
-                    if horizontal_fallback and notch_index == 2:
-                        direction = sign * (-1.0 if self.swap_drag_scroll_notches else 1.0)
-                        painter.drawLine(QPointF(notch_x-direction*7, point.y()-8),
-                                         QPointF(notch_x+direction*7, point.y()))
-                        painter.drawLine(QPointF(notch_x+direction*7, point.y()),
-                                         QPointF(notch_x-direction*7, point.y()+8))
-                    else:
-                        painter.drawLine(QPointF(notch_x, point.y()-half_width),
-                                         QPointF(notch_x, point.y()+half_width))
+            selected_delta = (smoothed_dy if axis_visual == "vertical" else
+                              smoothed_dx if axis_visual == "horizontal" else 0.0)
+            selected_stage = notch_stage(selected_delta)
+            horizontal_fallback = bool(
+                axis_visual == "horizontal" and scrolling and
+                action.get("horizontal_scroll_supported") is False)
+            if axis_visual in ("vertical", "horizontal"):
+                for notch_index in range(3):
+                    offset = deadzone_mark + notch_spacing * notch_index
+                    half_width = 10.0 + notch_index * 2.0
+                    chosen = selected_stage == notch_index + 1
+                    notch_color = (QColor(255, 255, 255, alpha) if chosen else
+                                   QColor.fromHsv(int(self.scroll_notch_hue) % 360,
+                                                  190, 255, alpha))
+                    for glow_pass in (True, False):
+                        if glow_pass and not chosen:
+                            continue
+                        painter.setPen(QPen(
+                            QColor(255, 255, 255, int(alpha * 0.42)) if glow_pass else notch_color,
+                            11.0 if glow_pass else 4.0, Qt.SolidLine, Qt.RoundCap))
+                        for sign in (-1.0, 1.0):
+                            if axis_visual == "vertical":
+                                notch_y = point.y() + sign * offset
+                                if notch_index == 2 and scrolling:
+                                    painter.drawLine(QPointF(point.x()-7, notch_y-sign*7),
+                                                     QPointF(point.x(), notch_y+sign*7))
+                                    painter.drawLine(QPointF(point.x(), notch_y+sign*7),
+                                                     QPointF(point.x()+7, notch_y-sign*7))
+                                else:
+                                    painter.drawLine(QPointF(point.x()-half_width, notch_y),
+                                                     QPointF(point.x()+half_width, notch_y))
+                            else:
+                                notch_x = point.x() + sign * offset
+                                if horizontal_fallback and notch_index == 2:
+                                    direction = sign * (-1.0 if self.swap_drag_scroll_notches else 1.0)
+                                    painter.drawLine(QPointF(notch_x-direction*7, point.y()-8),
+                                                     QPointF(notch_x+direction*7, point.y()))
+                                    painter.drawLine(QPointF(notch_x+direction*7, point.y()),
+                                                     QPointF(notch_x-direction*7, point.y()+8))
+                                else:
+                                    painter.drawLine(QPointF(notch_x, point.y()-half_width),
+                                                     QPointF(notch_x, point.y()+half_width))
+            if horizontal_fallback and scrolling:
+                held_side = action.get("scroll_nav_hold_direction")
+                started = action.get("scroll_nav_hold_started_at")
+                duration = max(0.1, float(self.scroll_nav_hold_seconds))
+                remaining = duration
+                progress = 0.0
+                if held_side in (-1, 1) and started is not None:
+                    elapsed = max(0.0, now - float(started))
+                    progress = min(1.0, elapsed/duration)
+                    remaining = max(0.0, duration-elapsed)
+                outer_offset = deadzone_mark + notch_spacing * 2.0
+                painter.setBrush(Qt.NoBrush)
+                for sign in (-1, 1):
+                    centre = QPointF(point.x() + sign*outer_offset, point.y())
+                    ring = QRectF(centre.x()-21, centre.y()-21, 42, 42)
+                    is_counting = held_side == sign and started is not None
+                    painter.setPen(QPen(QColor(118, 230, 245, int(alpha * 0.65)), 2.0))
+                    painter.drawEllipse(ring)
+                    if is_counting:
+                        painter.setPen(QPen(QColor(255, 255, 255, alpha), 3.8,
+                                            Qt.SolidLine, Qt.RoundCap))
+                        painter.drawArc(ring, 90*16, -int(progress*360*16))
+                        painter.setFont(self._ui_font(8, QFont.DemiBold))
+                        painter.setPen(QColor(240, 255, 255, alpha))
+                        painter.drawText(QRectF(centre.x()-29, centre.y()-47, 58, 21),
+                                         Qt.AlignCenter, f"{remaining:.1f}s")
             painter.setPen(Qt.NoPen)
             painter.setBrush(QBrush(QColor(180, 250, 255, alpha)))
             painter.drawEllipse(point, 2.3, 2.3)
