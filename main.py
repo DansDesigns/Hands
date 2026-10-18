@@ -28,6 +28,62 @@ import uuid
 from datetime import datetime
 from ctypes import wintypes
 from pathlib import Path
+
+
+def _windows_debug_console_requested() -> bool:
+    """Read the saved next-launch choice before the expensive Qt/vision imports.
+
+    Settings normally live in %APPDATA%/Freehand. Use the old in-project
+    settings file only on first launch, before user_paths migrates it.
+    """
+    roaming = Path(os.environ.get("APPDATA") or (Path.home() / "AppData" / "Roaming"))
+    saved = roaming / "Freehand" / "ui_settings.json"
+    if not saved.is_file():
+        saved = Path(__file__).resolve().parent / "ui_settings.json"
+    try:
+        return json.loads(saved.read_text(encoding="utf-8")).get("debug_console") is True
+    except (OSError, ValueError, TypeError, AttributeError):
+        return False
+
+
+def _configure_windows_console_on_startup() -> None:
+    """Hide the Windows CMD console by default; show it in debugging mode.
+
+    Hide/show, rather than FreeConsole(), preserves stdout/stderr and the
+    original terminal so switching the setting only needs a normal restart.
+    Nothing here affects Linux, and failure never prevents Freehand starting.
+    """
+    if sys.platform != "win32":
+        return
+    try:
+        from ctypes import wintypes as _wintypes
+        kernel = ctypes.WinDLL("kernel32", use_last_error=True)
+        user = ctypes.WinDLL("user32", use_last_error=True)
+        kernel.GetConsoleWindow.restype = _wintypes.HWND
+        user.ShowWindow.argtypes = (_wintypes.HWND, ctypes.c_int)
+        user.ShowWindow.restype = ctypes.c_bool
+        show_debug = _windows_debug_console_requested()
+        hwnd = kernel.GetConsoleWindow()
+        if not hwnd and show_debug:
+            # Also support a windowed/pythonw launcher: create a console on
+            # the next run only when the user explicitly enables debugging.
+            if kernel.AllocConsole():
+                hwnd = kernel.GetConsoleWindow()
+                if sys.stdout is None:
+                    sys.stdout = open("CONOUT$", "w", encoding="utf-8", buffering=1)
+                if sys.stderr is None:
+                    sys.stderr = open("CONOUT$", "w", encoding="utf-8", buffering=1)
+        if hwnd:
+            user.ShowWindow(hwnd, 5 if show_debug else 0)  # SW_SHOW / SW_HIDE
+    except (OSError, AttributeError, ValueError):
+        pass
+
+
+# Run this before OpenCV, MediaPipe and Qt load, avoiding an unnecessarily
+# long visible CMD window while heavy modules initialise.
+if __name__ == "__main__" and sys.platform == "win32":
+    _configure_windows_console_on_startup()
+
 from linux_screen_geometry import resolve_fullscreen_bounds
 from garden_weather import fetch_live_weather, calculate_solar_state, weather_kind, WEATHER_REFRESH_SECONDS
 
@@ -118,7 +174,9 @@ except Exception as exc:
 from PySide6.QtCore import Qt, QTimer, QPoint, QPointF, QRect, QRectF, QObject, Signal, QMimeData, QBuffer, QIODevice
 from PySide6.QtGui import QPainter, QColor, QPen, QBrush, QFont, QFontMetricsF, QCursor, QLinearGradient, QImage, QPainterPath, QPainterPathStroker, QRadialGradient, QGradient, QPolygonF, QDrag, QPixmap
 from PySide6.QtCore import QUrl
-from PySide6.QtWidgets import QApplication, QWidget, QMessageBox, QInputDialog
+from PySide6.QtWidgets import (QApplication, QWidget, QMessageBox, QInputDialog,
+                               QLineEdit, QDialog, QCheckBox, QLabel, QPushButton,
+                               QVBoxLayout, QHBoxLayout)
 
 from user_paths import user_data_dir, user_file
 
@@ -387,6 +445,150 @@ def play_ui_sound(filename, *, stop_event=None):
                     threading.Thread(target=_stop_process_on_cancel, daemon=True).start()
     except (OSError, ValueError):
         pass
+# Win32 touch injection structures use explicitly-sized fields. ctypes.wintypes.LONG
+# is platform-dependent on Linux, so these layouts must not rely on its host size.
+class _TouchPoint(ctypes.Structure):
+    _fields_ = [("x", ctypes.c_int32), ("y", ctypes.c_int32)]
+
+
+class _TouchRect(ctypes.Structure):
+    _fields_ = [("left", ctypes.c_int32), ("top", ctypes.c_int32),
+                ("right", ctypes.c_int32), ("bottom", ctypes.c_int32)]
+
+
+class _WinPointerInfo(ctypes.Structure):
+    _fields_ = [
+        ("pointerType", ctypes.c_uint32), ("pointerId", ctypes.c_uint32),
+        ("frameId", ctypes.c_uint32), ("pointerFlags", ctypes.c_uint32),
+        ("sourceDevice", ctypes.c_void_p), ("hwndTarget", ctypes.c_void_p),
+        ("ptPixelLocation", _TouchPoint), ("ptHimetricLocation", _TouchPoint),
+        ("ptPixelLocationRaw", _TouchPoint), ("ptHimetricLocationRaw", _TouchPoint),
+        ("dwTime", ctypes.c_uint32), ("historyCount", ctypes.c_uint32),
+        ("InputData", ctypes.c_int32), ("dwKeyStates", ctypes.c_uint32),
+        ("PerformanceCount", ctypes.c_uint64), ("ButtonChangeType", ctypes.c_uint32),
+    ]
+
+
+class _WinTouchInfo(ctypes.Structure):
+    _fields_ = [
+        ("pointerInfo", _WinPointerInfo), ("touchFlags", ctypes.c_uint32),
+        ("touchMask", ctypes.c_uint32), ("rcContact", _TouchRect),
+        ("rcContactRaw", _TouchRect), ("orientation", ctypes.c_uint32),
+        ("pressure", ctypes.c_uint32),
+    ]
+
+
+class _WindowsTouchInjector:
+    """Two real Win32 touch contacts; a single InjectTouchInput frame for both.
+
+    The Windows touch API must receive stable IDs, DOWN once, UPDATE while
+    pinching, and UP when either hand releases. No touchscreen is required.
+    """
+
+    DOWN = 0x00010000 | 0x00000002 | 0x00000004
+    UPDATE = 0x00020000 | 0x00000002 | 0x00000004
+    UP = 0x00040000
+
+    def __init__(self, api=None):
+        self.api = api
+        self.initialized = False
+        self.unavailable = False
+        self.active = False
+        self.last_points = None
+        self.last_error = ""
+        self.last_dispatch_at = 0.0
+
+    def _ensure_api(self):
+        if self.unavailable:
+            return False
+        if self.initialized:
+            return True
+        try:
+            if self.api is None:
+                self.api = ctypes.WinDLL("user32", use_last_error=True)
+            initialize = self.api.InitializeTouchInjection
+            initialize.argtypes = [ctypes.c_uint32, ctypes.c_uint32]
+            initialize.restype = ctypes.c_int
+            dispatch = self.api.InjectTouchInput
+            dispatch.argtypes = [ctypes.c_uint32, ctypes.POINTER(_WinTouchInfo)]
+            dispatch.restype = ctypes.c_int
+            # No system touch ripples over the user-facing hand indicators.
+            if not initialize(2, 0x3):  # TOUCH_FEEDBACK_NONE
+                raise OSError(f"InitializeTouchInjection failed (Win32 error {ctypes.get_last_error()})")
+            self.initialized = True
+            return True
+        except (OSError, AttributeError, ValueError) as exc:
+            self.last_error = str(exc)
+            self.unavailable = True
+            return False
+
+    @staticmethod
+    def _contact(pointer_id, point, flags):
+        x, y = int(round(point[0])), int(round(point[1]))
+        info = _WinTouchInfo()
+        info.pointerInfo.pointerType = 2  # PT_TOUCH
+        info.pointerInfo.pointerId = pointer_id
+        info.pointerInfo.pointerFlags = flags
+        info.pointerInfo.ptPixelLocation = _TouchPoint(x, y)
+        info.touchMask = 0x1 | 0x2 | 0x4  # CONTACTAREA, ORIENTATION, PRESSURE
+        info.rcContact = _TouchRect(x - 5, y - 5, x + 5, y + 5)
+        info.orientation = 90
+        info.pressure = 512
+        return info
+
+    def _send(self, points, flags):
+        contacts = (_WinTouchInfo * 2)(
+            self._contact(0, points["left"], flags),
+            self._contact(1, points["right"], flags),
+        )
+        try:
+            result = self.api.InjectTouchInput(2, contacts)
+            if not result:
+                self.last_error = f"InjectTouchInput failed (Win32 error {ctypes.get_last_error()})"
+            return bool(result)
+        except (OSError, AttributeError, ValueError) as exc:
+            self.last_error = str(exc)
+            return False
+
+    def start(self, points, now):
+        if self.active:
+            return self.update(points, now)
+        if not self._ensure_api():
+            return False
+        if not self._send(points, self.DOWN):
+            self.unavailable = True
+            return False
+        self.active = True
+        self.last_points = dict(points)
+        self.last_dispatch_at = float(now)
+        return True
+
+    def update(self, points, now):
+        if not self.active:
+            return False
+        # Avoid redundant native frames with immobile hands; preserve subpixel
+        # movement locally until an actual pixel change appears.
+        if self.last_points == points:
+            return True
+        if not self._send(points, self.UPDATE):
+            self.end()
+            self.unavailable = True
+            return False
+        self.last_points = dict(points)
+        self.last_dispatch_at = float(now)
+        return True
+
+    def end(self):
+        if not self.active:
+            return
+        try:
+            if self.last_points is not None:
+                self._send(self.last_points, self.UP)
+        finally:
+            self.active = False
+            self.last_points = None
+
+
 # Hand render styles, in the order shown by the Settings -> Hands switch.
 HAND_RENDER_STYLES = ("skeleton", "flat", "3d")
 HAND_RENDER_STYLE_LABELS = {"skeleton": "SKELETON", "flat": "FLAT", "3d": "3D"}
@@ -408,6 +610,96 @@ TTS_VOICE_OPTIONS = (
     "vits-piper-en_US-ryan-medium",
 )
 
+def normalise_wake_word_name(value):
+    """A short, speakable, user-configured trigger phrase (empty disables it)."""
+    if not isinstance(value, str):
+        return ""
+    return " ".join(value.strip().split())[:48].strip()
+
+
+def wake_word_command(transcript, wake_name):
+    """Return (matched, remainder), accepting 'name' or 'hey name command'.
+
+    This uses whole words: a named wake word must never match a substring of
+    another word or a similar-sounding command. Final recognition is authoritative.
+    """
+    name_words = re.findall(r"[a-z0-9']+", normalise_wake_word_name(wake_name).lower())
+    said_words = re.findall(r"[a-z0-9']+", str(transcript or "").lower())
+    if not name_words or not said_words:
+        return False, ""
+    if said_words[:len(name_words)] == name_words:
+        return True, " ".join(said_words[len(name_words):])
+    # Prefer exact-name matching first: a wake name such as "Hey" must not
+    # mistakenly be eaten as an optional leading greeting.
+    if (said_words[0] in ("hey", "hi", "okay", "ok") and
+            said_words[1:1+len(name_words)] == name_words):
+        return True, " ".join(said_words[1+len(name_words):])
+    return False, ""
+
+
+class WakeWordTrainingDialog(QDialog):
+    """Three *recognition* checks using existing Vosk final results.
+
+    No acoustic-model weights are modified: the three utterances validate that
+    the configured name is reliably recognized by the installed STT model.
+    """
+    def __init__(self, name, parent=None):
+        super().__init__(parent)
+        self.name = normalise_wake_word_name(name)
+        self.successes = 0
+        self.setWindowTitle("Freehand · Train Wake Word")
+        self.setWindowFlags(Qt.Dialog | Qt.WindowStaysOnTopHint)
+        self.setModal(True)
+        self.setMinimumWidth(415)
+        self.setStyleSheet("""
+            QDialog { background: #0b202d; color: #e5faff; }
+            QLabel { color: #def7ff; font-size: 12px; }
+            QCheckBox { color: #def7ff; font-size: 13px; padding: 8px; }
+            QCheckBox::indicator { width: 19px; height: 19px; }
+            QPushButton { background: #18485d; border: 1px solid #69bcd2;
+                          color: white; border-radius: 7px; padding: 9px 26px; }
+            QPushButton:hover { background: #236780; }
+        """)
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(22, 20, 22, 18)
+        layout.setSpacing(12)
+        header = QLabel(f'Say “{self.name}” clearly three separate times.')
+        header.setWordWrap(True)
+        layout.addWidget(header)
+        self.checks = []
+        for i in range(3):
+            checkbox = QCheckBox(f'Recognition {i+1} of 3')
+            checkbox.setFocusPolicy(Qt.NoFocus)
+            checkbox.setAttribute(Qt.WA_TransparentForMouseEvents, True)
+            layout.addWidget(checkbox)
+            self.checks.append(checkbox)
+        self.feedback = QLabel('Waiting for microphone…')
+        self.feedback.setWordWrap(True)
+        layout.addWidget(self.feedback)
+        controls = QHBoxLayout()
+        controls.addStretch(1)
+        self.cancel_button = QPushButton('Cancel')
+        self.cancel_button.clicked.connect(self.reject)
+        controls.addWidget(self.cancel_button)
+        layout.addLayout(controls)
+
+    def receive_final(self, text):
+        matched, remainder = wake_word_command(text, self.name)
+        if not matched or remainder:
+            self.feedback.setText(f'Heard “{text}”. Please say only “{self.name}”.')
+            return False
+        if self.successes >= 3:
+            return True
+        self.checks[self.successes].setChecked(True)
+        self.successes += 1
+        if self.successes == 3:
+            self.feedback.setText('Passed 3/3 — wake word verified!')
+            self.cancel_button.setText('Done')
+            return True
+        self.feedback.setText(f'Correct: {self.successes}/3. Say “{self.name}” again.')
+        return False
+
+
 def load_ui_preferences() -> dict:
     defaults = {
         "paused_notice_position": "bottom-center",
@@ -418,6 +710,9 @@ def load_ui_preferences() -> dict:
         "stt_indicator_position": "top-right",
         "ui_font_scale": 1.2,
         "show_gesture_disabled_indicator": True,
+        "debug_console": False,
+        "wake_word_name": "",
+        "wake_word_trained": False,
         "garden_onboarding_completed": False,
         "sound_defaults_v1_applied": False,
         **{key: DEFAULT_UI_SOUNDS.get(key, "None") for key, _label in SOUND_SETTING_ROWS},
@@ -435,9 +730,11 @@ def load_ui_preferences() -> dict:
                     result[key] = min(1.4, max(0.7, float(value)))
                 except (TypeError, ValueError):
                     pass
-            elif key in ("show_gesture_disabled_indicator", "garden_onboarding_completed"):
+            elif key in ("show_gesture_disabled_indicator", "garden_onboarding_completed", "debug_console", "wake_word_trained"):
                 if isinstance(value, bool):
                     result[key] = value
+            elif key == "wake_word_name":
+                result[key] = normalise_wake_word_name(value)
             elif key == "sound_defaults_v1_applied":
                 if isinstance(value, bool):
                     result[key] = value
@@ -447,6 +744,8 @@ def load_ui_preferences() -> dict:
                     result[key] = value
             elif value in NOTIFICATION_POSITIONS:
                 result[key] = value
+    if not result["wake_word_name"]:
+        result["wake_word_trained"] = False
     return result
 
 def save_ui_preferences(values: dict) -> None:
@@ -458,9 +757,11 @@ def save_ui_preferences(values: dict) -> None:
                 current[key] = min(1.4, max(0.7, float(value)))
             except (TypeError, ValueError):
                 pass
-        elif key in ("show_gesture_disabled_indicator", "garden_onboarding_completed"):
+        elif key in ("show_gesture_disabled_indicator", "garden_onboarding_completed", "debug_console", "wake_word_trained"):
             if isinstance(value, bool):
                 current[key] = value
+        elif key == "wake_word_name":
+            current[key] = normalise_wake_word_name(value)
         elif key == "sound_defaults_v1_applied":
             if isinstance(value, bool):
                 current[key] = value
@@ -470,6 +771,8 @@ def save_ui_preferences(values: dict) -> None:
                 current[key] = value
         elif value in NOTIFICATION_POSITIONS:
             current[key] = value
+    if not current["wake_word_name"]:
+        current["wake_word_trained"] = False
     try:
         UI_SETTINGS_FILE.write_text(json.dumps(current, indent=2) + "\n", encoding="utf-8")
     except OSError as exc:
@@ -1458,6 +1761,8 @@ class SearchHandOverlay(QWidget):
         # on Windows; Linux keeps the original Search-only overlay behaviour.
         windows_global_layer = bool(
             sys.platform.startswith("win") and not owner.hand_tracking_paused and
+            not getattr(owner, "_wake_word_training_dialog", None) and
+            not getattr(owner, "_wake_word_name_editing", False) and
             not getattr(owner, "hand_calibration_active", False) and
             getattr(owner, "tli_calibration_active_side", None) is None
         )
@@ -2250,6 +2555,26 @@ class SpatialDesktop(QWidget):
         self.swap_drag_scroll_notches = settings.get("swap_drag_scroll_notches", False)
         self.cursor_lock_priority = settings.get("cursor_lock_priority", "right")
         self.ui_preferences = load_ui_preferences()
+        self._wake_word_armed_until = 0.0
+        self._wake_word_training_dialog = None
+        self._wake_word_name_editing = False
+        self._wake_word_training_started_speech = False
+        self._wake_word_save_timer = QTimer(self)
+        self._wake_word_save_timer.setSingleShot(True)
+        self._wake_word_save_timer.timeout.connect(self._save_wake_word_preferences)
+        self.wake_word_entry = QLineEdit(self)
+        self.wake_word_entry.setMaxLength(48)
+        self.wake_word_entry.setPlaceholderText('Empty = no wake word')
+        self.wake_word_entry.setText(self.ui_preferences.get('wake_word_name', ''))
+        self.wake_word_entry.setStyleSheet(
+            'QLineEdit {background-color: #09283a; color: #e8fdff; border: 2px solid #5cbed0; '
+            'border-radius: 8px; padding: 4px 12px; font-size: 13px;}'
+            'QLineEdit:focus {border: 2px solid #9af3de;}')
+        self.wake_word_entry.textEdited.connect(self._on_wake_word_name_edited)
+        self.wake_word_entry.hide()
+        # This is the *next-launch* console state. Do not change the running
+        # process when the user toggles the button in Interaction settings.
+        self.debug_console_enabled = bool(self.ui_preferences.get("debug_console", False))
         if not self.ui_preferences.get("sound_defaults_v1_applied", False):
             for sound_key, default_file in DEFAULT_UI_SOUNDS.items():
                 if self.ui_preferences.get(sound_key) in (None, "None", ""):
@@ -2569,6 +2894,11 @@ class SpatialDesktop(QWidget):
         self.pinch_buffer_seconds = float(settings.get("pinch_buffer_seconds", 0.8))
         # Two-hand thumb-to-middle pinch zoom. The existing Pinch Menu buffer is reused;
         # once the hold is confirmed, hand separation drives content zoom or corner resize.
+        # Two thumb-to-index pinches generate genuine Windows multitouch in OS
+        # mode. Other platforms and the existing thumb-middle zoom are unchanged.
+        self._windows_touch = (_WindowsTouchInjector()
+                               if sys.platform.startswith("win") else None)
+        self._two_hand_touch_last_both_at = None
         self.middle_pinch_zoom = {
             "started_at": None, "last_both_seen_at": None, "active": False,
             "mode": None, "hwnd": None, "rect": None, "corners": None,
@@ -5322,6 +5652,7 @@ class SpatialDesktop(QWidget):
             stack("scroll_toggle")
             stack("swap_drag_scroll_toggle")
             stack("priority_toggle")
+            stack("debugging_toggle")
         elif page == "hands":
             stack("render_style")
             stack("skin_tint")
@@ -5361,6 +5692,11 @@ class SpatialDesktop(QWidget):
             stack("face_welcome")
             y += group
             stack("streamtts_config", h=42.0)
+            y += group
+            texts['wake_word_caption'] = (L, y, W, 21.0)
+            y += 23.0
+            stack('wake_word_field', h=40.0)
+            stack('wake_word_train', h=42.0)
             texts["status"] = (L, y, W, 48.0)
             y += 48.0 + gap
         elif page == "update":
@@ -7775,6 +8111,15 @@ class SpatialDesktop(QWidget):
                     self.cursor_lock_priority = "left" if self.cursor_lock_priority == "right" else "right"
                     self.schedule_gesture_settings_save()
                     self.status = f"Cursor lock priority: {self.cursor_lock_priority.title()} hand"
+                elif pressed("debugging_toggle"):
+                    self.debug_console_enabled = not self.debug_console_enabled
+                    self.ui_preferences["debug_console"] = self.debug_console_enabled
+                    # Persist immediately, so an immediate restart uses the
+                    # requested console mode even if the gesture debounce has
+                    # not fired yet. The current console stays as it is.
+                    save_ui_preferences(self.ui_preferences)
+                    self.status = ("Debugging console will SHOW after restart" if self.debug_console_enabled
+                                   else "Debugging console will HIDE after restart")
                 return
 
             if self.settings_page == "tli":
@@ -7874,7 +8219,16 @@ class SpatialDesktop(QWidget):
                 return
 
             if self.settings_page == "voice":
-                if pressed("tts_toggle"):
+                if pressed('wake_word_field'):
+                    # Hand-driven activation works even when OS mode's transparent
+                    # overlay cannot receive ordinary keyboard focus from a touch.
+                    # A hand click cannot always focus an embedded text editor
+                    # through the native OS overlay. Open a proper keyboard input
+                    # dialog as a fallback; direct physical typing still works.
+                    self._edit_wake_word_name_dialog()
+                elif pressed('wake_word_train'):
+                    self._open_wake_word_training()
+                elif pressed("tts_toggle"):
                     self.tts.set_enabled(not self.tts.enabled)
                     self.status = "Local TTS " + ("enabled" if self.tts.enabled else "disabled")
                 elif pressed("voice_cycle"):
@@ -8796,7 +9150,131 @@ class SpatialDesktop(QWidget):
             committed.extend(new_words)
         self.focus_dictation_last_partial = text
 
+    def _save_wake_word_preferences(self):
+        save_ui_preferences(self.ui_preferences)
+
+    def _on_wake_word_name_edited(self, value):
+        name = normalise_wake_word_name(value)
+        old_name = self.ui_preferences.get('wake_word_name', '')
+        if name != old_name:
+            # A new name is unverified; leave ordinary commands intact until
+            # three correctly recognised utterances confirm the replacement.
+            self.ui_preferences['wake_word_name'] = name
+            self.ui_preferences['wake_word_trained'] = False
+            self._wake_word_armed_until = 0.0
+            self._wake_word_save_timer.start(450)
+            self.status = ('Wake-word name saved — train it to activate.' if name else
+                           'Wake word disabled — all ordinary voice commands work.')
+            self.update()
+
+    def _edit_wake_word_name_dialog(self):
+        self._wake_word_name_editing = True
+        try:
+            name, accepted = QInputDialog.getText(
+                self, 'Freehand · Wake Word', 'Wake-word name (leave empty to disable):',
+                QLineEdit.Normal, self.wake_word_entry.text())
+        finally:
+            self._wake_word_name_editing = False
+        if accepted:
+            self.wake_word_entry.setText(normalise_wake_word_name(name))
+            self._on_wake_word_name_edited(self.wake_word_entry.text())
+
+    def _sync_wake_word_entry(self):
+        entry = getattr(self, 'wake_word_entry', None)
+        if entry is None:
+            return
+        show = bool(self.menu_open and self.hub_visible and self.settings_open and
+                    self.settings_page == 'voice' and
+                    not (self._wake_word_training_dialog and
+                         self._wake_word_training_dialog.isVisible()) and
+                    self.width() > 0 and self.height() > 0)
+        if show:
+            box = self._settings_control_rects(page='voice').get('wake_word_field')
+            if box is None:
+                show = False
+            else:
+                rect = box.adjusted(2, 1, -2, -1).toRect()
+                if entry.geometry() != rect:
+                    entry.setGeometry(rect)
+        if entry.isVisible() != show:
+            entry.setVisible(show)
+
+    def _open_wake_word_training(self):
+        if self._wake_word_training_dialog is not None:
+            self._wake_word_training_dialog.raise_()
+            return
+        name = normalise_wake_word_name(self.wake_word_entry.text())
+        if not name:
+            self.status = 'Enter a wake-word name before training (empty disables it).'
+            self.wake_word_entry.setFocus(Qt.OtherFocusReason)
+            return
+        if name != self.ui_preferences.get('wake_word_name'):
+            self._on_wake_word_name_edited(name)
+        self._save_wake_word_preferences()
+        dialog = WakeWordTrainingDialog(name, self)
+        self._wake_word_training_dialog = dialog
+        self._wake_word_training_started_speech = False
+        dialog.finished.connect(self._finish_wake_word_training)
+        dialog.show()
+        dialog.raise_()
+        dialog.activateWindow()
+        if not self.speech.running:
+            if self.speech.start():
+                self._wake_word_training_started_speech = True
+                self.stt_enabled = True
+                dialog.feedback.setText('Microphone ready. Say the name clearly (1 of 3).')
+            else:
+                dialog.feedback.setText('Microphone/Vosk unavailable. Check input, or Cancel.')
+        else:
+            dialog.feedback.setText('Listening. Say the name clearly (1 of 3).')
+
+    def _finish_wake_word_training(self, _result):
+        dialog = self._wake_word_training_dialog
+        if dialog is None:
+            return
+        trained = dialog.successes == 3 and (dialog.name == self.ui_preferences.get('wake_word_name', ''))
+        if trained:
+            self.ui_preferences['wake_word_trained'] = True
+            self._save_wake_word_preferences()
+            self.status = (f'Wake word “{dialog.name}” verified — say it before commands. ' +
+                           ('Turn Voice Input ON to listen.' if self._wake_word_training_started_speech else ''))
+        else:
+            self.status = ('Wake-word training cancelled — ordinary commands remain available.'
+                           if not self.ui_preferences.get('wake_word_trained') else
+                           'Wake-word training closed; existing setting preserved.')
+        if self._wake_word_training_started_speech:
+            self.speech.stop()
+            self.stt_enabled = False
+        self._wake_word_training_started_speech = False
+        self._wake_word_training_dialog = None
+        dialog.deleteLater()
+        self._sync_wake_word_entry()
+        self.update()
+
+    def _wake_word_gate(self, transcript):
+        """Return command text, '' for activation only, or None if not addressed."""
+        name = self.ui_preferences.get('wake_word_name', '')
+        if not name or not self.ui_preferences.get('wake_word_trained', False):
+            return transcript
+        matched, remainder = wake_word_command(transcript, name)
+        if matched:
+            if not remainder:
+                self._wake_word_armed_until = time.monotonic() + 8.0
+                self.status = f'Wake word “{name}” heard — speak a command.'
+                return ''
+            self._wake_word_armed_until = 0.0
+            return remainder
+        if time.monotonic() < self._wake_word_armed_until:
+            self._wake_word_armed_until = 0.0
+            return transcript
+        return None
+
     def on_speech_partial(self, text):
+        if self._wake_word_training_dialog is not None:
+            if text.strip():
+                self._wake_word_training_dialog.feedback.setText(
+                    f'Listening: “{text}” — say only the wake word.')
+            return
         self.speech_partial = text
         # A new phrase should immediately replace any previous unrecognised-command
         # feedback, even before the next final recognition arrives.
@@ -8816,6 +9294,10 @@ class SpatialDesktop(QWidget):
 
     def on_voice_status(self, text):
         # Status callbacks from STT/TTS are routed through Qt signals.
+        if (self._wake_word_training_dialog is not None and text.startswith(
+                ('Voice input error:', 'Microphone unavailable:', 'Vosk model not found', 'Vosk model unavailable:'))):
+            self._wake_word_training_dialog.feedback.setText(
+                text + ' — check the microphone or press Cancel.')
         if text:
             if text.startswith(("Voice input error:", "Microphone unavailable:", "Vosk model not found")):
                 self.stt_enabled = False
@@ -9777,9 +10259,27 @@ try {
         self.heard_popup_mode = "transcript"
         self.heard_popup_message = ""
         self.heard_popup_shake_until = 0.0
+        if self._wake_word_training_dialog is not None:
+            training = self._wake_word_training_dialog
+            if training.receive_final(text) and training.successes == 3:
+                self.ui_preferences['wake_word_trained'] = True
+                self._save_wake_word_preferences()
+            return
         low = text.lower().strip()
         low = re.sub(r"\s+", " ", low)
         dialog = self.search_dialog
+        # Dictation remains free-flowing after it has been explicitly started.
+        # 'Stop listening' remains available without a wake word for safety.
+        if (self.ui_preferences.get('wake_word_name') and
+                self.ui_preferences.get('wake_word_trained', False) and
+                not self.focus_dictation_enabled and
+                not (dialog is not None and dialog.isVisible() and dialog.dictation_enabled) and
+                low not in ('stop listening', 'voice off', 'stop voice control')):
+            addressed = self._wake_word_gate(text)
+            if addressed is None or addressed == '':
+                return
+            text = addressed
+            low = re.sub(r"\s+", " ", text.lower().strip())
 
         # Handle global stop-listening commands before any dictation path can type
         # the phrase into a field. Keep confirmation identical to the Glass Menu.
@@ -10042,6 +10542,7 @@ try {
 
     def apply_desktop_mode(self):
         """Configure a fullscreen overlay; OS mode passes physical mouse input through."""
+        self._end_two_hand_touch()
         self._applied_desktop_mode = self.desktop_mode
         self._applied_menu_state = bool(self.menu_open and self.hub_visible)
         self._sync_scroll_cursor_visibility()
@@ -12939,6 +13440,11 @@ try {
         """
         if getattr(self, "_capturing_glass_backdrop", False):
             return
+        # A native wake-word training popup must remain above the fullscreen
+        # click-through owner (and must keep keyboard/mouse focus for Cancel).
+        training = getattr(self, '_wake_word_training_dialog', None)
+        if (training is not None and training.isVisible()) or getattr(self, '_wake_word_name_editing', False):
+            return
         now = time.monotonic() if now is None else float(now)
         if sys.platform.startswith("linux") and now-float(
                 getattr(self, "_last_linux_geometry_sync_check", 0.0)) >= 0.5:
@@ -13203,6 +13709,94 @@ try {
         timer = getattr(self, "timer", None)
         if timer is not None and timer.interval() != desired_ms:
             timer.setInterval(desired_ms)
+
+    def _end_two_hand_touch(self):
+        """Release injected contacts on pinch exit, mode switch, or shutdown."""
+        injector = getattr(self, "_windows_touch", None)
+        if injector is not None:
+            injector.end()
+        self._two_hand_touch_last_both_at = None
+
+    def _process_two_hand_touch(self, cursor_points, poses, now):
+        """Turn simultaneous index pinches into two native Windows touch points.
+
+        Ordinary one-hand pinches continue through the existing click/drag/menu
+        handlers. Starting a dual touch consumes both hands so no native mouse,
+        pinch-menu, or custom gesture can fire during the touch session.
+        """
+        injector = getattr(self, "_windows_touch", None)
+        if injector is None:
+            return False
+        search = getattr(self, "search_dialog", None)
+        modal = (self._gesture_ui_modal_open() or
+                 self.tli_calibration_active_side is not None or
+                 self.hand_calibration_active or self.voice_selection_mode is not None or
+                 self.custom_gesture_recording is not None or
+                 any(self.fist_action_menu_open.values()) or
+                 (search is not None and search.isVisible()))
+        if self.desktop_mode != "os" or modal:
+            self._end_two_hand_touch()
+            return False
+        # The existing two-hand thumb-MIDDLE pinch deliberately owns zoom/resize.
+        # Do not inject index touches when that distinct action is in progress.
+        middle = self.middle_pinch_zoom
+        if (middle.get("started_at") is not None or middle.get("active") or
+                all(poses.get(side, {}).get("middle_pinch", False)
+                    for side in ("left", "right"))):
+            self._end_two_hand_touch()
+            return False
+        both = all(
+            side in cursor_points and
+            poses.get(side, {}).get("pinch", False) and
+            not poses.get(side, {}).get("fist", False) and
+            self.gesture_tracking_enabled.get(side, False)
+            for side in ("left", "right")
+        )
+        if both:
+            points = {}
+            for side in ("left", "right"):
+                position = self._virtual_point_to_global(cursor_points[side])
+                if position is None:
+                    both = False
+                    break
+                points[side] = (int(position.x()), int(position.y()))
+        if both:
+            self._two_hand_touch_last_both_at = float(now)
+            if not injector.active:
+                # A native drag is an exclusive mouse action; release it before
+                # injecting contacts, and clear timers from either hand.
+                for side in ("left", "right"):
+                    self._end_pinch_drag(side, status=False)
+                    if self.fist_mouse_down.get(side, False):
+                        self._release_fist_mouse(side)
+                    self.active_action[side] = None
+                    self._reset_fist_gesture(side)
+                    self._clear_menu_pinch_sequence(side)
+                    self.active_push_sides.discard(side)
+                self.gesture_owner = None
+                if not injector.start(points, now):
+                    self.status = ("Windows multitouch unavailable: " +
+                                   (injector.last_error or "touch injection failed"))
+                    # Consume this pair, even on API failure: don't accidentally
+                    # click an application twice after failed touch activation.
+                    return True
+                self.status = "Two-hand touchscreen touch — move both pinches; release either to end"
+            elif not injector.update(points, now):
+                self.status = "Windows multitouch interrupted: " + injector.last_error
+            return True
+
+        if injector.active:
+            # One bad MediaPipe frame should not immediately lift both fingers.
+            last = self._two_hand_touch_last_both_at
+            if last is not None and now-float(last) <= 0.12:
+                return True
+            self._end_two_hand_touch()
+            self.status = "Two-hand touchscreen touch released"
+            # Consume the release frame so it never becomes a single-hand click.
+            for side in ("left", "right"):
+                self._clear_menu_pinch_sequence(side)
+            return True
+        return False
 
     def _reset_middle_pinch_zoom(self):
         """Clear a pending or active two-hand pinch zoom session."""
@@ -13524,7 +14118,9 @@ try {
         scroll_dt = max(0.0, min(0.05, now - previous_scene_time))
         self._last_update_scene_time = now
         self._maintain_native_topmost(now)
+        self._sync_wake_word_entry()
         if self.hand_tracking_paused:
+            self._end_two_hand_touch()
             self._sync_scroll_cursor_visibility()
             # No hand cursor, skeleton, TLI, or gesture timers while paused. Vosk and camera
             # frames remain active so the user can say "resume tracking".
@@ -13555,6 +14151,7 @@ try {
         # Full-screen-modal onboarding keeps live inference/rendering available but stops
         # all normal pointer, click, drag, scroll, peace-toggle and menu gesture paths.
         if getattr(self, "hand_calibration_active", False):
+            self._end_two_hand_touch()
             self.hand_positions = {
                 side: [(float(lm.x), float(lm.y), float(lm.z)) for lm in hands_by_side[side][0]]
                 if side in hands_by_side else []
@@ -13901,12 +14498,22 @@ try {
                 pass
 
         if calibration_modal_frame:
+            self._end_two_hand_touch()
             # Do not move the OS pointer or pass poses into any normal gesture handler
             # while the standalone calibration target is open. Sampling continues above.
             self.pointer_side = None
             self.active_push_sides = set()
             self.depth += (self.target_depth-self.depth)*0.16
             self.update()
+            self._stop_inactive_timer_during_sounds()
+            return
+
+        if self._process_two_hand_touch(cursor_points, poses, now):
+            self.pointer_side = None
+            self.active_push_sides.clear()
+            self.depth += (self.target_depth-self.depth)*0.16
+            self._request_scene_repaint(now)
+            self._sync_scroll_cursor_visibility()
             self._stop_inactive_timer_during_sounds()
             return
 
@@ -15146,6 +15753,12 @@ try {
         self._request_scene_repaint(now)
 
     def closeEvent(self, event):
+        if self._wake_word_save_timer.isActive():
+            self._wake_word_save_timer.stop()
+            self._save_wake_word_preferences()
+        if self._wake_word_training_dialog is not None:
+            self._wake_word_training_dialog.reject()
+        self._end_two_hand_touch()
         if self._native_scroll_cursor_hidden:
             try:
                 ctypes.windll.user32.ShowCursor(True)
@@ -15866,8 +16479,10 @@ try {
                         scroll = controls["scroll_toggle"]
                         swap_nav = controls["swap_drag_scroll_toggle"]
                         priority = controls["priority_toggle"]
+                        debugging = controls["debugging_toggle"]
                         for rect, enabled in ((scroll, self.invert_scroll),
-                                              (swap_nav, self.swap_drag_scroll_notches)):
+                                              (swap_nav, self.swap_drag_scroll_notches),
+                                              (debugging, self.debug_console_enabled)):
                             painter.setBrush(QBrush(QColor(55, 145, 82, 225) if enabled else QColor(75, 80, 89, 205)))
                             painter.setPen(QPen(QColor(155, 245, 180, 220) if enabled else QColor(155, 162, 172, 200), 1.5*scale))
                             painter.drawRoundedRect(rect, 10*scale, 10*scale)
@@ -15878,6 +16493,7 @@ try {
                         self._draw_fitted_button_label(painter, scroll, "SCROLL  ·  "+("INVERTED" if self.invert_scroll else "NORMAL"), base_size=label_size, min_size=6, inset=12*scale)
                         self._draw_fitted_button_label(painter, swap_nav, "DRAG NAV  ·  "+("BACK/FORWARD SWAPPED" if self.swap_drag_scroll_notches else "NORMAL"), base_size=label_size, min_size=6, inset=12*scale)
                         self._draw_fitted_button_label(painter, priority, "CURSOR PRIORITY  ·  "+self.cursor_lock_priority.upper(), base_size=label_size, min_size=6, inset=12*scale)
+                        self._draw_fitted_button_label(painter, debugging, "DEBUGGING  ·  "+("ON" if self.debug_console_enabled else "OFF")+" (NEXT RUN)", base_size=label_size, min_size=6, inset=12*scale)
 
                     elif self.settings_page == "tli":
                         glow_toggle = controls["glow_toggle"]
@@ -16096,6 +16712,22 @@ try {
                         self._draw_fitted_button_label(painter, face_button, face_label, base_size=label_size, min_size=6, inset=12*scale)
                         self._draw_fitted_button_label(painter, streamtts_config_button, "OPEN STREAMTTS CONFIG", base_size=label_size, min_size=6, inset=12*scale)
                         painter.setPen(QColor(170, 215, 225, 230))
+                        caption = text_rects.get('wake_word_caption')
+                        if caption is not None:
+                            painter.setPen(QColor(196, 238, 242))
+                            painter.setFont(self._ui_font(9, QFont.DemiBold))
+                            painter.drawText(caption, Qt.AlignVCenter | Qt.AlignLeft,
+                                             'WAKE-WORD NAME   ·   EMPTY = DISABLED')
+                        train_rect = controls['wake_word_train']
+                        enabled_name = self.ui_preferences.get('wake_word_name', '')
+                        trained = bool(enabled_name and self.ui_preferences.get('wake_word_trained', False))
+                        painter.setBrush(QBrush(QColor(39, 123, 84, 228) if trained else QColor(10, 47, 67, 225)))
+                        painter.setPen(QPen(QColor(155, 245, 185, 215) if trained else QColor(140, 230, 240, 210), 1.5*scale))
+                        painter.drawRoundedRect(train_rect, 10*scale, 10*scale)
+                        painter.setPen(QColor(240, 253, 255))
+                        self._draw_fitted_button_label(painter, train_rect,
+                            'TRAIN WAKE WORD  ·  ' + ('VERIFIED' if trained else '3 RECOGNITIONS'),
+                            base_size=label_size, min_size=6, inset=12*scale)
                         voice_status = f"{self.tts.status}  ·  {self.face_enrollment_status}"
                         self._draw_wrapped_fitted_text(painter, text_rects["status"], voice_status[:150],
                                                        base_size=max(6, int(7*scale)), min_size=6)
