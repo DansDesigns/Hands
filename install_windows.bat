@@ -100,6 +100,19 @@ if errorlevel 1 (
 
 echo.
 echo [9/9] Assigning the local Freehand launcher icon and creating the Start Menu shortcut...
+rem Installed Start Menu entries must launch the windowless VBS shim.
+rem It chooses pythonw.exe normally and python.exe only when Debugging is ON.
+set "FREEHAND_LAUNCHER=%CD%\launch_windows.vbs"
+set "FREEHAND_DIR=%CD%"
+if not exist "%FREEHAND_LAUNCHER%" (
+  echo ERROR: launch_windows.vbs is missing from the Freehand folder.
+  echo Place it beside main.py and install_windows.bat, then rerun the installer.
+  goto :shortcut_error
+)
+if not exist "%CD%\.venv\Scripts\pythonw.exe" (
+  echo ERROR: The virtual environment has no pythonw.exe for a console-free launch.
+  goto :shortcut_error
+)
 set "ICON_PNG=%CD%\Freehand_logo_small.png"
 set "ICON_ICO=%CD%\Freehand_logo_small.ico"
 rem Windows shortcuts need an ICO resource; convert the bundled PNG locally, without network access.
@@ -108,7 +121,9 @@ if not exist "%ICON_ICO%" echo WARNING: Freehand_logo_small.png is missing or co
 set "STARTMENU=%APPDATA%\Microsoft\Windows\Start Menu\Programs"
 if not exist "%STARTMENU%" mkdir "%STARTMENU%"
 rem Windows forbids an ASCII colon in file names. Use the visually equivalent fullwidth colon in the Start Menu shortcut name.
-powershell -NoProfile -ExecutionPolicy Bypass -Command "$name='Freehand'+[char]0xFF1A+' Spatial Computing'; $shortcut=Join-Path '%STARTMENU%' ($name+'.lnk'); $old=Join-Path '%STARTMENU%' 'Spatial Desktop Prototype.lnk'; $s=(New-Object -ComObject WScript.Shell).CreateShortcut($shortcut); $s.TargetPath='%VPY%'; $s.Arguments='""%CD%\main.py""'; $s.WorkingDirectory='%CD%'; $s.Description='Freehand: Spatial Computing'; if (Test-Path $env:ICON_ICO) { $s.IconLocation=$env:ICON_ICO + ',0' }; $s.Save(); if (Test-Path -LiteralPath $old) { Remove-Item -LiteralPath $old -Force }"
+rem Point the link to Windows Script Host, not python.exe or a batch file.
+rem Pass the VBS file as a QUOTED argument so folders containing spaces work.
+powershell -NoProfile -ExecutionPolicy Bypass -Command "$ErrorActionPreference='Stop'; $name='Freehand'+[char]0xFF1A+' Spatial Computing'; $shortcut=Join-Path $env:STARTMENU ($name+'.lnk'); $old=Join-Path $env:STARTMENU 'Spatial Desktop Prototype.lnk'; $s=(New-Object -ComObject WScript.Shell).CreateShortcut($shortcut); $s.TargetPath=Join-Path $env:SystemRoot 'System32\wscript.exe'; $s.Arguments=[char]34 + $env:FREEHAND_LAUNCHER + [char]34; $s.WorkingDirectory=$env:FREEHAND_DIR; $s.Description='Freehand: Spatial Computing'; if (Test-Path -LiteralPath $env:ICON_ICO) { $s.IconLocation=$env:ICON_ICO + ',0' }; $s.Save(); if (Test-Path -LiteralPath $old) { Remove-Item -LiteralPath $old -Force }; Write-Host ('Shortcut target: ' + $s.TargetPath + ' ' + $s.Arguments)"
 if errorlevel 1 goto :shortcut_error
 
 echo.
