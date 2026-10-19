@@ -118,11 +118,7 @@ from gesture_rules import (
     pinch_drag_should_start,
     thumb_sticking_out,
     thumb_axis_is_vertical_up,
-    thumb_middle_pinch_pose,
     opposite_diagonal_corner_assignment,
-    classify_middle_pinch_window_action,
-    resize_rect_from_corner_deltas,
-    resize_rect_from_distance_scale,
 )
 from voice_services import Speech, KokoroTTS
 from hand_occlusion import TuckSmoother
@@ -479,24 +475,32 @@ class _WinTouchInfo(ctypes.Structure):
 
 
 class _WindowsTouchInjector:
-    """Two real Win32 touch contacts; a single InjectTouchInput frame for both.
+    """Independent left/right Win32 touch contacts, delivered in atomic frames.
 
-    The Windows touch API must receive stable IDs, DOWN once, UPDATE while
-    pinching, and UP when either hand releases. No touchscreen is required.
+    Touches retain their own pointer IDs. An existing contact receives UPDATE
+    while another receives DOWN/UP, so adding or removing one hand does not
+    interrupt the other hand (or a native two-finger zoom/pan gesture).
     """
 
     DOWN = 0x00010000 | 0x00000002 | 0x00000004
     UPDATE = 0x00020000 | 0x00000002 | 0x00000004
     UP = 0x00040000
+    IDS = {"left": 0, "right": 1}
 
     def __init__(self, api=None):
         self.api = api
         self.initialized = False
         self.unavailable = False
-        self.active = False
-        self.last_points = None
+        self.active_points = {}
         self.last_error = ""
-        self.last_dispatch_at = 0.0
+        # Windows can ignore DOWN/UP frames delivered in the same event-loop
+        # turn. Keep a brief 65 ms contact for individual taps.
+        self._pending_taps = set()
+        self._tap_serial = {"left": 0, "right": 0}
+
+    @property
+    def active(self):
+        return bool(self.active_points)
 
     def _ensure_api(self):
         if self.unavailable:
@@ -509,12 +513,11 @@ class _WindowsTouchInjector:
             initialize = self.api.InitializeTouchInjection
             initialize.argtypes = [ctypes.c_uint32, ctypes.c_uint32]
             initialize.restype = ctypes.c_int
-            dispatch = self.api.InjectTouchInput
-            dispatch.argtypes = [ctypes.c_uint32, ctypes.POINTER(_WinTouchInfo)]
-            dispatch.restype = ctypes.c_int
-            # No system touch ripples over the user-facing hand indicators.
+            inject = self.api.InjectTouchInput
+            inject.argtypes = [ctypes.c_uint32, ctypes.POINTER(_WinTouchInfo)]
+            inject.restype = ctypes.c_int
             if not initialize(2, 0x3):  # TOUCH_FEEDBACK_NONE
-                raise OSError(f"InitializeTouchInjection failed (Win32 error {ctypes.get_last_error()})")
+                raise OSError(f"InitializeTouchInjection failed: {ctypes.get_last_error()}")
             self.initialized = True
             return True
         except (OSError, AttributeError, ValueError) as exc:
@@ -530,63 +533,397 @@ class _WindowsTouchInjector:
         info.pointerInfo.pointerId = pointer_id
         info.pointerInfo.pointerFlags = flags
         info.pointerInfo.ptPixelLocation = _TouchPoint(x, y)
-        info.touchMask = 0x1 | 0x2 | 0x4  # CONTACTAREA, ORIENTATION, PRESSURE
-        info.rcContact = _TouchRect(x - 5, y - 5, x + 5, y + 5)
+        info.touchMask = 0x1 | 0x2 | 0x4
+        info.rcContact = _TouchRect(x-5, y-5, x+5, y+5)
         info.orientation = 90
         info.pressure = 512
         return info
 
-    def _send(self, points, flags):
-        contacts = (_WinTouchInfo * 2)(
-            self._contact(0, points["left"], flags),
-            self._contact(1, points["right"], flags),
-        )
+    def _send(self, contacts):
+        if not contacts:
+            return True
+        frame = (_WinTouchInfo * len(contacts))(*contacts)
         try:
-            result = self.api.InjectTouchInput(2, contacts)
-            if not result:
-                self.last_error = f"InjectTouchInput failed (Win32 error {ctypes.get_last_error()})"
-            return bool(result)
+            if self.api.InjectTouchInput(len(contacts), frame):
+                return True
+            self.last_error = f"InjectTouchInput failed: {ctypes.get_last_error()}"
         except (OSError, AttributeError, ValueError) as exc:
             self.last_error = str(exc)
-            return False
+        return False
 
-    def start(self, points, now):
-        if self.active:
-            return self.update(points, now)
-        if not self._ensure_api():
+    def sync(self, points):
+        """Atomically apply 0, 1 or 2 contacts, each with a stable identity."""
+        new = {side: (int(round(point[0])), int(round(point[1])))
+               for side, point in points.items() if side in self.IDS}
+        previous = self.active_points
+        if new == previous:
+            return True
+        if new and not self._ensure_api():
             return False
-        if not self._send(points, self.DOWN):
+        if not self.initialized:
+            self.active_points = {}
+            return True
+        frame = []
+        for side in ("left", "right"):
+            if side in new and side not in previous:
+                frame.append(self._contact(self.IDS[side], new[side], self.DOWN))
+            elif side in new and side in previous:
+                # Every active contact participates in a multi-contact frame.
+                frame.append(self._contact(self.IDS[side], new[side], self.UPDATE))
+            elif side in previous:
+                frame.append(self._contact(self.IDS[side], previous[side], self.UP))
+        if not self._send(frame):
             self.unavailable = True
+            self.end()
             return False
-        self.active = True
-        self.last_points = dict(points)
-        self.last_dispatch_at = float(now)
+        self.active_points = new
         return True
 
-    def update(self, points, now):
-        if not self.active:
+    def release_pending_tap(self, side):
+        """Release only this pending tap, leaving any other contact pressed."""
+        if side not in self._pending_taps:
+            return
+        self._pending_taps.discard(side)
+        if side in self.active_points:
+            self.sync({key: pt for key, pt in self.active_points.items() if key != side})
+
+    def tap(self, side, point):
+        """Hold a real touch-down long enough for Explorer to see a tap.
+
+        Do not block the GUI or the second hand: a timer sends the touch-up
+        after 65 ms. A rapid second tap first finishes the previous tap.
+        """
+        if side not in self.IDS:
             return False
-        # Avoid redundant native frames with immobile hands; preserve subpixel
-        # movement locally until an actual pixel change appears.
-        if self.last_points == points:
-            return True
-        if not self._send(points, self.UPDATE):
-            self.end()
-            self.unavailable = True
+        self.release_pending_tap(side)
+        if side in self.active_points:
             return False
-        self.last_points = dict(points)
-        self.last_dispatch_at = float(now)
+        if not self.sync({**self.active_points, side: point}):
+            return False
+        self._pending_taps.add(side)
+        self._tap_serial[side] += 1
+        serial = self._tap_serial[side]
+        QTimer.singleShot(65, lambda s=side, token=serial:
+                          self.release_pending_tap(s) if self._tap_serial[s] == token else None)
         return True
 
     def end(self):
-        if not self.active:
+        self._pending_taps.clear()
+        if self.active_points and self.initialized:
+            frame = [self._contact(self.IDS[side], point, self.UP)
+                     for side, point in self.active_points.items()]
+            self._send(frame)
+        self.active_points = {}
+
+
+class _LinuxTouchInjector:
+    """A real two-contact virtual touchscreen using Linux /dev/uinput.
+
+    Sends kernel MT protocol B slot/tracking-ID events, consumed by libinput in
+    X11 and Wayland. /dev/uinput write permission is configured by the distro;
+    Freehand never tries to gain elevated privileges itself.
+    """
+
+    IDS = {"left": 0, "right": 1}
+    EV_SYN, EV_KEY, EV_ABS = 0, 1, 3
+    SYN_REPORT, BTN_TOUCH = 0, 0x14a
+    ABS_X, ABS_Y = 0, 1
+    ABS_MT_SLOT, ABS_MT_POSITION_X, ABS_MT_POSITION_Y, ABS_MT_TRACKING_ID = 0x2f, 0x35, 0x36, 0x39
+    INPUT_PROP_DIRECT = 1
+    UI_DEV_CREATE, UI_DEV_DESTROY = 0x5501, 0x5502
+
+    def __init__(self, bounds=(0, 0, 1920, 1080), open_device=None, ioctl=None, write=None):
+        self.bounds = tuple(bounds)  # global desktop x, y, width, height
+        self.fd = None
+        self.active_points = {}
+        self.unavailable = False
+        self.last_error = ""
+        self._next_tracking_id = 1
+        self._open_device = open_device or os.open
+        self._ioctl = ioctl
+        self._write = write or os.write
+        self._device_created = False
+
+    @property
+    def active(self):
+        return bool(self.active_points)
+
+    @staticmethod
+    def _iow(nr, size=4):
+        return (1 << 30) | ((size & 0x3fff) << 16) | (ord('U') << 8) | nr
+
+    def _ensure_api(self):
+        if self.unavailable:
+            return False
+        if self.fd is not None:
+            return True
+        import fcntl
+        import struct
+        ioctl = self._ioctl or fcntl.ioctl
+        try:
+            try:
+                self.fd = self._open_device('/dev/uinput', os.O_WRONLY | os.O_NONBLOCK)
+            except FileNotFoundError:
+                self.fd = self._open_device('/dev/input/uinput', os.O_WRONLY | os.O_NONBLOCK)
+            ioctl(self.fd, self._iow(100), self.EV_KEY)  # UI_SET_EVBIT
+            ioctl(self.fd, self._iow(100), self.EV_ABS)
+            ioctl(self.fd, self._iow(101), self.BTN_TOUCH)  # UI_SET_KEYBIT
+            ioctl(self.fd, self._iow(110), self.INPUT_PROP_DIRECT)  # UI_SET_PROPBIT
+            for axis in (self.ABS_X, self.ABS_Y, self.ABS_MT_SLOT,
+                         self.ABS_MT_TRACKING_ID, self.ABS_MT_POSITION_X,
+                         self.ABS_MT_POSITION_Y):
+                ioctl(self.fd, self._iow(103), axis)  # UI_SET_ABSBIT
+                high = 1 if axis == self.ABS_MT_SLOT else 65535
+                # uinput_abs_setup: uint16 code, 2 pad bytes, input_absinfo (6 int32)
+                configuration = struct.pack('@H2xiiiiii', axis, 0, 0, high, 0, 0, 0)
+                ioctl(self.fd, self._iow(4, len(configuration)), configuration)
+            name = b'Freehand Virtual Multitouch Screen'
+            # uinput_setup: input_id (4x16-bit), name[80], ff_effects_max
+            setup = struct.pack('@HHHH80sI', 0x06, 0x4652, 0x4844, 1, name, 0)
+            ioctl(self.fd, self._iow(3, len(setup)), setup)  # UI_DEV_SETUP
+            ioctl(self.fd, self.UI_DEV_CREATE)
+            self._device_created = True
+            return True
+        except (OSError, ValueError) as exc:
+            self.last_error = f'/dev/uinput unavailable: {exc}. Configure a udev permission rule for Freehand.'
+            self.unavailable = True
+            self.close()
+            return False
+
+    def _axis(self, point):
+        x, y, w, h = self.bounds
+        px, py = float(point[0]), float(point[1])
+        return (max(0, min(65535, round((px-x)*65535/max(1, w-1)))),
+                max(0, min(65535, round((py-y)*65535/max(1, h-1)))))
+
+    def _events(self, events):
+        import struct
+        # Linux input_event: timeval (native longs), type:uint16, code:uint16, value:int32
+        payload = b''.join(struct.pack('@llHHi', 0, 0, typ, code, value)
+                           for typ, code, value in events)
+        try:
+            return self._write(self.fd, payload) == len(payload)
+        except OSError as exc:
+            self.last_error = f'Linux touch write failed: {exc}'
+            return False
+
+    def sync(self, points):
+        new = {side: (int(round(pos[0])), int(round(pos[1])))
+               for side, pos in points.items() if side in self.IDS}
+        previous = self.active_points
+        if new == previous:
+            return True
+        if new and not self._ensure_api():
+            return False
+        if self.fd is None:
+            self.active_points = {}
+            return True
+        events = []
+        if new and not previous:
+            events.append((self.EV_KEY, self.BTN_TOUCH, 1))
+        for side in ('left', 'right'):
+            before, after = previous.get(side), new.get(side)
+            if before == after:
+                continue
+            events.append((self.EV_ABS, self.ABS_MT_SLOT, self.IDS[side]))
+            if after is None:
+                events.append((self.EV_ABS, self.ABS_MT_TRACKING_ID, -1))
+            else:
+                if before is None:
+                    events.append((self.EV_ABS, self.ABS_MT_TRACKING_ID,
+                                   self._next_tracking_id))
+                    self._next_tracking_id = (self._next_tracking_id % 65534) + 1
+                xx, yy = self._axis(after)
+                events.extend(((self.EV_ABS, self.ABS_MT_POSITION_X, xx),
+                               (self.EV_ABS, self.ABS_MT_POSITION_Y, yy)))
+        if new:
+            primary = new.get('left') or new.get('right')
+            xx, yy = self._axis(primary)
+            events.extend(((self.EV_ABS, self.ABS_X, xx),
+                           (self.EV_ABS, self.ABS_Y, yy)))
+        elif previous:
+            events.append((self.EV_KEY, self.BTN_TOUCH, 0))
+        events.append((self.EV_SYN, self.SYN_REPORT, 0))
+        if not self._events(events):
+            self.unavailable = True
+            # Never recurse through end()->sync()->close() on a broken fd.
+            self.active_points = {}
+            self.close()
+            return False
+        self.active_points = new
+        return True
+
+    def tap(self, side, point):
+        if side not in self.IDS or side in self.active_points:
+            return False
+        if not self.sync({**self.active_points, side: point}):
+            return False
+        return self.sync({key: value for key, value in self.active_points.items()
+                          if key != side})
+
+    def end(self):
+        if self.active_points and self.fd is not None:
+            self.sync({})
+        self.active_points = {}
+
+    def close(self):
+        if self.fd is None:
             return
         try:
-            if self.last_points is not None:
-                self._send(self.last_points, self.UP)
+            self.end()
+            if self._device_created:
+                import fcntl
+                (self._ioctl or fcntl.ioctl)(self.fd, self.UI_DEV_DESTROY)
+        except OSError:
+            pass
         finally:
-            self.active = False
-            self.last_points = None
+            try:
+                os.close(self.fd)
+            except OSError:
+                pass
+            self.fd = None
+            self._device_created = False
+
+
+class _MacTouchGestureFallback:
+    """Accessibility-driven mouse + two-hand gesture approximation on macOS.
+
+    macOS offers no equivalent public system-wide two-finger touchscreen injector.
+    Single contact uses mouse down/drag/up; two contacts use application zoom
+    shortcuts and scroll-wheel panning. This is deliberately not labelled native
+    touchscreen injection and can vary between Mac applications.
+    """
+
+    IDS = {"left": 0, "right": 1}
+
+    def __init__(self, controller=None, clock=None):
+        self.controller = controller if controller is not None else pyautogui
+        self.clock = clock or time.monotonic
+        self.active_points = {}
+        self.unavailable = self.controller is None
+        self.last_error = ('pyautogui unavailable on macOS' if self.unavailable else '')
+        self._drag_side = None
+        self._zoom_accumulator = 0.0
+        self._pan_accumulator = [0.0, 0.0]
+        self._last_zoom_at = 0.0
+
+    @property
+    def active(self):
+        return bool(self.active_points)
+
+    def _call(self, method, *args, **kwargs):
+        try:
+            return getattr(self.controller, method)(*args, **kwargs)
+        except Exception as exc:
+            self.last_error = f'macOS gesture fallback: {exc}'
+            self.unavailable = True
+            self.end()
+            return None
+
+    def sync(self, points):
+        import math
+        new = {side: (int(round(pos[0])), int(round(pos[1])))
+               for side, pos in points.items() if side in self.IDS}
+        if self.unavailable:
+            return False
+        previous = self.active_points
+        if new == previous:
+            return True
+        if len(new) == 2:
+            if self._drag_side is not None:
+                self._call('mouseUp', button='left', _pause=False)
+                self._drag_side = None
+            if len(previous) == 2:
+                keys = ('left', 'right')
+                before = [previous[s] for s in keys]
+                after = [new[s] for s in keys]
+                initial_distance = math.dist(before[0], before[1])
+                final_distance = math.dist(after[0], after[1])
+                if min(initial_distance, final_distance) > 20.0:
+                    self._zoom_accumulator += math.log(final_distance/initial_distance)
+                if (abs(self._zoom_accumulator) >= 0.15 and
+                        self.clock()-self._last_zoom_at >= 0.18):
+                    direction = '=' if self._zoom_accumulator > 0 else '-'
+                    self._call('hotkey', 'command', direction, _pause=False)
+                    self._zoom_accumulator -= math.copysign(0.15, self._zoom_accumulator)
+                    self._last_zoom_at = self.clock()
+                cx0 = (before[0][0]+before[1][0])*0.5
+                cy0 = (before[0][1]+before[1][1])*0.5
+                cx1 = (after[0][0]+after[1][0])*0.5
+                cy1 = (after[0][1]+after[1][1])*0.5
+                self._pan_accumulator[0] += cx1-cx0
+                self._pan_accumulator[1] += cy1-cy0
+                if abs(self._pan_accumulator[1]) >= 35.0:
+                    ticks = int(self._pan_accumulator[1]/35.0)
+                    self._call('scroll', -ticks, _pause=False)
+                    self._pan_accumulator[1] -= ticks*35.0
+                if abs(self._pan_accumulator[0]) >= 45.0:
+                    ticks = int(self._pan_accumulator[0]/45.0)
+                    if hasattr(self.controller, 'hscroll'):
+                        try:
+                            self.controller.hscroll(ticks, _pause=False)
+                        except (OSError, NotImplementedError, AttributeError):
+                            pass  # Not all macOS automation backends support it.
+                    self._pan_accumulator[0] -= ticks*45.0
+        elif len(new) == 1:
+            side, point = next(iter(new.items()))
+            if self._drag_side != side:
+                if self._drag_side is not None:
+                    self._call('mouseUp', button='left', _pause=False)
+                # Transitioning out of a two-contact gesture must not leave
+                # a mouse pressed against an unrelated application.
+                if len(previous) != 2:
+                    self._call('moveTo', *point, _pause=False)
+                    self._call('mouseDown', button='left', _pause=False)
+                    self._drag_side = side
+            elif previous.get(side) != point:
+                self._call('moveTo', *point, _pause=False)
+        elif self._drag_side is not None:
+            self._call('mouseUp', button='left', _pause=False)
+            self._drag_side = None
+        self.active_points = new
+        return not self.unavailable
+
+    def tap(self, side, point):
+        if self.unavailable or side not in self.IDS or side in self.active_points:
+            return False
+        self._call('click', x=int(point[0]), y=int(point[1]), _pause=False)
+        return not self.unavailable
+
+    def end(self):
+        if self._drag_side is not None and self.controller is not None:
+            try:
+                self.controller.mouseUp(button='left', _pause=False)
+            except Exception:
+                pass
+        self._drag_side = None
+        self.active_points = {}
+        self._zoom_accumulator = 0.0
+        self._pan_accumulator = [0.0, 0.0]
+
+
+def _create_native_touch_injector():
+    """Choose the best supported OS input backend without touching D1 or gestures."""
+    if sys.platform.startswith('win'):
+        return _WindowsTouchInjector()
+    if sys.platform.startswith('linux'):
+        screens = QApplication.screens()
+        if screens:
+            box = screens[0].geometry()
+            for screen in screens[1:]:
+                box = box.united(screen.geometry())
+            bounds = (box.x(), box.y(), box.width(), box.height())
+        else:
+            bounds = (0, 0, 1920, 1080)
+        injector = _LinuxTouchInjector(bounds)
+        # Register before webcam startup completes, giving libinput time to
+        # discover the device before the user's first pinch.
+        if not injector._ensure_api():
+            print('Freehand Linux multitouch:', injector.last_error, flush=True)
+        return injector
+    if sys.platform == 'darwin':
+        return _MacTouchGestureFallback()
+    return None
 
 
 # Hand render styles, in the order shown by the Settings -> Hands switch.
@@ -858,10 +1195,10 @@ def save_gesture_settings(values: dict) -> None:
         "# DOUBLE-CLICK: two quick thumb/index pinches near the same point are snapped to one target for a native double-click.",
         "# PINCH MENU: hold thumb/index pinch continuously for pinch_buffer_seconds (default 0.8s); then the circle fills for the hold timer.",
         "# PINCH MENU: while open, a fresh pinch/grab outside the popup closes it without clicking through.",
-        "# TWO-HAND PINCH ZOOM: pinch thumb to middle fingertip with BOTH hands and hold through pinch_buffer_seconds; move hands apart/together to zoom app content with Ctrl/Command+wheel.",
-        "# WINDOW RESIZE: begin the same two-hand pinch with TPIs at opposite diagonal corners of one application window; keep pinching and move the corners to resize it.",
+        "# WINDOWS MULTITOUCH: thumb/index pinch on either hand = touch; two simultaneously = native two-finger zoom/pan/rotate.",
+        "# TOUCH DRAG: move a held thumb/index pinch to drag a native touch point; stationary hold keeps the timed Pinch Menu.",
         "# FIST MOVEMENT: a moving RIGHT-only fist starts smooth vertical page scrolling without a fist timer; left fist remains the modifier, and two-fist window drag remains available.",
-        "# TIMERS: Pinch Menu, two-hand thumb-middle pinch zoom, and peace-sign gestures show countdowns. Right-fist scrolling has no circle timer.",
+        "# TIMERS: Pinch Menu and peace-sign gestures show countdowns. Right-fist scrolling has no circle timer.",
         "# A release before 0.8s cancels that timer sequence. Quick/double pinches start a fresh buffer; after confirmation only held-pinch time counts.",
         "# A fist/grip has priority over pinch recognition; a fist alone cannot start the Pinch Menu timer.",
         "# PEACE SIGN: hold an index+middle V-sign for 1.5 seconds to detach/reattach that hand from native OS mouse movement; glass and Pinch Menu gestures and live TPI tracking remain active.",
@@ -1288,20 +1625,6 @@ def is_thumb_index_menu_pinch(landmarks, edge_tolerant=False):
                                        finger_straightness=straight,
                                        edge_tolerant=edge_tolerant)
 
-
-def is_thumb_middle_zoom_pinch(landmarks, edge_tolerant=False):
-    """True for a thumb-to-middle fingertip pinch, distinct from the Pinch Menu."""
-    if landmarks is None or len(landmarks) < 21:
-        return False
-    palm = max(1e-5, distance3d(landmarks, 0, 9))
-    middle_gap = distance3d(landmarks, 4, 12) / palm
-    index_gap = distance3d(landmarks, 4, 8) / palm
-    return thumb_middle_pinch_pose(
-        normalized_middle_gap=middle_gap,
-        normalized_index_gap=index_gap,
-        finger_straightness=_finger_straightness_values(landmarks),
-        edge_tolerant=edge_tolerant,
-    )
 
 
 class _HandVisualMotionFilter:
@@ -1911,7 +2234,6 @@ class SearchHandOverlay(QWidget):
             owner._paint_gesture_timer_fade(painter, side, now)
             owner._paint_pinch_menu(painter, side, now)
         owner._paint_floating_clipboard(painter, now)
-        owner._paint_middle_pinch_zoom_timer(painter, now)
         # This overlay is the sole hand-visual owner while Search is visible; the main
         # window skips the identical layer to avoid double-painted ghost silhouettes.
         for side in ("left", "right"):
@@ -2562,7 +2884,19 @@ class SpatialDesktop(QWidget):
         self._wake_word_save_timer = QTimer(self)
         self._wake_word_save_timer.setSingleShot(True)
         self._wake_word_save_timer.timeout.connect(self._save_wake_word_preferences)
+        # This editor is visually part of the Glass Menu, but has its own tiny
+        # native, frameless input surface. In OS mode the *main* fullscreen
+        # overlay deliberately passes mouse/keyboard input through to the desktop.
+        # An ordinary QLineEdit child cannot receive focus in that mode.
+        # Keeping the editor as a Qt.Tool window aligned exactly with the menu
+        # row makes it editable on Windows and Linux without making the whole
+        # Glass Menu block clicks to underlying applications.
         self.wake_word_entry = QLineEdit(self)
+        self.wake_word_entry.setWindowFlags(
+            Qt.Tool | Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint)
+        self.wake_word_entry.setAttribute(Qt.WA_ShowWithoutActivating, True)
+        self.wake_word_entry.setFocusPolicy(Qt.StrongFocus)
+        self._wake_word_entry_last_raise = 0.0
         self.wake_word_entry.setMaxLength(48)
         self.wake_word_entry.setPlaceholderText('Empty = no wake word')
         self.wake_word_entry.setText(self.ui_preferences.get('wake_word_name', ''))
@@ -2837,7 +3171,9 @@ class SpatialDesktop(QWidget):
         # Loaded from gestures.txt above; set from Settings -> Hands -> CONTACT RANGE.
         self.hand_contact_weight = 0.0
         self.hand_contact_last_update = None
-        self.mouse_detached_by_side = {"left": True, "right": False}
+        # Touchscreen-first: both physical hands are independent inputs by default.
+        # Peace-sign toggles still detach either hand independently.
+        self.mouse_detached_by_side = {"left": False, "right": False}
         self.peace_hold_started = {"left": None, "right": None}
         # Countdown visuals must survive removal of the disabled hand's native cursor.
         self.peace_timer_anchor_by_side = {"left": None, "right": None}
@@ -2851,8 +3187,8 @@ class SpatialDesktop(QWidget):
         self.gesture_tracking_toggle_hold_seconds = self.default_gesture_hold_seconds
         # The left hand starts detached. Show its banner immediately on startup;
         # _hand_tracking_notice_opacity applies the usual delay and fade timeout.
-        self.hand_tracking_notice_text = "Left mouse detached"
-        self.hand_tracking_notice_until = float("inf")
+        self.hand_tracking_notice_text = "Both hands ready for touch input"
+        self.hand_tracking_notice_until = time.monotonic() + 5.0
         # Shorter hold, with a visible countdown ring so the toggle feels responsive.
         self.peace_toggle_hold_seconds = self.default_gesture_hold_seconds
         self.hand_last_seen = {"left": 0.0, "right": 0.0}
@@ -2892,20 +3228,14 @@ class SpatialDesktop(QWidget):
         # Pinch Menu confirmation buffer before the circle timer starts; adjustable in
         # Settings -> Interaction (PINCH BUFFER). Fist holds keep the fixed buffer above.
         self.pinch_buffer_seconds = float(settings.get("pinch_buffer_seconds", 0.8))
-        # Two-hand thumb-to-middle pinch zoom. The existing Pinch Menu buffer is reused;
-        # once the hold is confirmed, hand separation drives content zoom or corner resize.
-        # Two thumb-to-index pinches generate genuine Windows multitouch in OS
-        # mode. Other platforms and the existing thumb-middle zoom are unchanged.
-        self._windows_touch = (_WindowsTouchInjector()
-                               if sys.platform.startswith("win") else None)
-        self._two_hand_touch_last_both_at = None
-        self.middle_pinch_zoom = {
-            "started_at": None, "last_both_seen_at": None, "active": False,
-            "mode": None, "hwnd": None, "rect": None, "corners": None,
-            "start_points": None, "start_distance": None, "last_distance": None,
-            "zoom_remainder": 0.0,
-            "last_resize_rect": None, "last_resize_at": 0.0,
-        }
+        # Both hands are independent touch contacts where the OS allows it.
+        # Windows uses InjectTouchInput; Linux uses /dev/uinput MT protocol B;
+        # macOS uses an accessible best-effort gesture fallback.
+        # Timed Pinch Menu, Glass Menu and peace-sign detachment are unchanged.
+        self._native_touch = _create_native_touch_injector()
+        self._touch_pending = {}     # side -> {started, last, origin, point}
+        self._touch_last_pose_at = {}  # last confirmed pinch, for dropout tolerance
+        self._touch_drag_sides = set()
         self.fist_quick_click_max_seconds = 0.65
         self.fist_started_at = {side: None for side in sides}
         self.fist_release_candidate_since = {side: None for side in sides}
@@ -8220,12 +8550,9 @@ class SpatialDesktop(QWidget):
 
             if self.settings_page == "voice":
                 if pressed('wake_word_field'):
-                    # Hand-driven activation works even when OS mode's transparent
-                    # overlay cannot receive ordinary keyboard focus from a touch.
-                    # A hand click cannot always focus an embedded text editor
-                    # through the native OS overlay. Open a proper keyboard input
-                    # dialog as a fallback; direct physical typing still works.
-                    self._edit_wake_word_name_dialog()
+                    # Edit the actual field in the Glass Menu; never open a
+                    # keyboard-input dialog behind the transparent overlay.
+                    self._focus_wake_word_entry()
                 elif pressed('wake_word_train'):
                     self._open_wake_word_training()
                 elif pressed("tts_toggle"):
@@ -9167,24 +9494,31 @@ class SpatialDesktop(QWidget):
                            'Wake word disabled — all ordinary voice commands work.')
             self.update()
 
-    def _edit_wake_word_name_dialog(self):
-        self._wake_word_name_editing = True
-        try:
-            name, accepted = QInputDialog.getText(
-                self, 'Freehand · Wake Word', 'Wake-word name (leave empty to disable):',
-                QLineEdit.Normal, self.wake_word_entry.text())
-        finally:
-            self._wake_word_name_editing = False
-        if accepted:
-            self.wake_word_entry.setText(normalise_wake_word_name(name))
-            self._on_wake_word_name_edited(self.wake_word_entry.text())
+    def _focus_wake_word_entry(self):
+        """Focus the in-menu field after a physical or hand-driven click."""
+        self._sync_wake_word_entry()
+        entry = self.wake_word_entry
+        if not entry.isVisible():
+            return
+        entry.raise_()
+        entry.activateWindow()
+        entry.setFocus(Qt.MouseFocusReason)
 
     def _sync_wake_word_entry(self):
+        """Dock the live keyboard editor inside the painted Glass Menu field.
+
+        The Glass Menu's OS-mode overlay is input-transparent. This single
+        frameless QLineEdit is an independent focusable window, positioned over
+        the matching painted row, not a separate popup or dialog.
+        """
         entry = getattr(self, 'wake_word_entry', None)
         if entry is None:
             return
         show = bool(self.menu_open and self.hub_visible and self.settings_open and
                     self.settings_page == 'voice' and
+                    self.settings_page_pending is None and
+                    (not self.settings_page_transition_started or
+                     self._settings_page_transition_progress() >= 0.94) and
                     not (self._wake_word_training_dialog and
                          self._wake_word_training_dialog.isVisible()) and
                     self.width() > 0 and self.height() > 0)
@@ -9193,11 +9527,26 @@ class SpatialDesktop(QWidget):
             if box is None:
                 show = False
             else:
-                rect = box.adjusted(2, 1, -2, -1).toRect()
-                if entry.geometry() != rect:
-                    entry.setGeometry(rect)
+                local_rect = box.adjusted(2, 1, -2, -1).toRect()
+                # Native Qt.Tool geometry uses desktop coordinates, unlike a
+                # child widget. mapToGlobal also supports screens whose origin
+                # is not (0, 0), e.g. multi-monitor Windows or Linux desktops.
+                screen_rect = QRect(self.mapToGlobal(local_rect.topLeft()), local_rect.size())
+                if entry.geometry() != screen_rect:
+                    entry.setGeometry(screen_rect)
         if entry.isVisible() != show:
             entry.setVisible(show)
+            if show:
+                entry.raise_()
+                self._wake_word_entry_last_raise = time.monotonic()
+        elif show:
+            # The main desktop overlay reasserts its topmost order periodically.
+            # Keep the focusable field above it, without repeatedly activating
+            # the editor or stealing keyboard focus from elsewhere.
+            now = time.monotonic()
+            if now - self._wake_word_entry_last_raise >= 0.5:
+                entry.raise_()
+                self._wake_word_entry_last_raise = now
 
     def _open_wake_word_training(self):
         if self._wake_word_training_dialog is not None:
@@ -9214,6 +9563,9 @@ class SpatialDesktop(QWidget):
         dialog = WakeWordTrainingDialog(name, self)
         self._wake_word_training_dialog = dialog
         self._wake_word_training_started_speech = False
+        # Hide the docked editor before showing the *training* dialog so the
+        # microphone checklist is never occluded by a separately raised field.
+        self._sync_wake_word_entry()
         dialog.finished.connect(self._finish_wake_word_training)
         dialog.show()
         dialog.raise_()
@@ -10564,7 +10916,7 @@ try {
                     0x0001 | 0x0002 | 0x0004 | 0x0010)
             except Exception as exc:
                 print("Overlay window configuration:", exc)
-        elif sys.platform.startswith("linux"):
+        elif sys.platform.startswith("linux") or sys.platform == "darwin":
             # The fullscreen overlay is deliberately topmost. In OS Desktop mode it
             # must also be transparent to native input, otherwise clicks generated by
             # PyAutoGUI hit this overlay instead of Qtile/the application underneath.
@@ -13711,399 +14063,190 @@ try {
             timer.setInterval(desired_ms)
 
     def _end_two_hand_touch(self):
-        """Release injected contacts on pinch exit, mode switch, or shutdown."""
-        injector = getattr(self, "_windows_touch", None)
+        """Cancel all injected contacts on UI changes, pauses and shutdown."""
+        injector = getattr(self, "_native_touch", None)
         if injector is not None:
             injector.end()
-        self._two_hand_touch_last_both_at = None
+        if hasattr(self, "_touch_pending"):
+            self._touch_pending.clear()
+            self._touch_last_pose_at.clear()
+            self._touch_drag_sides.clear()
 
     def _process_two_hand_touch(self, cursor_points, poses, now):
-        """Turn simultaneous index pinches into two native Windows touch points.
+        """Cross-platform two-hand touch via thumb-index pinches.
 
-        Ordinary one-hand pinches continue through the existing click/drag/menu
-        handlers. Starting a dual touch consumes both hands so no native mouse,
-        pinch-menu, or custom gesture can fire during the touch session.
+        Stationary single-pinches remain in the *original* timed Pinch Menu
+        handler. The touch starts only on actual drag movement, or immediately
+        for two simultaneous pinches. Quick tap releases inject DOWN + UP and
+        consume the release, preventing a duplicate native mouse click.
         """
-        injector = getattr(self, "_windows_touch", None)
-        if injector is None:
-            return False
+        injector = getattr(self, "_native_touch", None)
+        if injector is None or injector.unavailable:
+            return False  # Preserve legacy pointer/mouse fallback on API failure.
         search = getattr(self, "search_dialog", None)
-        modal = (self._gesture_ui_modal_open() or
+        modal = (self._gesture_ui_modal_open() or self.hand_tracking_paused or
                  self.tli_calibration_active_side is not None or
                  self.hand_calibration_active or self.voice_selection_mode is not None or
                  self.custom_gesture_recording is not None or
+                 self.left_click_modifier_active or
+                 # A fist clutch or an active drag/scroll takes priority over touch.
+                 any(poses.get(side, {}).get("fist", False) for side in ("left", "right")) or
+                 any(self.active_action.values()) or
                  any(self.fist_action_menu_open.values()) or
                  (search is not None and search.isVisible()))
         if self.desktop_mode != "os" or modal:
             self._end_two_hand_touch()
             return False
-        # The existing two-hand thumb-MIDDLE pinch deliberately owns zoom/resize.
-        # Do not inject index touches when that distinct action is in progress.
-        middle = self.middle_pinch_zoom
-        if (middle.get("started_at") is not None or middle.get("active") or
-                all(poses.get(side, {}).get("middle_pinch", False)
-                    for side in ("left", "right"))):
-            self._end_two_hand_touch()
-            return False
-        both = all(
-            side in cursor_points and
-            poses.get(side, {}).get("pinch", False) and
-            not poses.get(side, {}).get("fist", False) and
-            self.gesture_tracking_enabled.get(side, False)
-            for side in ("left", "right")
-        )
-        if both:
-            points = {}
+
+        candidates = {}
+        for side in ("left", "right"):
+            pose = poses.get(side, {})
+            if (side in cursor_points and pose.get("pinch", False) and
+                    not pose.get("fist", False) and
+                    self.gesture_tracking_enabled.get(side, False) and
+                    not self.mouse_detached_by_side.get(side, False) and
+                    self.active_action.get(side) is None and
+                    self.fist_started_at.get(side) is None and
+                    not self.pinch_drag_active.get(side, False) and
+                    not self.fist_action_menu_open.get(side, False) and
+                    not self._canvas_menu_panel_contains(cursor_points[side]) and
+                    self._canvas_slider_name_at(cursor_points[side], for_grab=True) is None):
+                global_point = self._virtual_point_to_global(cursor_points[side])
+                if global_point is not None:
+                    candidates[side] = (int(global_point.x()), int(global_point.y()))
+                    self._touch_last_pose_at[side] = float(now)
+
+        # Process active fingers independently. Short detection dropouts do not
+        # immediately release a touch, but a confirmed gesture release does.
+        active_points = dict(injector.active_points)
+        for side in tuple(active_points):
+            if side in getattr(injector, "_pending_taps", ()):
+                # A synthetic quick tap owns this contact until its scheduled
+                # touch-up; don't terminate it during the next 50 ms UI tick.
+                if side in candidates:
+                    injector.release_pending_tap(side)
+                    active_points.pop(side, None)
+                else:
+                    continue
+            if side in candidates:
+                active_points[side] = candidates[side]
+            elif now-self._touch_last_pose_at.get(side, -100.0) > 0.10:
+                active_points.pop(side)
+                self._touch_drag_sides.discard(side)
+
+        for side, point in candidates.items():
+            if side not in self._touch_pending and side not in active_points:
+                self._touch_pending[side] = {
+                    "started": float(now), "last": float(now),
+                    "origin": point, "point": point,
+                }
+            elif side in self._touch_pending:
+                pending = self._touch_pending[side]
+                # A second quick pinch can arrive before the 80 ms release
+                # debounce finishes. Finish the first tap rather than merge
+                # two deliberate taps into one long hold/menu timer.
+                released_at = pending.get("release_started")
+                if released_at is not None:
+                    duration = released_at-pending["started"]
+                    if (self.quick_pinch_click_min_seconds <= duration <=
+                            self.fist_quick_click_max_seconds):
+                        if injector.tap(side, pending["origin"]):
+                            play_ui_sound(self.ui_preferences.get("sound_pinch", "None"))
+                        self._clear_menu_pinch_sequence(side)
+                    pending.update(started=float(now), origin=point)
+                pending["release_started"] = None
+                pending["point"] = point
+                pending["last"] = float(now)
+
+        # Two simultaneous pinches start a two-finger gesture while retaining
+        # stable independent contact IDs (or macOS gesture fallback).
+        if len(candidates) == 2 and not self.menu_pinch_latched.intersection({"left", "right"}):
             for side in ("left", "right"):
-                position = self._virtual_point_to_global(cursor_points[side])
-                if position is None:
-                    both = False
-                    break
-                points[side] = (int(position.x()), int(position.y()))
-        if both:
-            self._two_hand_touch_last_both_at = float(now)
-            if not injector.active:
-                # A native drag is an exclusive mouse action; release it before
-                # injecting contacts, and clear timers from either hand.
-                for side in ("left", "right"):
-                    self._end_pinch_drag(side, status=False)
-                    if self.fist_mouse_down.get(side, False):
-                        self._release_fist_mouse(side)
-                    self.active_action[side] = None
-                    self._reset_fist_gesture(side)
+                active_points[side] = candidates[side]
+                self._touch_drag_sides.add(side)
+
+        # A deliberate movement starts one-finger dragging. Stationary holds
+        # stay in the existing timed menu path, including its circle and sound.
+        touch_release_consumed = False
+        for side, pending in tuple(self._touch_pending.items()):
+            if side in active_points:
+                continue
+            if side in candidates:
+                point = candidates[side]
+                dx = point[0]-pending["origin"][0]
+                dy = point[1]-pending["origin"][1]
+                if (now-pending["started"] >= PINCH_DRAG_MIN_HOLD_SECONDS and
+                        dx*dx+dy*dy >= self.pinch_drag_start_distance**2):
+                    active_points[side] = pending["origin"]
+                    self._touch_drag_sides.add(side)
+            else:
+                # Use the first detected release frame for gesture duration,
+                # excluding the release debounce just as the legacy click did.
+                if pending.get("release_started") is None:
+                    pending["release_started"] = float(now)
+                    # Stop the old mouse-release path from dispatching a second
+                    # click at the *mouse cursor*, which no longer follows the TPI.
                     self._clear_menu_pinch_sequence(side)
-                    self.active_push_sides.discard(side)
-                self.gesture_owner = None
-                if not injector.start(points, now):
-                    self.status = ("Windows multitouch unavailable: " +
-                                   (injector.last_error or "touch injection failed"))
-                    # Consume this pair, even on API failure: don't accidentally
-                    # click an application twice after failed touch activation.
+                touch_release_consumed = True
+                if now-pending["release_started"] < 0.08:
+                    continue
+                elapsed = pending["release_started"]-pending["started"]
+                pose = poses.get(side, {})
+                if (self.quick_pinch_click_min_seconds <= elapsed <= self.fist_quick_click_max_seconds
+                        and side in poses and not pose.get("fingers_closed", False)
+                        and not pose.get("fist", False)
+                        and not self._forming_fist_pinch_guard.get(side, False)):
+                    # The pointer stays where it was: this click is a touch tap.
+                    if not injector.tap(side, pending["origin"]):
+                        self.status = "Touch tap unavailable: " + injector.last_error
+                    else:
+                        play_ui_sound(self.ui_preferences.get("sound_pinch", "None"))
+                    self._touch_pending.pop(side, None)
+                    self._clear_menu_pinch_sequence(side)
+                    if self.gesture_owner == side:
+                        self.gesture_owner = None
                     return True
-                self.status = "Two-hand touchscreen touch — move both pinches; release either to end"
-            elif not injector.update(points, now):
-                self.status = "Windows multitouch interrupted: " + injector.last_error
+                self._touch_pending.pop(side, None)
+
+        if active_points:
+            # This frame belongs entirely to the touch backend, not the mouse
+            # or Pinch Menu. A dual pinch must not arm either timed menu.
+            for side in active_points:
+                if self.pinch_drag_active.get(side, False):
+                    self._end_pinch_drag(side, status=False)
+                if self.menu_pinch_started.get(side) is not None:
+                    self._clear_menu_pinch_sequence(side)
+                self._touch_pending.pop(side, None)
+            self.gesture_owner = None
+            # First emit DOWN at drag origin; then UPDATE to the current point.
+            if not injector.sync(active_points):
+                self.status = "Touch injection unavailable: " + injector.last_error
+                self._end_two_hand_touch()
+                return True
+            final_points = dict(active_points)
+            for side in self._touch_drag_sides:
+                if side in candidates:
+                    final_points[side] = candidates[side]
+            if final_points != active_points:
+                injector.sync(final_points)
             return True
 
         if injector.active:
-            # One bad MediaPipe frame should not immediately lift both fingers.
-            last = self._two_hand_touch_last_both_at
-            if last is not None and now-float(last) <= 0.12:
-                return True
-            self._end_two_hand_touch()
-            self.status = "Two-hand touchscreen touch released"
-            # Consume the release frame so it never becomes a single-hand click.
-            for side in ("left", "right"):
-                self._clear_menu_pinch_sequence(side)
+            # Let Windows finish any scheduled tap-up instead of ending its
+            # contact prematurely on the next render frame.
+            remaining = {side: pt for side, pt in injector.active_points.items()
+                         if side in getattr(injector, "_pending_taps", ())}
+            injector.sync(remaining)
+            self.gesture_owner = None
             return True
+
+        if touch_release_consumed:
+            # While 80 ms release debounce runs, never fall through into the
+            # old single-cursor mouse-click path (which targets the wrong file).
+            self.gesture_owner = None
+            return True
+
         return False
-
-    def _reset_middle_pinch_zoom(self):
-        """Clear a pending or active two-hand pinch zoom session."""
-        state = getattr(self, "middle_pinch_zoom", None)
-        if state is None:
-            return
-        state.update({
-            "started_at": None, "last_both_seen_at": None, "active": False,
-            "mode": None, "hwnd": None, "rect": None, "corners": None,
-            "start_points": None, "start_distance": None, "last_distance": None,
-            "zoom_remainder": 0.0,
-            "last_resize_rect": None, "last_resize_at": 0.0,
-        })
-
-    def _begin_middle_pinch_zoom(self, cursor_points, now):
-        """Choose window resize from opposite corner zones; otherwise zoom content."""
-        state = self.middle_pinch_zoom
-        points = {side: self._virtual_point_to_global(cursor_points[side])
-                  for side in ("left", "right")}
-        if any(point is None for point in points.values()):
-            return False
-        point_tuples = {side: (float(point.x()), float(point.y())) for side, point in points.items()}
-        midpoint = QPointF((cursor_points["left"].x()+cursor_points["right"].x())*0.5,
-                           (cursor_points["left"].y()+cursor_points["right"].y())*0.5)
-        initial_distance = math.hypot(
-            point_tuples["right"][0]-point_tuples["left"][0],
-            point_tuples["right"][1]-point_tuples["left"][1])
-        left_hwnd = self._find_native_window_at(cursor_points["left"], prefer_smallest=True)
-        right_hwnd = self._find_native_window_at(cursor_points["right"], prefer_smallest=True)
-        centre_hwnd = self._find_native_window_at(midpoint, prefer_smallest=True)
-
-        # Find the smallest native app window containing BOTH pinch starts. This lets
-        # mode selection use where the pinches begin in that window, not whether the
-        # app happens to be a browser, file manager, image viewer, or presentation app.
-        candidates = []
-        for candidate in (left_hwnd, right_hwnd, centre_hwnd):
-            if candidate and all(int(candidate) != int(existing) for existing in candidates):
-                candidates.append(candidate)
-        shared_windows = []
-        for candidate in candidates:
-            rect = self._native_window_rect(candidate)
-            if rect is None:
-                continue
-            left, top, right, bottom = rect
-            if all(left <= x < right and top <= y < bottom
-                   for x, y in point_tuples.values()):
-                shared_windows.append(((right-left)*(bottom-top), candidate, rect))
-        if shared_windows:
-            _area, target, target_rect = min(shared_windows, key=lambda row: row[0])
-            action, corners = classify_middle_pinch_window_action(
-                target_rect, point_tuples["left"], point_tuples["right"],
-                corner_zone_ratio=0.25)
-        else:
-            # If the hands straddle application windows, never resize either by
-            # accident. Content zoom is the safe fallback for the active target.
-            target = centre_hwnd or left_hwnd or right_hwnd
-            target_rect = self._native_window_rect(target) if target else None
-            action, corners = "zoom", None
-
-        state["active"] = True
-        state["start_points"] = point_tuples
-        state["start_distance"] = max(1.0, initial_distance)
-        state["last_distance"] = initial_distance
-        state["zoom_remainder"] = 0.0
-        state["last_resize_at"] = 0.0
-        if action == "resize" and target and target_rect and corners:
-            # On tiled Linux WMs, float/activate the app before resizing. Re-test the
-            # same 25%-inset corner zones after the WM has finished preparing it.
-            self._prepare_native_window_drag(target)
-            target_rect = self._native_window_rect(target) or target_rect
-            action, corners = classify_middle_pinch_window_action(
-                target_rect, point_tuples["left"], point_tuples["right"],
-                corner_zone_ratio=0.25)
-            if action == "resize" and corners:
-                state["mode"] = "resize"
-                state["hwnd"] = target
-                state["rect"] = target_rect
-                state["corners"] = corners
-                state["last_resize_rect"] = target_rect
-                self.status = "Window resize active — move hands from opposite corner zones"
-            else:
-                # Window geometry changed during preparation; do not resize the wrong
-                # edges. Continue in generic content zoom mode instead.
-                state["mode"] = "zoom"
-                state["hwnd"] = target
-                state["rect"] = target_rect
-                state["corners"] = None
-                state["last_resize_rect"] = None
-                self._focus_native_window_for_zoom(target)
-                self.status = "Content zoom active — move hands apart to zoom in, together to zoom out"
-        else:
-            state["mode"] = "zoom"
-            state["hwnd"] = target
-            state["rect"] = target_rect
-            state["corners"] = None
-            state["last_resize_rect"] = None
-            # Generic Ctrl/Command+wheel handles browser pages, Explorer icon sizing,
-            # presentation canvases, and image viewers without relying on app names.
-            self._focus_native_window_for_zoom(target)
-            self.status = "Content zoom active — move hands apart to zoom in, together to zoom out"
-        self.update()
-        return True
-
-    def _apply_middle_pinch_zoom_step(self, direction):
-        """Dispatch a generic Ctrl/Command+wheel step at the live hand cursor.
-
-        Unlike moving the cursor to the midpoint, this operates at the current OS
-        pointer location. Ctrl+wheel is supported by browsers, Explorer, many image
-        viewers, and presentation canvases. No application-name heuristics are used.
-        """
-        if pyautogui is None:
-            self.status = "Content zoom unavailable: pyautogui is not installed"
-            return False
-        modifier = "command" if sys.platform == "darwin" else "ctrl"
-        modifier_down = False
-        try:
-            pyautogui.keyDown(modifier, _pause=False)
-            modifier_down = True
-            pyautogui.scroll(1 if direction > 0 else -1, _pause=False)
-            return True
-        except Exception as exc:
-            self.status = f"Content zoom input failed: {exc}"
-            return False
-        finally:
-            if modifier_down:
-                try:
-                    pyautogui.keyUp(modifier, _pause=False)
-                except Exception:
-                    pass
-
-    def _update_middle_pinch_zoom(self, cursor_points, now):
-        """Apply distance changes to the chosen window bounds or its content zoom."""
-        state = self.middle_pinch_zoom
-        points = {side: self._virtual_point_to_global(cursor_points[side])
-                  for side in ("left", "right")}
-        if any(point is None for point in points.values()):
-            return
-        current = {side: (float(point.x()), float(point.y())) for side, point in points.items()}
-        if state.get("mode") == "resize":
-            rect = resize_rect_from_corner_deltas(
-                state["rect"], state["start_points"], current, state["corners"])
-            if rect is None:
-                return
-            previous = state.get("last_resize_rect")
-            moved_enough = previous is None or any(abs(a-b) >= 2.0 for a, b in zip(rect, previous))
-            # wmctrl resizing spawns a process on X11; cap it at ~15 Hz to keep the
-            # new built-in gesture from adding a large CPU cost during a resize.
-            if (moved_enough and now-float(state.get("last_resize_at", 0.0)) >= 0.065):
-                left, top, right, bottom = rect
-                resized = self._resize_native_window(state.get("hwnd"), left, top,
-                                                      right-left, bottom-top)
-                state["last_resize_at"] = now
-                if resized:
-                    state["last_resize_rect"] = rect
-            return
-        distance = math.hypot(current["right"][0]-current["left"][0],
-                              current["right"][1]-current["left"][1])
-        if state.get("mode") == "resize_scale":
-            rect = resize_rect_from_distance_scale(
-                state.get("rect"), state.get("start_distance"), distance)
-            if rect is None:
-                return
-            previous = state.get("last_resize_rect")
-            moved_enough = previous is None or any(abs(a-b) >= 2.0 for a, b in zip(rect, previous))
-            # Window-manager operations are intentionally throttled to avoid extra CPU
-            # use while still providing smooth enough resizing by hand.
-            if moved_enough and now-float(state.get("last_resize_at", 0.0)) >= 0.065:
-                left, top, right, bottom = rect
-                resized = self._resize_native_window(state.get("hwnd"), left, top,
-                                                      right-left, bottom-top)
-                state["last_resize_at"] = now
-                if resized:
-                    state["last_resize_rect"] = rect
-            state["last_distance"] = distance
-            return
-        previous_distance = state.get("last_distance")
-        state["last_distance"] = distance
-        if previous_distance is None:
-            return
-        # Ignore small tremor and emit zoom keyboard steps only after a meaningful
-        # change in hand separation. No OS cursor repositioning is required.
-        state["zoom_remainder"] = float(state.get("zoom_remainder", 0.0)) + (distance-previous_distance)
-        remainder = state["zoom_remainder"]
-        if abs(remainder) < 34.0:
-            return
-        emitted = 0
-        while abs(remainder) >= 34.0 and emitted < 3:
-            direction = 1 if remainder > 0 else -1
-            if not self._apply_middle_pinch_zoom_step(direction):
-                state["zoom_remainder"] = 0.0
-                return
-            remainder -= 34.0*direction
-            emitted += 1
-        state["zoom_remainder"] = remainder
-
-    def _process_middle_pinch_zoom(self, cursor_points, poses, now):
-        """Consume the two-hand thumb-middle pinch and its shared Pinch Menu buffer."""
-        state = self.middle_pinch_zoom
-        # A closed grip has the middle fingertip naturally folded near the thumb.
-        # Never allow the raw middle-pinch classifier to steal an ordinary fist/grab.
-        middle = {
-            side: bool(
-                poses.get(side, {}).get("middle_pinch")
-                and not poses.get(side, {}).get("fist", False)
-                and side in cursor_points
-            )
-            for side in ("left", "right")
-        }
-        any_middle = middle["left"] or middle["right"]
-        both_middle = middle["left"] and middle["right"]
-        if not any_middle and state.get("started_at") is None and not state.get("active"):
-            return False
-        # A middle-finger pinch is reserved for this built-in action. If the glass UI owns
-        # gestures, consume it without touching underlying application windows.
-        search_dialog = getattr(self, "search_dialog", None)
-        modal = (self._gesture_ui_modal_open() or self.tli_calibration_active_side is not None or
-                 getattr(self, "hand_calibration_active", False) or self.voice_selection_mode is not None or
-                 self.custom_gesture_recording is not None or
-                 any(self.fist_action_menu_open.values()) or
-                 (search_dialog is not None and search_dialog.isVisible()))
-        if modal or self.desktop_mode != "os":
-            was_active = bool(state.get("active"))
-            self._reset_middle_pinch_zoom()
-            if any_middle and not modal and self.status != "Pinch zoom and native window resize require OS desktop mode":
-                self.status = "Pinch zoom and native window resize require OS desktop mode"
-            elif was_active and not modal:
-                self.status = "Pinch zoom and native window resize require OS desktop mode"
-            return any_middle
-        # The zoom/resize gesture is explicitly two-handed. A single middle pinch
-        # with no session armed must fall through to normal gesture processing (not
-        # consume the frame), preserving one-hand clicks and fist-grab window drag.
-        if state.get("started_at") is None and not state.get("active") and not both_middle:
-            return False
-
-        if both_middle:
-            state["last_both_seen_at"] = now
-            if state.get("started_at") is None:
-                state["started_at"] = now
-                # Do not let this two-hand hold continue an in-progress click/drag/menu.
-                for side in ("left", "right"):
-                    self._end_pinch_drag(side, status=False)
-                    if self.fist_mouse_down.get(side, False):
-                        self._release_fist_mouse(side)
-                    self.active_action[side] = None
-                    self._reset_fist_gesture(side)
-                    self._clear_menu_pinch_sequence(side)
-                    self.active_push_sides.discard(side)
-                if self.gesture_owner in ("left", "right"):
-                    self.gesture_owner = None
-            if not state.get("active") and now-float(state["started_at"]) >= self.pinch_buffer_seconds:
-                if not self._begin_middle_pinch_zoom(cursor_points, now):
-                    self._reset_middle_pinch_zoom()
-            if state.get("active"):
-                self._update_middle_pinch_zoom(cursor_points, now)
-            self._request_scene_repaint(now)
-            return True
-        # Tolerate a brief one-frame landmark glitch, but release if either pinch ends.
-        if state.get("started_at") is not None:
-            last_seen = state.get("last_both_seen_at") or state.get("started_at")
-            if now-float(last_seen) <= 0.16:
-                self._request_scene_repaint(now)
-                return True
-            was_active = bool(state.get("active"))
-            self._reset_middle_pinch_zoom()
-            if was_active:
-                self.status = "Pinch zoom/resize released"
-            self._request_scene_repaint(now)
-        return any_middle
-
-    def _paint_middle_pinch_zoom_timer(self, painter, now=None):
-        """Draw the shared buffer countdown on each hand while pinch zoom is arming."""
-        state = getattr(self, "middle_pinch_zoom", {})
-        started = state.get("started_at") if isinstance(state, dict) else None
-        if started is None:
-            return
-        now = time.monotonic() if now is None else float(now)
-        if state.get("active"):
-            points = [self.side_cursor_positions.get(side) for side in ("left", "right")]
-            if all(point is not None for point in points):
-                centre = QPointF((points[0].x()+points[1].x())*0.5,
-                                 (points[0].y()+points[1].y())*0.5)
-                label = "RESIZE WINDOW" if state.get("mode") == "resize" else "PINCH ZOOM"
-                badge = QRectF(centre.x()-68, centre.y()-16, 136, 32)
-                painter.setPen(QPen(QColor(90, 235, 255, 210), 1.5))
-                painter.setBrush(QColor(12, 24, 36, 185))
-                painter.drawRoundedRect(badge, 8, 8)
-                painter.setPen(QColor(220, 252, 255, 245))
-                painter.setFont(self._ui_font(8, QFont.DemiBold))
-                painter.drawText(badge, Qt.AlignCenter, label)
-            return
-        elapsed = max(0.0, now-float(started))
-        remaining = max(0.0, self.pinch_buffer_seconds-elapsed)
-        progress = min(1.0, elapsed/max(0.01, self.pinch_buffer_seconds))
-        for side in ("left", "right"):
-            cursor = self.side_cursor_positions.get(side)
-            if cursor is None:
-                continue
-            ring = QRectF(cursor.x()-39, cursor.y()-39, 78, 78)
-            painter.setBrush(Qt.NoBrush)
-            painter.setPen(QPen(QColor(95, 235, 255, 80), 3))
-            painter.drawEllipse(ring)
-            painter.setPen(QPen(QColor(95, 235, 255, 245), 4))
-            painter.drawArc(ring, 90*16, -int(progress*360*16))
-            painter.setPen(QColor(225, 252, 255, 245))
-            painter.setFont(self._ui_font(8, QFont.DemiBold))
-            painter.drawText(QRectF(cursor.x()-24, cursor.y()+25, 48, 16), Qt.AlignCenter,
-                             f"{remaining:.1f}s")
 
     def update_scene(self):
         """Mutually-exclusive quick clicks, direct fist manipulation, and Pinch Menu gestures."""
@@ -14372,17 +14515,16 @@ try {
                 self._space_finish_constellation(side)
             raw_fist = is_fist_or_grip_pose(landmarks, edge_tolerant=edge_tolerant)
             raw_pinch = is_thumb_index_menu_pinch(landmarks, edge_tolerant=edge_tolerant)
-            raw_middle_pinch = is_thumb_middle_zoom_pinch(landmarks, edge_tolerant=edge_tolerant)
             raw_open = is_open_hand_pose(landmarks, edge_tolerant=edge_tolerant)
             if not self.gesture_tracking_enabled.get(side, True) or side in gesture_tracking_just_toggled:
-                raw_fist = raw_pinch = raw_middle_pinch = raw_open = False
+                raw_fist = raw_pinch = raw_open = False
             if peace:
-                raw_fist = raw_pinch = raw_middle_pinch = raw_open = False
+                raw_fist = raw_pinch = raw_open = False
             calibration_consumes_gesture = self._process_tli_calibration_frame(
                 side, landmarks, raw_pinch)
             if calibration_modal_frame or calibration_consumes_gesture:
                 # Calibration pinches must never also click, drag, or start built-in timers.
-                raw_fist = raw_pinch = raw_middle_pinch = raw_open = False
+                raw_fist = raw_pinch = raw_open = False
             # Closing the fingers before the thumb forms a temporary near-index
             # contact. Suppress it for either hand without relaxing fist recognition
             # or depending on the TPI pointer's visual location.
@@ -14469,7 +14611,6 @@ try {
                 "clear_left_pinch": clear_left_pinch,
                 # Fingers folded with or without the thumb out: a thumbs-up counts.
                 "fingers_closed": fingers_closed_pose(landmarks, edge_tolerant),
-                "middle_pinch": raw_middle_pinch,
             }
 
         self._update_hand_contact_display()
@@ -14509,17 +14650,6 @@ try {
             return
 
         if self._process_two_hand_touch(cursor_points, poses, now):
-            self.pointer_side = None
-            self.active_push_sides.clear()
-            self.depth += (self.target_depth-self.depth)*0.16
-            self._request_scene_repaint(now)
-            self._sync_scroll_cursor_visibility()
-            self._stop_inactive_timer_during_sounds()
-            return
-
-        if self._process_middle_pinch_zoom(cursor_points, poses, now):
-            # While this two-hand pose is arming or active, do not let it leak into
-            # custom-pose recognition, pinch-menu timers, clicks or ordinary pointer moves.
             self.pointer_side = None
             self.active_push_sides.clear()
             self.depth += (self.target_depth-self.depth)*0.16
@@ -14653,7 +14783,9 @@ try {
 
         # The configured physical hand has first refusal for new gestures. Cancel a
         # pending uncommitted gesture from the other hand if the preferred hand appears.
-        if preferred in cursor_points and self.gesture_owner == nonpreferred:
+        if (preferred in cursor_points and self.gesture_owner == nonpreferred and
+                not (self.desktop_mode == "os" and self._native_touch is not None and
+                     not self._native_touch.unavailable and poses.get(nonpreferred, {}).get("pinch", False))):
             other_is_committed = (self.active_action.get(nonpreferred) is not None or
                                   self.pinch_drag_active.get(nonpreferred, False) or
                                   self.fist_action_menu_open.get(nonpreferred, False) or
@@ -15190,9 +15322,14 @@ try {
                 continue
 
             # Only one hand may own a gesture sequence at a time.
-            if self.gesture_owner not in (None, side):
+            independent_touch_pinch = bool(
+                self.desktop_mode == "os" and self._native_touch is not None and
+                not self._native_touch.unavailable and is_pinch and
+                not self._gesture_ui_modal_open())
+            if self.gesture_owner not in (None, side) and not independent_touch_pinch:
                 continue
-            if (not self.left_click_modifier_active and side != preferred and preferred in cursor_points and
+            if (not independent_touch_pinch and not self.left_click_modifier_active and
+                    side != preferred and preferred in cursor_points and
                     not self.fist_action_menu_open.get(side, False)):
                 # Always honour the configured physical-hand priority for new idle gestures.
                 # A committed action or menu selection was handled above and remains locked.
@@ -15739,7 +15876,8 @@ try {
         # An active fist scroll uses the tracked hand for scrolling, but must not
         # move the OS cursor. Restore it immediately after full-hand release.
         self._sync_scroll_cursor_visibility()
-        if self.desktop_mode == "os" and not self._os_scroll_pointer_detached():
+        if (self.desktop_mode == "os" and not self._os_scroll_pointer_detached()
+                and (self._native_touch is None or self._native_touch.unavailable)):
             mouse_side = self.pointer_side
             if mouse_side not in cursor_points or self.mouse_detached_by_side.get(mouse_side, False):
                 alternate = "left" if mouse_side == "right" else "right"
@@ -15759,6 +15897,9 @@ try {
         if self._wake_word_training_dialog is not None:
             self._wake_word_training_dialog.reject()
         self._end_two_hand_touch()
+        injector = getattr(self, "_native_touch", None)
+        if injector is not None and hasattr(injector, "close"):
+            injector.close()
         if self._native_scroll_cursor_hidden:
             try:
                 ctypes.windll.user32.ShowCursor(True)
@@ -16914,7 +17055,6 @@ try {
                 self._paint_gesture_timer_fade(painter, side, now)
                 self._paint_pinch_menu(painter, side, now)
             self._paint_floating_clipboard(painter, now)
-            self._paint_middle_pinch_zoom_timer(painter, now)
 
             # Reticle and skeleton use the fixed hand-relative (optionally calibrated) TLI anchor.
             # During TLI calibration the dedicated target window is the sole visual owner;

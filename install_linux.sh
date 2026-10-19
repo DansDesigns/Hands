@@ -6,6 +6,39 @@ set -x
 SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 APP_DIR=$SCRIPT_DIR
 cd "$APP_DIR"
+
+# Internal elevated phase of this SAME installer: no separate touch setup file.
+# Restrict virtual system-wide input injection to explicitly enrolled users.
+if [ "${1:-}" = "--configure-uinput" ]; then
+    account="${2:-}"
+    if [ "$(id -u)" -ne 0 ] || [ -z "$account" ] || [ "$account" = root ] || ! id "$account" >/dev/null 2>&1; then
+        echo 'ERROR: uinput setup requires root and a valid desktop account.' >&2
+        exit 1
+    fi
+    if ! getent group freehand-uinput >/dev/null 2>&1; then
+        groupadd --system freehand-uinput
+    fi
+    mkdir -p /etc/udev/rules.d
+    printf '%s\n' 'KERNEL=="uinput", SUBSYSTEM=="misc", GROUP="freehand-uinput", MODE="0660"' > /etc/udev/rules.d/70-freehand-uinput.rules
+    if command -v modprobe >/dev/null 2>&1; then
+        modprobe uinput || echo 'Note: uinput may be built into the kernel.'
+    fi
+    if command -v udevadm >/dev/null 2>&1; then
+        udevadm control --reload-rules || true
+        udevadm trigger --subsystem-match=misc --sysname-match=uinput || true
+    fi
+    usermod -a -G freehand-uinput "$account"
+    for device in /dev/uinput /dev/input/uinput; do
+        if [ -e "$device" ]; then
+            chgrp freehand-uinput "$device"
+            chmod 0660 "$device"
+        fi
+    done
+    echo "Freehand multitouch enabled for account: $account"
+    echo 'Log out and log back in before using multitouch if group membership is new.'
+    exit 0
+fi
+
 trap 'status=$?; if [ "$status" -ne 0 ]; then echo "ERROR: Installer failed (exit $status). See command output above." >&2; fi' 0
 
 echo '============================================================'
@@ -79,6 +112,44 @@ echo '(prebuilt for x64/arm64/s390x; other architectures are compiled locally if
 if ! "$VPY" -u "$APP_DIR/install_d1_model.py" 600m; then
     echo 'WARNING: d1 setup did not complete. Spatial Desktop remains usable without d1.' >&2
     echo "Retry later with: $VPY $APP_DIR/install_d1_model.py 600m" >&2
+fi
+
+echo '[8b/9] Configuring Linux two-hand multitouch (/dev/uinput)...'
+# Ask for privilege escalation HERE during regular installation, rather than
+# asking users to download/run another setup script after installation.
+DESKTOP_USER="$(id -un)"
+if [ "$DESKTOP_USER" = root ]; then
+    DESKTOP_USER="${SUDO_USER:-}"
+fi
+if [ -z "$DESKTOP_USER" ] || [ "$DESKTOP_USER" = root ]; then
+    echo 'WARNING: Could not identify desktop user; uinput setup requires a non-root account.' >&2
+    TOUCH_SETUP_RESULT=failed
+else
+    TOUCH_SETUP_RESULT=failed
+    if [ "$(id -u)" -eq 0 ]; then
+        if sh "$APP_DIR/install_linux.sh" --configure-uinput "$DESKTOP_USER"; then
+            TOUCH_SETUP_RESULT=ok
+        fi
+    else
+        # sudo works in an interactive terminal; pkexec supports graphical
+        # authentication on desktops that provide a polkit agent.
+        if command -v sudo >/dev/null 2>&1 && [ -t 0 ]; then
+            if sudo sh "$APP_DIR/install_linux.sh" --configure-uinput "$DESKTOP_USER"; then
+                TOUCH_SETUP_RESULT=ok
+            fi
+        fi
+        if [ "$TOUCH_SETUP_RESULT" != ok ] && command -v pkexec >/dev/null 2>&1; then
+            if pkexec sh "$APP_DIR/install_linux.sh" --configure-uinput "$DESKTOP_USER"; then
+                TOUCH_SETUP_RESULT=ok
+            fi
+        fi
+    fi
+fi
+if [ "$TOUCH_SETUP_RESULT" != ok ]; then
+    echo 'WARNING: Could not configure /dev/uinput access; Freehand installs, but native multitouch requires permission.' >&2
+    echo 'Re-run this main installer from a terminal to complete the permission step.' >&2
+else
+    echo 'Linux multitouch permission configured. New group membership may require sign-out/sign-in.'
 fi
 
 echo '[9/9] Assigning the bundled Freehand launcher icon and creating the desktop entry...'
