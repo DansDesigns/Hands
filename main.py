@@ -117,6 +117,7 @@ from gesture_rules import (
     ease_toward,
     pinch_drag_should_start,
     thumb_sticking_out,
+    thumb_across_palm,
     thumb_axis_is_vertical_up,
     opposite_diagonal_corner_assignment,
 )
@@ -441,6 +442,238 @@ def play_ui_sound(filename, *, stop_event=None):
                     threading.Thread(target=_stop_process_on_cancel, daemon=True).start()
     except (OSError, ValueError):
         pass
+# A one-time accessibility probe at the START of a single pinch drag is used
+# to choose between text selection (native held left click) and touchscreen
+# scrolling. Never run these OS lookups during ordinary hand tracking frames.
+class _AccessibleValue(ctypes.Union):
+    _fields_ = [("number", ctypes.c_int32), ("pointer", ctypes.c_void_p),
+                ("raw", ctypes.c_byte * 16)]
+
+
+class _AccessibleVariant(ctypes.Structure):
+    _fields_ = [("vt", ctypes.c_uint16), ("r1", ctypes.c_uint16),
+                ("r2", ctypes.c_uint16), ("r3", ctypes.c_uint16),
+                ("value", _AccessibleValue)]
+
+
+def _accessible_role_is_text(role):
+    """Text leaves/links/editors, NOT entire documents or generic controls."""
+    if isinstance(role, int):
+        # MSAA: TEXT, STATICTEXT, LINK. DOCUMENT intentionally excluded; a
+        # document covers blank space too and must not steal touch scrolling.
+        return role in (0x2a, 0x29, 0x1e)
+    name = str(role or "").strip().lower().replace("_", " ")
+    return name in (
+        "text", "static text", "static", "paragraph", "entry", "text entry",
+        "editable text", "label", "link", "hyperlink", "password text",
+        "terminal", "text field", "text area", "heading",
+    )
+
+
+def _windows_accessible_text_at(x, y):
+    """MSAA hit test with the standard oleacc.dll; no added Python packages."""
+    if not sys.platform.startswith("win"):
+        return False
+    ole32 = None
+    initialized = False
+    try:
+        ole32 = ctypes.OleDLL("ole32")
+        coinit = ole32.CoInitializeEx
+        coinit.argtypes = [ctypes.c_void_p, ctypes.c_uint32]
+        coinit.restype = ctypes.c_long
+        hr = coinit(None, 2)  # COINIT_APARTMENTTHREADED, GUI thread
+        initialized = hr in (0, 1)  # S_OK or S_FALSE
+        # RPC_E_CHANGED_MODE: Qt already set the COM model; can still use it.
+        if hr not in (0, 1, -2147417850):
+            return False
+        oleacc = ctypes.OleDLL("oleacc")
+        get_object = oleacc.AccessibleObjectFromPoint
+        get_object.argtypes = [wintypes.POINT, ctypes.POINTER(ctypes.c_void_p),
+                               ctypes.POINTER(_AccessibleVariant)]
+        get_object.restype = ctypes.c_long
+        pointer = ctypes.c_void_p()
+        child = _AccessibleVariant()
+        if get_object(wintypes.POINT(int(x), int(y)),
+                      ctypes.byref(pointer), ctypes.byref(child)) < 0 or not pointer.value:
+            return False
+        vtable = None
+        try:
+            vtable = ctypes.cast(pointer, ctypes.POINTER(ctypes.POINTER(ctypes.c_void_p))).contents
+            # IAccessible inherits IDispatch (7 entries); get_accRole is vtable[13].
+            get_role = ctypes.WINFUNCTYPE(
+                ctypes.c_long, ctypes.c_void_p, _AccessibleVariant,
+                ctypes.POINTER(_AccessibleVariant))(vtable[13])
+            if child.vt != 3:  # VT_I4 / CHILDID_SELF or child index
+                child.vt, child.value.number = 3, 0
+            role = _AccessibleVariant()
+            if get_role(pointer, child, ctypes.byref(role)) >= 0:
+                return role.vt == 3 and _accessible_role_is_text(role.value.number)
+        finally:
+            if vtable is not None:
+                release = ctypes.WINFUNCTYPE(ctypes.c_uint32, ctypes.c_void_p)(vtable[2])
+                release(pointer)
+    except Exception:
+        # An inaccessible/malformed accessibility object must never interrupt
+        # the hand tracker or prevent the normal touch-scrolling fallback.
+        return False
+    finally:
+        if initialized and ole32 is not None:
+            try:
+                ole32.CoUninitialize()
+            except (OSError, AttributeError):
+                pass
+    return False
+
+
+def _linux_accessible_text_at(x, y):
+    """Check AT-SPI text roles if the desktop exposes Python AT-SPI bindings.
+
+    On accessibility-disabled sessions, keep touch scrolling as the safe default.
+    This is a once-per-drag lookup, never a per-frame accessibility-tree walk.
+    """
+    try:
+        import pyatspi
+        desktop = pyatspi.Registry.getDesktop(0)
+        for app in desktop:
+            for window in app:
+                try:
+                    component = window.queryComponent()
+                    rect = component.getExtents(pyatspi.DESKTOP_COORDS)
+                    if not (rect.x - 16 <= x <= rect.x + rect.width + 16 and
+                            rect.y - 16 <= y <= rect.y + rect.height + 16):
+                        continue
+                    target = component.getAccessibleAtPoint(int(x), int(y),
+                                                            pyatspi.DESKTOP_COORDS)
+                    if target is None:
+                        continue
+                    # Some AT-SPI providers return a container first, then the text
+                    # child. Only descend along the point, never the entire tree.
+                    for _ in range(3):
+                        if _accessible_role_is_text(target.getRoleName()):
+                            return True
+                        try:
+                            next_target = target.queryComponent().getAccessibleAtPoint(
+                                int(x), int(y), pyatspi.DESKTOP_COORDS)
+                        except Exception:
+                            break
+                        if next_target is None or next_target == target:
+                            break
+                        target = next_target
+                except Exception:
+                    continue
+    except Exception:
+        pass
+    return False
+
+
+def _windows_native_editor_at(x, y):
+    """Fallback for native edit controls whose accessibility roles are incomplete."""
+    if not sys.platform.startswith('win'):
+        return False
+    try:
+        user32 = ctypes.windll.user32
+        window_at = user32.WindowFromPoint
+        window_at.argtypes = [wintypes.POINT]
+        window_at.restype = wintypes.HWND
+        hwnd = window_at(wintypes.POINT(int(x), int(y)))
+        if not hwnd:
+            return False
+        name = ctypes.create_unicode_buffer(160)
+        user32.GetClassNameW(wintypes.HWND(hwnd), name, len(name))
+        classname = name.value.lower()
+        return (classname in ('edit', 'scintilla', 'tmemo', 'trichedit', 'tedit') or
+                'richedit' in classname or 'windowsforms10.edit' in classname)
+    except (OSError, ValueError, AttributeError, TypeError):
+        return False
+
+
+def _mac_accessible_text_at(x, y):
+    """Best-effort macOS Accessibility role hit-test if PyObjC is present."""
+    try:
+        from ApplicationServices import (AXUIElementCreateSystemWide,
+            AXUIElementCopyElementAtPosition, AXUIElementCopyAttributeValue)
+        system = AXUIElementCreateSystemWide()
+        err, target = AXUIElementCopyElementAtPosition(system, float(x), float(y), None)
+        if err != 0 or target is None:
+            return False
+        err, role = AXUIElementCopyAttributeValue(target, 'AXRole', None)
+        return err == 0 and _accessible_role_is_text(
+            {'AXStaticText': 'static text', 'AXTextField': 'text field',
+             'AXTextArea': 'text area', 'AXLink': 'link',
+             'AXTextView': 'text area'}.get(str(role), str(role)))
+    except Exception:
+        return False
+
+
+def _pinch_origin_over_text(point):
+    """Probe the origin and a tiny adjacent area, once when drag intention appears."""
+    x, y = int(round(point[0])), int(round(point[1]))
+    if sys.platform.startswith('win'):
+        def probe(a, b):
+            # Win32 accessibility queries also expect native pixels, unlike
+            # the already-calibrated and visually drawn Qt TPI point.
+            physical_x, physical_y = _windows_touch_screen_pixels((a, b))
+            return (_windows_accessible_text_at(physical_x, physical_y) or
+                    _windows_native_editor_at(physical_x, physical_y))
+    elif sys.platform.startswith('linux'):
+        probe = _linux_accessible_text_at
+    elif sys.platform == 'darwin':
+        probe = _mac_accessible_text_at
+    else:
+        return False
+    # Near-text tolerance is less than the default 30-pixel TPI diameter.
+    offsets = ((0, 0), (0, -12), (0, 12), (-12, 0), (12, 0))
+    # Cross-process AT-SPI calls cost more than Win32 role queries: probe the
+    # centre and the closest two text-line offsets, not five full tree walks.
+    if sys.platform.startswith('linux'):
+        offsets = offsets[:3]
+    return any(probe(x+dx, y+dy) for dx, dy in offsets)
+
+
+def _windows_touch_screen_pixels(point):
+    """Convert a Qt desktop-global point to Win32 physical screen pixels.
+
+    Qt 6 uses device-independent pixels for its TPI and mapToGlobal(), while
+    InjectTouchInput, WindowFromPoint and MSAA hit-testing require physical
+    screen pixels.  At 125%/150% display scaling, passing Qt coordinates
+    unconverted taps up and to the left of the drawn TPI.  On Windows Qt keeps
+    each monitor's global origin at its native position but scales its size;
+    scale *relative to that monitor's origin*, not to desktop (0, 0).
+
+    Don't change the Qt-side TPI, smoothing, pinch origins or Linux/macOS touch
+    backends. They must continue using their existing coordinate systems.
+    """
+    px, py = float(point[0]), float(point[1])
+    if not sys.platform.startswith("win"):
+        return (int(round(px)), int(round(py)))
+    try:
+        location = QPoint(int(round(px)), int(round(py)))
+        screen = QApplication.screenAt(location)
+        if screen is None:
+            # Qt's Windows high-DPI "islands" can have gaps between screens.
+            # Select the closest Qt monitor rather than using the primary one's
+            # scale for a point on a secondary display.
+            screens = QApplication.screens()
+            if screens:
+                def distance_sq(item):
+                    rect = item.geometry()
+                    dx = max(rect.left()-px, 0.0, px-rect.right())
+                    dy = max(rect.top()-py, 0.0, py-rect.bottom())
+                    return dx*dx+dy*dy
+                screen = min(screens, key=distance_sq)
+        if screen is not None:
+            rect = screen.geometry()
+            ratio = float(screen.devicePixelRatio())
+            if math.isfinite(ratio) and ratio > 0.0:
+                px = rect.x() + (px-rect.x())*ratio
+                py = rect.y() + (py-rect.y())*ratio
+    except (AttributeError, RuntimeError, TypeError, ValueError):
+        # On a display with 100% scaling or when Qt hasn't found a screen,
+        # the original global point remains a better fallback than guessing.
+        pass
+    return (int(round(px)), int(round(py)))
+
+
 # Win32 touch injection structures use explicitly-sized fields. ctypes.wintypes.LONG
 # is platform-dependent on Linux, so these layouts must not rely on its host size.
 class _TouchPoint(ctypes.Structure):
@@ -527,7 +760,10 @@ class _WindowsTouchInjector:
 
     @staticmethod
     def _contact(pointer_id, point, flags):
-        x, y = int(round(point[0])), int(round(point[1]))
+        # The UI and stored contact state use Qt logical global coordinates;
+        # convert only at the native Windows injection boundary so a tap hits
+        # the exact centre of the on-screen TPI at every display scale.
+        x, y = _windows_touch_screen_pixels(point)
         info = _WinTouchInfo()
         info.pointerInfo.pointerType = 2  # PT_TOUCH
         info.pointerInfo.pointerId = pointer_id
@@ -1037,6 +1273,81 @@ class WakeWordTrainingDialog(QDialog):
         return False
 
 
+def _set_start_on_login(enabled, app_root=ROOT):
+    """Configure login startup for *this user* without root/admin privileges.
+
+    Windows: HKCU Run invokes the existing VBS, preserving the Debugging toggle.
+    Linux: XDG autostart runs the existing launcher script, using the same
+    environment and log handling as a normal desktop-menu launch.
+    """
+    enabled = bool(enabled)
+    app_root = Path(app_root).resolve()
+    if sys.platform.startswith("win"):
+        try:
+            import winreg
+            key_path = r"Software\Microsoft\Windows\CurrentVersion\Run"
+            value_name = "Freehand Spatial Computing"
+            if enabled:
+                launcher = app_root / "launch_windows.vbs"
+                if not launcher.is_file():
+                    return False, "Missing launch_windows.vbs; run the Windows installer first"
+                wscript = Path(os.environ.get("SystemRoot", r"C:\Windows")) / "System32" / "wscript.exe"
+                command = subprocess.list2cmdline((str(wscript), str(launcher)))
+                with winreg.CreateKeyEx(winreg.HKEY_CURRENT_USER, key_path, 0,
+                                        winreg.KEY_SET_VALUE) as key:
+                    winreg.SetValueEx(key, value_name, 0, winreg.REG_SZ, command)
+            else:
+                try:
+                    with winreg.OpenKey(winreg.HKEY_CURRENT_USER, key_path, 0,
+                                        winreg.KEY_SET_VALUE) as key:
+                        winreg.DeleteValue(key, value_name)
+                except FileNotFoundError:
+                    pass
+            return True, "Windows login startup updated"
+        except (OSError, ValueError) as exc:
+            return False, f"Could not update Windows login startup: {exc}"
+
+    if sys.platform.startswith("linux"):
+        try:
+            config_base = os.environ.get("XDG_CONFIG_HOME")
+            if config_base and Path(config_base).is_absolute():
+                config_dir = Path(config_base)
+            else:
+                config_dir = Path.home() / ".config"
+            target = config_dir / "autostart" / "freehand-spatial-computing.desktop"
+            if enabled:
+                launcher = app_root / "run_linux.sh"
+                if not launcher.is_file():
+                    return False, "Missing run_linux.sh; run the Linux installer first"
+                # Desktop Entry Exec accepts a double-quoted executable path; these
+                # are the special characters that need escaping inside the quotes.
+                quoted = str(launcher)
+                for old, new in (("\\", "\\\\"), ('"', '\\"'), ("$", "\\$"), ("`", "\\`")):
+                    quoted = quoted.replace(old, new)
+                target.parent.mkdir(parents=True, exist_ok=True)
+                content = ("[Desktop Entry]\n"
+                           "Type=Application\n"
+                           "Name=Freehand: Spatial Computing\n"
+                           f'Exec="{quoted}"\n'
+                           "Terminal=false\n"
+                           "X-GNOME-Autostart-enabled=true\n"
+                           "Categories=Utility;\n")
+                temporary = target.with_suffix(".desktop.tmp")
+                try:
+                    temporary.write_text(content, encoding="utf-8")
+                    os.chmod(temporary, 0o644)
+                    os.replace(temporary, target)
+                finally:
+                    temporary.unlink(missing_ok=True)
+            else:
+                target.unlink(missing_ok=True)
+            return True, "Linux login startup updated"
+        except OSError as exc:
+            return False, f"Could not update Linux login startup: {exc}"
+
+    return False, "Start on Login is supported on Windows and Linux"
+
+
 def load_ui_preferences() -> dict:
     defaults = {
         "paused_notice_position": "bottom-center",
@@ -1048,6 +1359,7 @@ def load_ui_preferences() -> dict:
         "ui_font_scale": 1.2,
         "show_gesture_disabled_indicator": True,
         "debug_console": False,
+        "start_on_login": False,
         "wake_word_name": "",
         "wake_word_trained": False,
         "garden_onboarding_completed": False,
@@ -1067,7 +1379,7 @@ def load_ui_preferences() -> dict:
                     result[key] = min(1.4, max(0.7, float(value)))
                 except (TypeError, ValueError):
                     pass
-            elif key in ("show_gesture_disabled_indicator", "garden_onboarding_completed", "debug_console", "wake_word_trained"):
+            elif key in ("show_gesture_disabled_indicator", "garden_onboarding_completed", "debug_console", "start_on_login", "wake_word_trained"):
                 if isinstance(value, bool):
                     result[key] = value
             elif key == "wake_word_name":
@@ -1094,7 +1406,7 @@ def save_ui_preferences(values: dict) -> None:
                 current[key] = min(1.4, max(0.7, float(value)))
             except (TypeError, ValueError):
                 pass
-        elif key in ("show_gesture_disabled_indicator", "garden_onboarding_completed", "debug_console", "wake_word_trained"):
+        elif key in ("show_gesture_disabled_indicator", "garden_onboarding_completed", "debug_console", "start_on_login", "wake_word_trained"):
             if isinstance(value, bool):
                 current[key] = value
         elif key == "wake_word_name":
@@ -2856,6 +3168,9 @@ class SpatialDesktop(QWidget):
         self.custom_gesture_rings = {}
         self.custom_gesture_dropdown = None  # row index whose action list is open
         self.sound_dropdown_key = None
+        self.d1_model_dropdown_open = False
+        self._d1_server_log_cache_at = 0.0
+        self._d1_server_log_cache = []
         self.custom_gesture_key_capture = None  # gesture row awaiting a physical keyboard shortcut
         self._native_shortcut_capture = None
         self.custom_gesture_triggers = {"left": HoldTrigger(), "right": HoldTrigger(), "overlap": HoldTrigger()}
@@ -2909,6 +3224,7 @@ class SpatialDesktop(QWidget):
         # This is the *next-launch* console state. Do not change the running
         # process when the user toggles the button in Interaction settings.
         self.debug_console_enabled = bool(self.ui_preferences.get("debug_console", False))
+        self.start_on_login_enabled = bool(self.ui_preferences.get("start_on_login", False))
         if not self.ui_preferences.get("sound_defaults_v1_applied", False):
             for sound_key, default_file in DEFAULT_UI_SOUNDS.items():
                 if self.ui_preferences.get(sound_key) in (None, "None", ""):
@@ -3236,6 +3552,7 @@ class SpatialDesktop(QWidget):
         self._touch_pending = {}     # side -> {started, last, origin, point}
         self._touch_last_pose_at = {}  # last confirmed pinch, for dropout tolerance
         self._touch_drag_sides = set()
+        self._touch_text_drag_sides = set()  # native mouse selection, never touch-scroll
         self.fist_quick_click_max_seconds = 0.65
         self.fist_started_at = {side: None for side in sides}
         self.fist_release_candidate_since = {side: None for side in sides}
@@ -3370,6 +3687,9 @@ class SpatialDesktop(QWidget):
         self.custom_key_capture_poll_timer.timeout.connect(self._poll_custom_key_capture)
         # Open with the existing glass menu; hand calibration stays available in Hands settings.
         QTimer.singleShot(2400, self.speak_startup_greeting)
+        # Only a configured AND verified wake word keeps the microphone listening
+        # while normal STT is OFF. Without one, startup remains microphone-off.
+        QTimer.singleShot(400, self._refresh_wake_word_listener)
 
     def schedule_gesture_settings_save(self):
         self.settings_save_timer.start(450)
@@ -5983,6 +6303,7 @@ class SpatialDesktop(QWidget):
             stack("swap_drag_scroll_toggle")
             stack("priority_toggle")
             stack("debugging_toggle")
+            stack("start_on_login_toggle")
         elif page == "hands":
             stack("render_style")
             stack("skin_tint")
@@ -6045,16 +6366,19 @@ class SpatialDesktop(QWidget):
             texts["help"] = (L, y, W, 58.0)
             y += 58.0 + gap
         elif page == "d1":
+            # Controls and status on the left, a full-height log on the right.
+            # Keep the bottom of both columns clear of the common Back button.
             stack("d1_model", h=44.0)
             half = (W-gap)*0.5
             buttons["d1_start"] = (L, y, half, 42.0)
             buttons["d1_stop"] = (L+half+gap, y, half, 42.0)
             y += 42.0 + gap
             stack("d1_retry", h=42.0)
-            texts["state"] = (R, 0.0, W, 22.0)
-            texts["about"] = (R, 26.0, W, 40.0)
-            texts["log"] = (R, 72.0, W, 122.0)
-            right_h = 72.0 + 122.0
+            texts["state"] = (L, y+5.0, W, 59.0)
+            texts["about"] = (L, y+68.0, W, 77.0)
+            y += 150.0
+            texts["log"] = (R, 0.0, W, 310.0)
+            right_h = 310.0
         elif page == "gestures":
             y = 394.0  # see _custom_gesture_layout
         left_h = max(0.0, y - gap)
@@ -6139,7 +6463,9 @@ class SpatialDesktop(QWidget):
         # same rectangles, so the visible and clickable areas stay aligned.
         tab_gap = 4.5*scale
         tab_height = 40.0*scale
-        widths = [82.0, 55.0, 48.0, 58.0, 76.0, 52.0, 48.0, 58.0, 58.0, 50.0]
+        # Reserve more room for ENGINE and VIRTUAL without extending the strip
+        # beyond the panel; labels have their own fitted text rectangles.
+        widths = [78.0, 51.0, 42.0, 53.0, 69.0, 47.0, 68.0, 54.0, 76.0, 47.0]
         total = sum(widths)*scale + tab_gap*9.0
         left = cx-total*0.5
         _panel_width, panel_height = self._menu_panel_dimensions()
@@ -6152,6 +6478,54 @@ class SpatialDesktop(QWidget):
             rects[name] = QRectF(x, y, width*scale, tab_height)
             x += (width*scale) + tab_gap
         return rects
+
+    def _d1_model_dropdown_layout(self, cx, cy, scale):
+        """Model options in one popup, sharing the same rectangles for paint/hit test."""
+        model_rect = self._settings_control_rects(cx, cy, scale, page="d1")["d1_model"]
+        item_height = 40.0*scale
+        choices = list(D1_MODELS.items())
+        left = model_rect.left()
+        top = model_rect.bottom()+3.0*scale
+        items = [(key, spec, QRectF(left, top+i*item_height, model_rect.width(), item_height))
+                 for i, (key, spec) in enumerate(choices)]
+        return {"panel": QRectF(left, top, model_rect.width(), len(items)*item_height),
+                "items": items}
+
+    def _paint_d1_model_dropdown(self, painter, cx, cy, scale):
+        layout = self._d1_model_dropdown_layout(cx, cy, scale)
+        panel = layout["panel"]
+        painter.setBrush(QBrush(QColor(5, 22, 35, 249)))
+        painter.setPen(QPen(QColor(140, 235, 245, 238), 1.5*scale))
+        painter.drawRoundedRect(panel, 9*scale, 9*scale)
+        selected = selected_d1_model()
+        for key, spec, rect in layout["items"]:
+            painter.setBrush(QBrush(QColor(47, 132, 83, 238) if key == selected
+                                    else QColor(13, 51, 72, 245)))
+            painter.setPen(QPen(QColor(110, 208, 220, 128), 0.7*scale))
+            painter.drawRect(rect.adjusted(2*scale, 2*scale, -2*scale, -2*scale))
+            painter.setPen(QColor(238, 251, 255))
+            self._draw_fitted_button_label(painter, rect,
+                                           ("✓  " if key == selected else "    ") + spec["label"],
+                                           base_size=9, min_size=7, inset=9*scale)
+
+    def _d1_server_log_tail(self):
+        """Read a small bounded tail at most once per 1.5s, never during every repaint."""
+        now = time.monotonic()
+        if now-self._d1_server_log_cache_at < 1.5:
+            return self._d1_server_log_cache
+        self._d1_server_log_cache_at = now
+        path = ROOT / "logs" / "llama-server.log"
+        try:
+            with path.open("rb") as handle:
+                handle.seek(0, os.SEEK_END)
+                size = handle.tell()
+                handle.seek(max(0, size-10000))
+                chunk = handle.read(10000).decode("utf-8", errors="replace")
+            lines = [line.strip()[:170] for line in chunk.splitlines() if line.strip()]
+            self._d1_server_log_cache = lines[-14:]
+        except OSError:
+            self._d1_server_log_cache = []
+        return self._d1_server_log_cache
 
     def _sound_dropdown_layout(self, cx, cy, scale):
         # Persistent list in the right column, rather than a popup over the rows.
@@ -7382,7 +7756,7 @@ class SpatialDesktop(QWidget):
             "clipboard_toggle": "",
             "glass_menu": ("GLASS MENU  ·  HIDE" if self.menu_open and self.hub_visible else "GLASS MENU  ·  SHOW"),
             "dictation_toggle": "DICTATE  ·  " + ("ON" if dictation_on else "OFF"),
-            "stt_toggle": "STT  ·  " + ("ON" if self.speech.running else "OFF"),
+            "stt_toggle": "STT  ·  " + ("ON" if self.stt_enabled else "OFF"),
         }
 
     def _announce_voice_input_state(self, enabled):
@@ -7405,21 +7779,56 @@ class SpatialDesktop(QWidget):
             (dialog is not None and dialog.isVisible() and dialog.dictation_enabled)))
         self._announce_voice_input_state(dictation_active)
 
-    def _toggle_stt_from_menu(self):
-        dialog = self.search_dialog
-        if self.speech.running:
-            if dialog is not None and dialog.isVisible() and dialog.dictation_enabled:
-                dialog.set_dictation_enabled(False, notify=True)
-            self.focus_dictation_enabled = False
-            self.focus_dictation_paused = False
-            self.focus_dictation_committed_words = []
-            self.focus_dictation_last_partial = ""
+    def _has_trained_wake_word(self):
+        """Wake-only listening is opt-in: both a name and three successful checks."""
+        return bool(self.ui_preferences.get('wake_word_trained', False) and
+                    normalise_wake_word_name(self.ui_preferences.get('wake_word_name', '')))
+
+    def _refresh_wake_word_listener(self):
+        """Keep Vosk alive for the wake name, but leave ordinary STT disabled.
+
+        This uses the existing offline recogniser: 'STT OFF' refers to command
+        processing, not microphone capture, while a trained wake word is set.
+        Never stop a stream currently needed by dictation or the trainer.
+        """
+        if (self.stt_enabled or self._wake_word_training_dialog is not None or
+                self.focus_dictation_enabled or
+                (self.search_dialog is not None and self.search_dialog.isVisible() and
+                 self.search_dialog.dictation_enabled)):
+            return
+        if self._has_trained_wake_word():
+            if not self.speech.running and self.speech.start():
+                self.status = 'Voice input off — waiting for the wake word'
+        elif self.speech.running:
             self.speech.stop()
-            self.stt_enabled = False
-            self.status = "Vosk speech recognition stopped"
-        else:
+        # When only the wake listener is on, normal UI indicators remain OFF.
+
+    def _set_voice_input_enabled(self, enabled):
+        """Toggle full command recognition independently of wake-only standby."""
+        if enabled:
             self.stt_enabled = bool(self.speech.start())
-            self.status = "Vosk speech recognition " + ("enabled" if self.stt_enabled else "could not start")
+            if self.stt_enabled:
+                self._wake_word_armed_until = 0.0
+            return self.stt_enabled
+        dialog = self.search_dialog
+        if dialog is not None and dialog.isVisible() and dialog.dictation_enabled:
+            dialog.set_dictation_enabled(False, notify=True)
+        self.focus_dictation_enabled = False
+        self.focus_dictation_paused = False
+        self.focus_dictation_committed_words = []
+        self.focus_dictation_last_partial = ''
+        self.stt_enabled = False
+        self._wake_word_armed_until = 0.0
+        self._refresh_wake_word_listener()
+        return False
+
+    def _toggle_stt_from_menu(self):
+        was_enabled = self.stt_enabled
+        self._set_voice_input_enabled(not was_enabled)
+        self.status = ('Vosk speech recognition enabled' if self.stt_enabled else
+                       'Voice input off — waiting for the wake word' if self._has_trained_wake_word() else
+                       'Vosk speech recognition stopped' if was_enabled else
+                       'Vosk speech recognition could not start')
         self._announce_voice_input_state(self.stt_enabled)
 
     def _action_menu_geometry(self, side):
@@ -8348,16 +8757,15 @@ class SpatialDesktop(QWidget):
                     self.apply_desktop_mode()
                     self.status = "OS desktop input" if self.desktop_mode == "os" else "Virtual desktop"
                 elif action == "voice":
+                    was_enabled = self.stt_enabled
+                    self._set_voice_input_enabled(not was_enabled)
                     if self.stt_enabled:
-                        self.speech.stop()
-                        self.stt_enabled = False
-                        self.status = "Voice input off"
+                        self.status = "Voice input on — listening locally with Vosk"
+                    elif was_enabled:
+                        self.status = ("Voice input off — waiting for the wake word"
+                                       if self._has_trained_wake_word() else "Voice input off")
                     else:
-                        self.stt_enabled = bool(self.speech.start())
-                        if self.stt_enabled:
-                            self.status = "Voice input on — listening locally with Vosk"
-                        else:
-                            self.status = "Voice input could not start"
+                        self.status = "Voice input could not start"
                     self._announce_voice_input_state(self.stt_enabled)
                 elif action == "settings":
                     self.settings_open = True
@@ -8391,6 +8799,30 @@ class SpatialDesktop(QWidget):
                         self.status = f"{key.replace('sound_', '').replace('_', ' ').title()} sound: {value}"
                         self.update()
                         return
+
+            if self.settings_page == "d1" and self.d1_model_dropdown_open:
+                # Clicking the selector again closes it rather than reopening it.
+                if self._settings_control_rects(cx, cy, scale, page="d1")["d1_model"].contains(point):
+                    self.d1_model_dropdown_open = False
+                    self.update()
+                    return
+                popup = self._d1_model_dropdown_layout(cx, cy, scale)
+                for key, spec, rect in popup["items"]:
+                    if rect.contains(point):
+                        self.d1_model_dropdown_open = False
+                        if key != selected_d1_model():
+                            ready = select_d1_model(key)
+                            self.status = (f"Selected {spec['label']}" if ready else
+                                           f"Downloading {spec['estimated']} model; see Engine log.")
+                            self._log_d1_ui("Selected " + spec["label"] +
+                                            (" (available)" if ready else " (download requested)"))
+                        else:
+                            self.status = "Model already selected: " + spec["label"]
+                        self._last_d1_log_signature = None
+                        self.update()
+                        return
+                # Clicks outside the list dismiss it; other buttons remain clickable.
+                self.d1_model_dropdown_open = False
 
             # Back and the three Settings sub-pages share a stable navigation row.
             if self._settings_back_rect(cx, cy, scale).contains(point):
@@ -8450,6 +8882,17 @@ class SpatialDesktop(QWidget):
                     save_ui_preferences(self.ui_preferences)
                     self.status = ("Debugging console will SHOW after restart" if self.debug_console_enabled
                                    else "Debugging console will HIDE after restart")
+                elif pressed("start_on_login_toggle"):
+                    requested = not self.start_on_login_enabled
+                    ok, detail = _set_start_on_login(requested)
+                    if ok:
+                        self.start_on_login_enabled = requested
+                        self.ui_preferences["start_on_login"] = requested
+                        save_ui_preferences(self.ui_preferences)
+                        self.status = ("Freehand will start when you log in" if requested
+                                       else "Freehand will no longer start on login")
+                    else:
+                        self.status = detail
                 return
 
             if self.settings_page == "tli":
@@ -8595,14 +9038,8 @@ class SpatialDesktop(QWidget):
 
             if self.settings_page == "d1":
                 if pressed("d1_model"):
-                    # Keep the supported default pinned to d1-omni-600M Q8.
-                    # Clicking this row ensures the default model is selected/downloaded;
-                    # the larger Q4 option is intentionally unavailable for now.
-                    ready = select_d1_model("600m")
-                    spec = D1_MODELS["600m"]
-                    self.status = (f"d1 model selected: {spec['label']}" if ready else
-                                   f"Downloading {spec['estimated']} d1 model in background.")
-                    self._log_d1_ui("Model ensured: " + ("available" if ready else "download requested"))
+                    self.d1_model_dropdown_open = not self.d1_model_dropdown_open
+                    self.update()
                 elif pressed("d1_start"):
                     start_d1_server()
                     self.status = "Starting local d1 runtime."
@@ -8822,28 +9259,51 @@ class SpatialDesktop(QWidget):
             for active in self.active_action.values()
         )
 
-    def _os_scroll_pointer_detached(self):
-        """Temporarily detach, peace-toggle style, without changing saved hand settings.
+    def _os_two_fist_window_drag_active(self):
+        """Recognise both clutch-drag paths without changing peace-sign settings."""
+        return self.desktop_mode == "os" and any(
+            isinstance(action, dict) and action.get("mode") == "drag_window"
+            for action in self.active_action.values()
+        )
 
-        Freeze the OS pointer as soon as a right-hand fist begins arming, before
-        movement crosses the scroll threshold. This also prevents the pointer
-        jumping when the thumb/index anchor changes shape as the fist closes.
-        Continue tracking the hand internally for scrolling and full-open release.
+    def _os_scroll_pointer_detached(self):
+        """Freeze the native pointer while a fist scroll OR window drag owns movement.
+
+        The earlier guard detached only a *single* right fist; adding the left
+        clutch allowed normal cursor routing to resume during a two-fist drag.
+        Keep the OS cursor at its pre-grip point and use the independent hand/TPI
+        coordinates to move windows. Peace-sign state is never modified.
         """
-        if self._os_fist_scroll_active():
+        if self.desktop_mode != "os":
+            return False
+        if self._os_fist_scroll_active() or self._os_two_fist_window_drag_active():
+            return True
+        if self.menu_open and self.hub_visible:
+            return False
+        # Detach during the two-fist clutch *arming* interval as well, so the
+        # cursor cannot jump while thumb/finger landmarks change to fist poses.
+        if (self.fist_started_at.get("right") is not None and
+                self.fist_started_at.get("left") is not None):
             return True
         return bool(
-            self.desktop_mode == "os"
-            and self.fist_started_at.get("right") is not None
+            self.fist_started_at.get("right") is not None
             and self.fist_started_at.get("left") is None
             and not self.left_click_modifier_active
-            and not (self.menu_open and self.hub_visible)
         )
 
     def _scroll_cursor_suppressed(self, side):
-        """Hide only a scrolling hand's TLI, not the hand or its gesture tracking."""
-        if isinstance(self.active_action.get(side), dict) and (
-                self.active_action[side].get("mode") == "scroll_window"):
+        """Hide the active grip's TPI marker, never the actual hand tracking."""
+        active = self.active_action.get(side)
+        if isinstance(active, dict):
+            if active.get("mode") == "scroll_window":
+                return True
+            if (self.desktop_mode == "os" and active.get("mode") == "drag_window" and
+                    (active.get("two_hand_clutch") or active.get("modifier_drag"))):
+                return True
+        if (side == "right" and self.desktop_mode == "os" and
+                self.fist_started_at.get("right") is not None and
+                self.fist_started_at.get("left") is not None and
+                not (self.menu_open and self.hub_visible)):
             return True
         return bool(
             side == "right" and self.desktop_mode == "virtual"
@@ -8855,7 +9315,8 @@ class SpatialDesktop(QWidget):
         """Balance Windows cursor hide/show without affecting saved detach state."""
         should_hide = bool(
             sys.platform.startswith("win") and self.desktop_mode == "os"
-            and not self.hand_tracking_paused and self._os_fist_scroll_active()
+            and not self.hand_tracking_paused and
+            (self._os_fist_scroll_active() or self._os_two_fist_window_drag_active())
         )
         if should_hide == self._native_scroll_cursor_hidden:
             return
@@ -8984,6 +9445,7 @@ class SpatialDesktop(QWidget):
         self.pinch_drag_origin_points[side] = None
         self.pinch_drag_last_points[side] = None
         self.pinch_drag_release_candidate_since[side] = None
+        self._touch_text_drag_sides.discard(side)
         self._release_fist_mouse(side)
         self.active_push_sides.discard(side)
         self._clear_menu_pinch_sequence(side)
@@ -9490,6 +9952,7 @@ class SpatialDesktop(QWidget):
             self.ui_preferences['wake_word_trained'] = False
             self._wake_word_armed_until = 0.0
             self._wake_word_save_timer.start(450)
+            self._refresh_wake_word_listener()
             self.status = ('Wake-word name saved — train it to activate.' if name else
                            'Wake word disabled — all ordinary voice commands work.')
             self.update()
@@ -9573,7 +10036,6 @@ class SpatialDesktop(QWidget):
         if not self.speech.running:
             if self.speech.start():
                 self._wake_word_training_started_speech = True
-                self.stt_enabled = True
                 dialog.feedback.setText('Microphone ready. Say the name clearly (1 of 3).')
             else:
                 dialog.feedback.setText('Microphone/Vosk unavailable. Check input, or Cancel.')
@@ -9588,17 +10050,17 @@ class SpatialDesktop(QWidget):
         if trained:
             self.ui_preferences['wake_word_trained'] = True
             self._save_wake_word_preferences()
-            self.status = (f'Wake word “{dialog.name}” verified — say it before commands. ' +
-                           ('Turn Voice Input ON to listen.' if self._wake_word_training_started_speech else ''))
+            self.status = f'Wake word “{dialog.name}” verified — standby enabled.'
         else:
             self.status = ('Wake-word training cancelled — ordinary commands remain available.'
                            if not self.ui_preferences.get('wake_word_trained') else
                            'Wake-word training closed; existing setting preserved.')
-        if self._wake_word_training_started_speech:
-            self.speech.stop()
-            self.stt_enabled = False
         self._wake_word_training_started_speech = False
         self._wake_word_training_dialog = None
+        if not self.stt_enabled:
+            # Keep the stream alive after successful training as a wake-only
+            # listener; stop it on cancellation if the name is not verified.
+            self._refresh_wake_word_listener()
         dialog.deleteLater()
         self._sync_wake_word_entry()
         self.update()
@@ -9626,6 +10088,10 @@ class SpatialDesktop(QWidget):
             if text.strip():
                 self._wake_word_training_dialog.feedback.setText(
                     f'Listening: “{text}” — say only the wake word.')
+            return
+        if not self.stt_enabled:
+            # The recogniser is only waiting for the trained name. Don't expose
+            # background speech in the Heard bar or feed either dictation path.
             return
         self.speech_partial = text
         # A new phrase should immediately replace any previous unrecognised-command
@@ -10587,7 +11053,15 @@ try {
 
     def _on_general_voice_answer(self, question, answer):
         if not answer:
-            answer = "I couldn't get an answer from the local D1 model. Check that the model is loaded and try again."
+            detail = str(d1_status().get("error") or "")
+            if detail:
+                self._log_d1_ui("Question could not be answered: " + detail[:180])
+            else:
+                self._log_d1_ui("Question did not return an answer")
+            # D1 is a structured decision model, not a general chat assistant.
+            # Avoid telling the user the microphone is broken or inventing replies.
+            answer = ("D1 is configured for desktop commands, not general conversation. "
+                      "A separate chat model is needed for open-ended answers.")
         self.status = answer
         self.tts.speak(answer)
 
@@ -10617,12 +11091,30 @@ try {
                 self.ui_preferences['wake_word_trained'] = True
                 self._save_wake_word_preferences()
             return
+        awakened_from_standby = False
+        if not self.stt_enabled:
+            # Passive wake-word mode: no voice commands, file operations or
+            # dictation can run until the correctly recognised name is heard.
+            if not self._has_trained_wake_word():
+                return
+            matched, command_after_name = wake_word_command(
+                text, self.ui_preferences.get('wake_word_name', ''))
+            if not matched or not self._set_voice_input_enabled(True):
+                return
+            self.status = 'Wake word recognised — voice input enabled'
+            self._announce_voice_input_state(True)
+            awakened_from_standby = True
+            # If the user said 'Name, show menu', carry out that addressed
+            # command after enabling STT. A name by itself simply switches on.
+            if not command_after_name:
+                return
+            text = command_after_name
         low = text.lower().strip()
         low = re.sub(r"\s+", " ", low)
         dialog = self.search_dialog
         # Dictation remains free-flowing after it has been explicitly started.
         # 'Stop listening' remains available without a wake word for safety.
-        if (self.ui_preferences.get('wake_word_name') and
+        if (not awakened_from_standby and self.ui_preferences.get('wake_word_name') and
                 self.ui_preferences.get('wake_word_trained', False) and
                 not self.focus_dictation_enabled and
                 not (dialog is not None and dialog.isVisible() and dialog.dictation_enabled) and
@@ -10649,10 +11141,21 @@ try {
             self.focus_dictation_paused = False
             self.focus_dictation_committed_words = []
             self.focus_dictation_last_partial = ""
-            self.speech.stop()
-            self.stt_enabled = False
+            self._set_voice_input_enabled(False)
             self.status = "Voice input off"
             self._announce_voice_input_state(False)
+            return
+
+        # Handle everyday greetings before the D1 command classifier. d1-omni is a
+        # structured decision model and its API cannot generate conversational text.
+        # Only do this outside dictation/search so phrases can still be typed there.
+        if (not self.focus_dictation_enabled and
+                not (dialog is not None and dialog.isVisible()) and
+                low in ("how are you", "how are you doing", "how's it going",
+                        "how is it going", "how are things", "are you there")):
+            answer = "I'm here and ready to help. What would you like to do?"
+            self.status = answer
+            self.tts.speak(answer)
             return
 
         # Live local facts must be answered from the OS, never guessed by a model.
@@ -10788,7 +11291,17 @@ try {
         if pc_action:
             self.execute_pc_voice_command(pc_action)
             return
-        pc_action = match_pc_command(low)
+        # Vosk's small English acoustic model can hear “pause media” as
+        # “cause media”.  In command mode this phrase has no other meaning;
+        # normal dictation/search routing remains unaffected.
+        media_transcript = {
+            "cause media": "pause media",
+            "cause the media": "pause media",
+            "cause music": "pause music",
+            "cause playback": "pause media",
+            "pause the media": "pause media",
+        }.get(low, low)
+        pc_action = match_pc_command(media_transcript)
         if pc_action:
             self.execute_pc_voice_command(pc_action)
             return
@@ -10841,8 +11354,7 @@ try {
                 return
             if low in ("stop listening", "voice off", "stop voice control"):
                 dialog.set_dictation_enabled(False, notify=True)
-                self.speech.stop()
-                self.stt_enabled = False
+                self._set_voice_input_enabled(False)
                 self.status = "Voice input off"
                 return
             if low in ("open top result", "open first result", "open result"):
@@ -10868,8 +11380,7 @@ try {
             self.status = "Voice command: home desktop"
             self.tts.speak("Returned to the home desktop.")
         elif low in ("stop listening", "voice off", "stop voice control"):
-            self.speech.stop()
-            self.stt_enabled = False
+            self._set_voice_input_enabled(False)
             self.status = "Voice input off"
             self.tts.speak("Voice input is off.")
         elif low in ("what can you do", "help", "voice help"):
@@ -10882,8 +11393,8 @@ try {
             if unprefixed_create:
                 self.status = "To create an item, start the command with 'create', for example 'create new folder'."
                 return
-            # General conversational questions are answered by the local D1 model.
-            # Do not steal ordinary dictation, search terms, or unrecognised commands.
+            # Other questions may use a compatible local chat API, when present;
+            # unsupported-model errors are explained rather than called network failures.
             question_start = re.match(r"^(what|why|how|who|when|where|which|can you|could you|do you|is it|are you|tell me|explain|define)\b", low)
             if question_start and not self.focus_dictation_enabled and not (dialog is not None and dialog.isVisible()):
                 self.status = "Thinking…"
@@ -13350,12 +13861,18 @@ try {
             ring_folded = landmarks[16].y > landmarks[14].y
             pinky_folded = landmarks[20].y > landmarks[18].y
             separation = abs(float(landmarks[8].x)-float(landmarks[12].x))
-            # Thumb tip must stay near the palm/index base rather than sticking outward.
-            thumb_tucked = math.hypot(float(landmarks[4].x)-float(landmarks[5].x),
-                                      float(landmarks[4].y)-float(landmarks[5].y)) < 0.20
+            # A V-sign with the thumb sticking sideways or pointing up is NOT a
+            # peace-toggle. Measure across the *hand's own palm*, not fixed screen
+            # x/y distances: that works on different hand sizes and rotations.
+            across = thumb_across_palm(landmarks)
+            palm_width = max(1e-6, distance3d(landmarks, 5, 17))
+            tip_to_index_base = distance3d(landmarks, 4, 5) / palm_width
+            thumb_tucked = (across is not None and -0.18 <= across <= 1.10 and
+                            tip_to_index_base <= 1.30 and
+                            not thumb_sticking_out(landmarks, threshold=-0.18))
             return (index_up and middle_up and ring_folded and pinky_folded and
                     separation > 0.025 and thumb_tucked)
-        except (IndexError, AttributeError, TypeError):
+        except (IndexError, AttributeError, TypeError, ValueError):
             return False
 
     @staticmethod
@@ -13851,6 +14368,15 @@ try {
                         return
                     self._linux_x11_lib = x11
                     self._linux_x11_display = display
+                # Maintain the main HUD above other desktop windows even when
+                # SearchHandOverlay is the topmost hand renderer. Keep Search
+                # between the HUD and hand layer so it remains fully interactive.
+                if target is search_overlay and self.isVisible():
+                    self._linux_x11_lib.XRaiseWindow(
+                        self._linux_x11_display, ctypes.c_ulong(int(self.winId())))
+                    if search_dialog is not None and search_dialog.isVisible():
+                        self._linux_x11_lib.XRaiseWindow(
+                            self._linux_x11_display, ctypes.c_ulong(int(search_dialog.winId())))
                 self._linux_x11_lib.XRaiseWindow(self._linux_x11_display,
                                                   ctypes.c_ulong(int(target.winId())))
                 self._linux_x11_lib.XFlush(self._linux_x11_display)
@@ -13907,11 +14433,24 @@ try {
                     self._windows_virtual_desktop_pin_warning_reported = True
         try:
             user32 = ctypes.windll.user32
-            hwnd = wintypes.HWND(int(target.winId()))
-            # HWND_TOPMOST, SWP_NOSIZE | SWP_NOMOVE | SWP_NOACTIVATE. Reordering without
-            # activation keeps the app under keyboard focus while correcting z-order.
-            user32.SetWindowPos(hwnd, wintypes.HWND(-1), 0, 0, 0, 0,
-                                0x0001 | 0x0002 | 0x0010)
+            # Two distinct translucent windows are used on Windows: the main
+            # fullscreen overlay paints notifications, scroll backdrops, notches
+            # and the Glass Menu; SearchHandOverlay paints the tracked hands/TPI.
+            # Raising ONLY the hand overlay left the HUD below native application
+            # windows even though the skeleton remained visible over them.
+            # Reassert the stack in bottom-to-top order, without activation:
+            #   native app < main Freehand HUD < independent hand overlay.
+            # Never lift the fullscreen owner over the Search launcher or a
+            # calibration window: those dialogs need to remain interactive.
+            flags = 0x0001 | 0x0002 | 0x0010  # NOSIZE | NOMOVE | NOACTIVATE
+            if target is search_overlay and self.isVisible():
+                user32.SetWindowPos(wintypes.HWND(int(self.winId())),
+                                    wintypes.HWND(-1), 0, 0, 0, 0, flags)
+                if search_dialog is not None and search_dialog.isVisible():
+                    user32.SetWindowPos(wintypes.HWND(int(search_dialog.winId())),
+                                        wintypes.HWND(-1), 0, 0, 0, 0, flags)
+            user32.SetWindowPos(wintypes.HWND(int(target.winId())),
+                                wintypes.HWND(-1), 0, 0, 0, 0, flags)
             self._last_native_topmost_reassert = now
         except Exception:
             pass
@@ -14083,6 +14622,11 @@ try {
         injector = getattr(self, "_native_touch", None)
         if injector is None or injector.unavailable:
             return False  # Preserve legacy pointer/mouse fallback on API failure.
+        if self._touch_text_drag_sides:
+            # A mouse-button text selection is committed until release; do not
+            # inject a competing touch (or convert to scroll mid-gesture).
+            self._end_two_hand_touch()
+            return False
         search = getattr(self, "search_dialog", None)
         modal = (self._gesture_ui_modal_open() or self.hand_tracking_paused or
                  self.tli_calibration_active_side is not None or
@@ -14177,6 +14721,31 @@ try {
                 dy = point[1]-pending["origin"][1]
                 if (now-pending["started"] >= PINCH_DRAG_MIN_HOLD_SECONDS and
                         dx*dx+dy*dy >= self.pinch_drag_start_distance**2):
+                    # Prioritise native mouse text selection for a one-hand drag
+                    # beginning on/near text. Else preserve touch panning/scroll.
+                    # In a two-hand pinch, the native multi-contact path above wins.
+                    is_text_target = (len(candidates) == 1 and
+                                      _pinch_origin_over_text(pending["origin"]))
+                    # Accessibility may be disabled by an app or desktop session.
+                    # A deliberate 0.55s stationary hold before moving provides
+                    # a selection fallback, below the existing Pinch Menu timer.
+                    held_to_select = (len(candidates) == 1 and
+                                      now-pending["started"] >= 0.55)
+                    if is_text_target or held_to_select:
+                        if sys.platform.startswith("linux"):
+                            screen_origin = self._interaction_screen_geometry().topLeft()
+                            origin_local = QPoint(int(pending["origin"][0] - screen_origin.x()),
+                                                  int(pending["origin"][1] - screen_origin.y()))
+                        else:
+                            origin_local = self.mapFromGlobal(QPoint(*pending["origin"]))
+                        if self._begin_pinch_drag(side, QPointF(origin_local), now):
+                            self._touch_text_drag_sides.add(side)
+                            self._touch_pending.pop(side, None)
+                            # Send a real drag movement from the *original* press
+                            # location; don't press at the already-moved position.
+                            self._set_os_pointer(cursor_points[side])
+                            self.status = "Text selection active — release the pinch to finish"
+                            return True
                     active_points[side] = pending["origin"]
                     self._touch_drag_sides.add(side)
             else:
@@ -15040,6 +15609,11 @@ try {
                 if is_pinch:
                     self.pinch_drag_last_points[side] = QPointF(cursor)
                     self.pinch_drag_release_candidate_since[side] = None
+                    if side in self._touch_text_drag_sides:
+                        # Touch-capable OS mode otherwise disables the final
+                        # legacy pointer routing. Text selection needs a real
+                        # mouse move on every accepted hand position.
+                        self._set_os_pointer(cursor)
                     continue
                 # Require a short stable release to avoid dropping an item on one bad
                 # landmark frame. A genuine pinch release still drops promptly.
@@ -16621,9 +17195,11 @@ try {
                         swap_nav = controls["swap_drag_scroll_toggle"]
                         priority = controls["priority_toggle"]
                         debugging = controls["debugging_toggle"]
+                        autostart = controls["start_on_login_toggle"]
                         for rect, enabled in ((scroll, self.invert_scroll),
                                               (swap_nav, self.swap_drag_scroll_notches),
-                                              (debugging, self.debug_console_enabled)):
+                                              (debugging, self.debug_console_enabled),
+                                              (autostart, self.start_on_login_enabled)):
                             painter.setBrush(QBrush(QColor(55, 145, 82, 225) if enabled else QColor(75, 80, 89, 205)))
                             painter.setPen(QPen(QColor(155, 245, 180, 220) if enabled else QColor(155, 162, 172, 200), 1.5*scale))
                             painter.drawRoundedRect(rect, 10*scale, 10*scale)
@@ -16635,6 +17211,7 @@ try {
                         self._draw_fitted_button_label(painter, swap_nav, "DRAG NAV  ·  "+("BACK/FORWARD SWAPPED" if self.swap_drag_scroll_notches else "NORMAL"), base_size=label_size, min_size=6, inset=12*scale)
                         self._draw_fitted_button_label(painter, priority, "CURSOR PRIORITY  ·  "+self.cursor_lock_priority.upper(), base_size=label_size, min_size=6, inset=12*scale)
                         self._draw_fitted_button_label(painter, debugging, "DEBUGGING  ·  "+("ON" if self.debug_console_enabled else "OFF")+" (NEXT RUN)", base_size=label_size, min_size=6, inset=12*scale)
+                        self._draw_fitted_button_label(painter, autostart, "START ON LOGIN  ·  "+("ON" if self.start_on_login_enabled else "OFF"), base_size=label_size, min_size=6, inset=12*scale)
 
                     elif self.settings_page == "tli":
                         glow_toggle = controls["glow_toggle"]
@@ -16869,7 +17446,9 @@ try {
                         self._draw_fitted_button_label(painter, train_rect,
                             'TRAIN WAKE WORD  ·  ' + ('VERIFIED' if trained else '3 RECOGNITIONS'),
                             base_size=label_size, min_size=6, inset=12*scale)
-                        voice_status = f"{self.tts.status}  ·  {self.face_enrollment_status}"
+                        wake_status = ('Wake standby: microphone listening locally  ·  '
+                                       if trained and not self.stt_enabled and self.speech.running else '')
+                        voice_status = wake_status + f"{self.tts.status}  ·  {self.face_enrollment_status}"
                         self._draw_wrapped_fitted_text(painter, text_rects["status"], voice_status[:150],
                                                        base_size=max(6, int(7*scale)), min_size=6)
 
@@ -16935,8 +17514,8 @@ try {
                             painter.drawRoundedRect(rect, 10*scale, 10*scale)
                         painter.setPen(QColor(240, 253, 255))
                         self._draw_fitted_button_label(painter, model_button,
-                                                       "MODEL  ·  " + D1_MODELS[model_key]["label"].upper() + "  ·  DEFAULT / ENSURE",
-                                                       base_size=label_size, min_size=6, inset=10*scale)
+                                                       "MODEL  ·  " + D1_MODELS[model_key]["label"].upper() + "  ▾",
+                                                       base_size=label_size, min_size=7, inset=10*scale)
                         self._draw_fitted_button_label(painter, runtime_button, "START / ENSURE RUNNING", base_size=label_size, min_size=6, inset=8*scale)
                         self._draw_fitted_button_label(painter, stop_button, "STOP LOCAL SERVER", base_size=label_size, min_size=6, inset=8*scale)
                         self._draw_fitted_button_label(painter, retry_button, "DOWNLOAD / RETRY / START", base_size=label_size, min_size=6, inset=10*scale)
@@ -16951,20 +17530,26 @@ try {
                             state = "STATUS: " + str(info.get("error"))[:90]
                         else:
                             state = "LOCAL SERVER: STOPPED / NOT READY"
+                        backend = str(info.get("backend") or "CPU / GPU checking")
+                        if info.get("ready") or info.get("loading"):
+                            state += "\nPROCESSOR: " + backend[:65]
+                        elif info.get("model_exists"):
+                            state += "\nNEXT START: " + backend[:65]
                         self._draw_wrapped_fitted_text(painter, text_rects["state"], state,
                                                        base_size=max(7, int(8*scale)), min_size=6)
                         self._draw_wrapped_fitted_text(painter, text_rects["about"],
-                                                       "Runs locally through llama.cpp. No separate terminal is needed. "
-                                                       "The larger model downloads only after you select it.",
-                                                       base_size=max(6, int(7*scale)), min_size=6)
-                        # Compact in-panel event log beneath the status text.
+                                                       "D1 handles desktop-command decisions via llama.cpp /v1/systemone. "
+                                                       "Open-ended voice conversations need a generative chat model. "
+                                                       "The larger D1 model downloads only if selected.",
+                                                       base_size=max(7, int(8*scale)), min_size=6)
+                        # The server diagnostics fill the right column down to Back.
                         log_rect = text_rects["log"]
                         painter.setBrush(QBrush(QColor(3, 10, 20, 220)))
                         painter.setPen(QPen(QColor(90, 170, 190, 190), 1.0*scale))
                         painter.drawRoundedRect(log_rect, 8*scale, 8*scale)
                         signature = (bool(info.get("ready")), bool(info.get("loading")),
                                      bool(info.get("downloading")), str(info.get("error") or ""),
-                                     bool(info.get("model_exists")))
+                                     bool(info.get("model_exists")), str(info.get("backend") or ""))
                         if signature != self._last_d1_log_signature:
                             self._last_d1_log_signature = signature
                             if info.get("error"):
@@ -16983,12 +17568,19 @@ try {
                         painter.setFont(self._ui_font(7, QFont.DemiBold))
                         painter.drawText(log_rect.adjusted(9*scale, 4*scale, -9*scale, -4*scale),
                                          Qt.AlignLeft | Qt.AlignTop, "ENGINE LOG")
-                        log_lines = self.d1_ui_log[-5:]
+                        server_lines = self._d1_server_log_tail()
+                        # Show recent events followed by the actual llama-server output.
+                        # Keep lines bounded for fast, predictable painting.
+                        log_lines = self.d1_ui_log[-6:]
+                        if server_lines:
+                            log_lines += ["── llama-server.log ──"] + server_lines[-13:]
+                        else:
+                            log_lines += ["Server diagnostics appear here after startup."]
                         log_text = "\n".join(log_lines)
                         painter.save()
-                        painter.setClipRect(log_rect.adjusted(2*scale, 2*scale, -2*scale, -2*scale))
+                        painter.setClipRect(log_rect.adjusted(2*scale, 20*scale, -2*scale, -2*scale))
                         painter.setFont(self._ui_font(7, QFont.Normal))
-                        painter.drawText(log_rect.adjusted(9*scale, 21*scale, -9*scale, -5*scale),
+                        painter.drawText(log_rect.adjusted(9*scale, 22*scale, -9*scale, -5*scale),
                                          Qt.AlignLeft | Qt.AlignTop | Qt.TextWordWrap, log_text)
                         painter.restore()
 
@@ -16997,6 +17589,8 @@ try {
                         self._paint_custom_gesture_dropdown(painter, cx, cy, scale)
                     if self.settings_page == "sounds":
                         self._paint_sound_dropdown(painter, cx, cy, scale)
+                    if self.settings_page == "d1" and self.d1_model_dropdown_open:
+                        self._paint_d1_model_dropdown(painter, cx, cy, scale)
             painter.restore()
             # Keep the two gesture reference images over the menu background,
             # but under the hand cursor/TLI overlay which is painted afterward.
@@ -17331,6 +17925,8 @@ try {
             active_indicators.append(("🎤>_", "dictation_indicator_position", QColor(104, 235, 180, 255)))
         if self.stt_enabled:
             active_indicators.append(("🎤", "stt_indicator_position", QColor(110, 220, 250, 255)))
+        elif self._has_trained_wake_word() and self.speech.running:
+            active_indicators.append(("WAKE", "stt_indicator_position", QColor(195, 205, 135, 255)))
         for indicator_text, position_key, accent in active_indicators:
             indicator_rect = self._notification_rect(
                 self.ui_preferences.get(position_key, "top-left" if position_key == "dictation_indicator_position" else "top-right"),

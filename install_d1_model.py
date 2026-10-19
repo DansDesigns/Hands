@@ -6,7 +6,7 @@ falls back to building llama-server from source when cmake and a C++ compiler ar
 available). macOS release builds are handled by the same code path.
 """
 from __future__ import annotations
-import json, os, platform, shutil, stat, subprocess, sys, tarfile, urllib.request, zipfile
+import json, os, platform, re, shutil, stat, subprocess, sys, tarfile, urllib.request, zipfile
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -592,7 +592,7 @@ def build_llama_server_from_source(dest: Path, releases: list) -> bool:
 # Main installer
 # ---------------------------------------------------------------------------
 
-def install_llama_server(force: bool = False) -> bool:
+def _install_cpu_llama_server(force: bool = False) -> bool:
     """Install a llama.cpp server build compatible with this OS and CPU.
 
     Selects an official release package by OS and architecture, extracts the
@@ -695,6 +695,126 @@ def install_llama_server(force: bool = False) -> bool:
     return False
 
 
+
+def _accelerator_devices(exe: Path) -> list[str]:
+    """Return real accelerator devices reported by this llama-server build."""
+    if not _probe_llama_server(exe):
+        return []
+    try:
+        result = subprocess.run([str(exe), "--list-devices"], cwd=str(exe.parent),
+                                capture_output=True, text=True, timeout=15,
+                                env=_runtime_env(exe),
+                                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+        if result.returncode != 0:
+            return []
+        return [match.group(1) for match in re.finditer(
+            r"(?im)^\s*((?:Vulkan|CUDA|ROCm|HIP|Metal|SYCL|OpenVINO)\d+)\s*:\s*([^\r\n]*)",
+            result.stdout + "\n" + result.stderr)
+            if not any(word in match.group(2).lower() for word in
+                       ("llvmpipe", "lavapipe", "softpipe", "swiftshader", "software rasterizer", "basic render driver"))]
+    except (OSError, ValueError, subprocess.TimeoutExpired):
+        return []
+
+
+def _gpu_release_assets(releases: list, os_tag: str, arch: str) -> list[tuple[str, str]]:
+    """Prefer official Vulkan builds for broad Intel/AMD/NVIDIA iGPU/GPU support."""
+    if os_tag not in {"windows", "linux"} or arch not in {"x64", "arm64"}:
+        return []
+    found, seen = [], set()
+    for release in releases:  # newest first
+        for asset in release.get("assets", []) or []:
+            name = str(asset.get("name", ""))
+            low = name.lower()
+            url = asset.get("browser_download_url")
+            if not url or url in seen or not low.startswith("llama-"):
+                continue
+            stem = low.removesuffix(".tar.gz").removesuffix(".tgz").removesuffix(".zip")
+            if "vulkan" not in stem or arch not in stem.replace("_", "-").split("-"):
+                continue
+            if os_tag == "windows" and (not low.endswith(".zip") or not any(t in low for t in ("-win-", "-windows-"))):
+                continue
+            if os_tag == "linux" and (not (low.endswith(".tar.gz") or low.endswith(".tgz"))
+                                       or not any(t in low for t in ("-ubuntu-", "-linux-"))):
+                continue
+            found.append((name, url))
+            seen.add(url)
+    return found[:6]  # avoid trying large numbers of old releases
+
+
+def _install_gpu_server(force: bool = False) -> bool:
+    """Install an accelerated runtime BESIDE the proven CPU runtime.
+
+    A failed driver/device check never replaces or damages the CPU fallback.
+    """
+    os_tag, arch = _platform_target()
+    dest = ROOT / "tools" / "llama.cpp" / "gpu"
+    exe = dest / SERVER_NAME
+    if exe.exists() and not force:
+        devices = _accelerator_devices(exe)
+        if devices:
+            print(f"GPU/iGPU D1 backend available: {', '.join(devices)}")
+            return True
+        print("Existing accelerator binary has no usable GPU devices; keeping CPU fallback.")
+    if os_tag == "macos":
+        cpu = ROOT / "tools" / "llama.cpp" / SERVER_NAME
+        devices = _accelerator_devices(cpu)
+        print("macOS built-in accelerator: " + (", ".join(devices) if devices else "unavailable; using CPU"))
+        return bool(devices)
+    if os_tag not in ("linux", "windows") or arch not in ("x64", "arm64"):
+        print(f"No prebuilt accelerated runtime for {os_tag}/{arch}; using CPU.")
+        return False
+    releases, error = _query_releases()
+    if not releases:
+        print(f"GPU release check failed ({error}); existing CPU runtime remains available.")
+        return False
+    candidates = _gpu_release_assets(releases, os_tag, arch)
+    if not candidates:
+        print("No Vulkan release asset found; using CPU.")
+        return False
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    for name, url in candidates:
+        print("Checking optional GPU/iGPU D1 runtime: " + name)
+        suffix = ".zip" if name.lower().endswith(".zip") else ".tar.gz"
+        archive = ROOT / "tools" / ("llama-gpu-download" + suffix)
+        extract = dest.with_name("gpu.extract")
+        stage = dest.with_name("gpu.staging")
+        try:
+            archive.unlink(missing_ok=True)
+            download_file(url, archive, min_existing_size=0)
+            shutil.rmtree(extract, ignore_errors=True)
+            _safe_extract(archive, extract)
+            server, _ = _find_server_in_tree(extract)
+            if server is None:
+                raise RuntimeError("no llama-server binary in GPU archive")
+            staged = _stage_server_dir(server, stage, package_root=extract)
+            devices = _accelerator_devices(staged)
+            if not devices:
+                raise RuntimeError("build has no compatible accelerator device (Vulkan driver or GPU unavailable)")
+            _swap_into_place(stage, dest)
+            print("Installed D1 GPU/iGPU server: " + str(exe))
+            print("Detected accelerator(s): " + ", ".join(devices))
+            return True
+        except Exception as exc:
+            print(f"GPU runtime {name} not usable: {type(exc).__name__}: {exc}")
+            shutil.rmtree(stage, ignore_errors=True)
+        finally:
+            archive.unlink(missing_ok=True)
+            shutil.rmtree(extract, ignore_errors=True)
+    print("No supported Vulkan GPU found. D1 will run on the CPU.")
+    return False
+
+
+def install_llama_server(force: bool = False) -> bool:
+    """Keep a working CPU build and optionally add an accelerated GPU build."""
+    cpu_ok = _install_cpu_llama_server(force=force)
+    gpu_ok = _install_gpu_server(force=force)
+    if gpu_ok:
+        print("D1 acceleration is available; Freehand will try GPU first, then CPU.")
+    else:
+        print("D1 will use the CPU backend (no compatible accelerator installed).")
+    return cpu_ok or gpu_ok
+
+
 def main() -> int:
     # The 600M Q8 model is the only supported installer choice for now.
     key = "600m"
@@ -707,7 +827,15 @@ def main() -> int:
         download_file(f"https://huggingface.co/{repo}/resolve/main/{mmproj_name}", folder / mmproj_name)
         llama_ok = install_llama_server(force="--force" in sys.argv[1:])
         settings = user_file("d1_settings.json", ROOT)
-        settings.write_text(json.dumps({"model": key}, indent=2) + "\n", encoding="utf-8")
+        # An installer rerun must not switch an existing 3B selection back to 600M.
+        try:
+            existing_settings = json.loads(settings.read_text(encoding="utf-8"))
+            if not isinstance(existing_settings, dict):
+                existing_settings = {}
+        except (OSError, ValueError):
+            existing_settings = {}
+        existing_settings.setdefault("model", key)
+        settings.write_text(json.dumps(existing_settings, indent=2) + "\n", encoding="utf-8")
         if not llama_ok:
             retry = (r".venv\Scripts\python.exe install_d1_model.py 600m" if IS_WINDOWS
                      else ".venv/bin/python install_d1_model.py 600m")

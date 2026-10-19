@@ -7,6 +7,8 @@ from __future__ import annotations
 import json
 import hashlib
 import os
+import re
+import sys
 import subprocess
 import tempfile
 import threading
@@ -31,6 +33,13 @@ MODELS = {
         "projector_file": "mmproj-d1-omni-600M-Q8_0.gguf",
         "estimated": "about 670 MB",
     },
+    "3b": {
+        "label": "d1-3B Q4_K_M · ~2.3 GB",
+        "repo": "LiquidAI/d1-3B-GGUF",
+        "model_file": "d1-3B-Q4_K_M.gguf",
+        "projector_file": "mmproj-d1-3B-Q8_0.gguf",
+        "estimated": "about 2.3 GB",
+    },
 }
 _lock = threading.RLock()
 _server_process = None
@@ -38,6 +47,9 @@ _loading_server = False
 _downloading = False
 _error = ""
 _ready = False
+_active_backend = "Not started"
+_active_runtime_path = ""
+_detected_backend = "Not checked"
 _server_lock_path = Path(tempfile.gettempdir()) / ("spatial-desktop-d1-" + hashlib.sha256(str(ROOT).encode("utf-8")).hexdigest()[:12] + ".lock")
 _owns_server_lock = False
 
@@ -59,12 +71,64 @@ def model_paths(model_key: str | None = None) -> tuple[Path, Path]:
 SERVER_BINARY = "llama-server.exe" if os.name == "nt" else "llama-server"
 
 
-def server_path() -> Path:
-    names = [ROOT / "tools" / "llama.cpp" / SERVER_BINARY, ROOT / SERVER_BINARY]
-    for path in names:
+def _cpu_server_path() -> Path:
+    for path in (ROOT / "tools" / "llama.cpp" / SERVER_BINARY,
+                 ROOT / SERVER_BINARY):
         if path.is_file():
             return path
     return Path(SERVER_BINARY)
+
+
+def _gpu_server_path() -> Path:
+    return ROOT / "tools" / "llama.cpp" / "gpu" / SERVER_BINARY
+
+
+def _reported_accelerators(binary: Path) -> list[str]:
+    """Probe the actual installed llama backend, not just the graphics driver.
+
+    Runs only from the server worker or installer checks, NEVER from the paint
+    loop. CPU-only binaries list no accelerator devices. Older binaries which
+    lack --list-devices safely take the CPU path instead.
+    """
+    if not binary.is_file():
+        return []
+    try:
+        proc = subprocess.run([str(binary), "--list-devices"], cwd=str(binary.parent),
+                              stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                              text=True, errors="replace", timeout=15,
+                              env=_server_env(binary),
+                              creationflags=(getattr(subprocess, "CREATE_NO_WINDOW", 0)
+                                             if os.name == "nt" else 0))
+        if proc.returncode != 0:
+            return []
+        # Software Vulkan (llvmpipe/SwiftShader) runs on the CPU and must not
+        # be presented as dedicated or integrated hardware acceleration.
+        return [match.group(1) for match in re.finditer(
+            r"(?im)^\s*((?:Vulkan|CUDA|ROCm|HIP|Metal|SYCL|OpenVINO)\d+)\s*:\s*([^\r\n]*)",
+            proc.stdout or "")
+            if not any(word in match.group(2).lower() for word in
+                       ("llvmpipe", "lavapipe", "softpipe", "swiftshader", "software rasterizer", "basic render driver"))]
+    except (OSError, ValueError, subprocess.TimeoutExpired):
+        return []
+
+
+def _select_server_backend() -> tuple[Path, str, bool]:
+    """Prefer verified GPU or iGPU acceleration; allow universal CPU fallback."""
+    gpu_path = _gpu_server_path()
+    cpu_path = _cpu_server_path()
+    # macOS official Apple Silicon builds may bundle Metal in the default server.
+    for candidate in (gpu_path, cpu_path):
+        devices = _reported_accelerators(candidate)
+        if devices:
+            return candidate, "GPU / iGPU (" + ", ".join(devices[:2]) + ")", True
+    return cpu_path, "CPU", False
+
+
+def server_path() -> Path:
+    # A cheap filename lookup for UI; actual compatibility probing is performed
+    # only in the server's background startup thread.
+    gpu = _gpu_server_path()
+    return gpu if gpu.is_file() else _cpu_server_path()
 
 
 def _server_env(binary: Path) -> dict:
@@ -200,72 +264,132 @@ def _release_server_lock() -> None:
 
 
 def _start_server_worker(model_key: str) -> None:
-    global _server_process, _loading_server, _error, _ready
+    global _server_process, _loading_server, _error, _ready, _active_backend, _detected_backend, _active_runtime_path
     try:
-        # A previous app instance or a user-started server may already own the endpoint.
         if _server_ready():
             with _lock:
                 _ready = True
+                _active_backend = "External llama-server (backend unknown)"
             return
         if not _claim_server_lock():
-            # Another Spatial Desktop process is starting the runtime. Wait for it rather
-            # than spawning a second CPU-heavy llama-server process.
-            deadline = time.time() + 45
-            while time.time() < deadline:
+            deadline = time.monotonic() + 45
+            while time.monotonic() < deadline:
                 if _server_ready():
                     with _lock:
                         _ready = True
                         _error = ""
+                        _active_backend = "External llama-server (backend unknown)"
                     return
                 time.sleep(0.5)
-            raise RuntimeError("Another Spatial Desktop instance is starting the d1 runtime. Close duplicate app instances and retry if it remains unavailable.")
-        binary = server_path()
+            raise RuntimeError("Another Freehand instance is starting D1. Close duplicates and retry.")
         model, projector = model_paths(model_key)
-        if not binary.is_file():
-            raise FileNotFoundError("llama-server is missing. Run the installer to install the local d1 runtime.")
         if not model.is_file() or not projector.is_file():
             _release_server_lock()
             download_model(model_key)
             return
-        # Conservative batch/context settings avoid the excessive CPU/RAM load caused by
-        # the former 8192-token batch settings while retaining local inference.
+        binary, label, gpu_available = _select_server_backend()
+        _detected_backend = label
+        if not binary.is_file():
+            raise FileNotFoundError("llama-server missing: rerun install_d1_model.py to install the runtime.")
         threads = max(2, min(6, (os.cpu_count() or 4) // 2))
-        cmd = [str(binary), "--host", "127.0.0.1", "--port", str(SERVER_PORT),
-               "-m", str(model), "--mmproj", str(projector), "--ctx-size", "2048",
-               "-b", "512", "-ub", "128", "--threads", str(threads),
-               "--threads-batch", str(threads), "--no-webui"]
+        common = ["--host", "127.0.0.1", "--port", str(SERVER_PORT),
+                  "-m", str(model), "--mmproj", str(projector), "--ctx-size", "2048",
+                  "-b", "512", "-ub", "128", "--threads", str(threads),
+                  "--threads-batch", str(threads), "--no-webui"]
+        cpu_binary = _cpu_server_path()
+        attempts = []
+        if gpu_available:
+            # Full offload first, partial offload for low-memory integrated GPUs.
+            attempts.extend([(binary, label + " · full offload", "99", 75),
+                             (binary, label + " · partial offload", "12", 75)])
+        if cpu_binary.is_file():
+            attempts.append((cpu_binary, "CPU", "0", 170))
+        elif not attempts:
+            attempts.append((binary, "CPU", "0", 170))
         creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0) if os.name == "nt" else 0
         SERVER_LOG.parent.mkdir(parents=True, exist_ok=True)
-        # Preserve llama.cpp startup diagnostics so model/runtime failures are visible
-        # instead of silently disappearing into DEVNULL.
-        log_handle = SERVER_LOG.open("a", encoding="utf-8", errors="replace")
-        log_handle.write(f"\n\n--- llama-server start {time.strftime('%Y-%m-%d %H:%M:%S')} ---\n")
-        log_handle.write("Command: " + " ".join(cmd) + "\n")
-        log_handle.flush()
-        _server_process = subprocess.Popen(cmd, cwd=str(binary.parent), stdout=log_handle,
-                                           stderr=subprocess.STDOUT, creationflags=creationflags,
-                                           env=_server_env(binary))
-        # Store the child PID once launched so a crashed/stopped server leaves a
-        # reclaimable lock even if the owning Spatial Desktop UI is still open.
-        try:
-            _server_lock_path.write_text(str(_server_process.pid), encoding="ascii")
-        except OSError:
-            pass
-        deadline = time.time() + 180
-        while time.time() < deadline:
-            if _server_process.poll() is not None:
-                raise RuntimeError("llama-server exited before becoming ready. Check available RAM and the d1 model files.")
-            if _server_ready():
-                with _lock:
-                    _ready = True
-                    _error = ""
-                return
-            time.sleep(0.5)
-        raise TimeoutError("Timed out waiting for the local d1 server to start.")
+        reasons = []
+        for attempt_binary, attempt_label, gpu_layers, seconds in attempts:
+            # 99/12/0 is compatible with older llama.cpp; newer builds also
+            # support --gpu-layers auto, but don't depend on it here.
+            command = [str(attempt_binary), *common, "--n-gpu-layers", gpu_layers]
+            with _lock:
+                _active_backend = "Starting " + attempt_label
+                _active_runtime_path = str(attempt_binary)
+            with SERVER_LOG.open("a", encoding="utf-8", errors="replace") as log:
+                log.write("\n\n--- Freehand D1 " + time.strftime('%Y-%m-%d %H:%M:%S') + " ---\n")
+                log.write("Attempt: " + attempt_label + "\n")
+                log.write("Command: " + " ".join(command) + "\n")
+                log.flush()
+                try:
+                    child = subprocess.Popen(command, cwd=str(attempt_binary.parent),
+                                             stdout=log, stderr=subprocess.STDOUT,
+                                             creationflags=creationflags,
+                                             env=_server_env(attempt_binary))
+                    with _lock:
+                        _server_process = child
+                    try:
+                        _server_lock_path.write_text(str(child.pid), encoding="ascii")
+                    except OSError:
+                        pass
+                    deadline = time.monotonic() + seconds
+                    while time.monotonic() < deadline:
+                        if child.poll() is not None:
+                            reasons.append(attempt_label + " exited " + str(child.returncode))
+                            break
+                        if _server_ready():
+                            # A listed GPU device is not proof that the model
+                            # offloaded any layers. Report the actual layer count
+                            # when llama.cpp supplies it, otherwise mark it as
+                            # unverified instead of falsely claiming GPU usage.
+                            effective_backend = attempt_label
+                            if gpu_layers != "0":
+                                try:
+                                    with SERVER_LOG.open("rb") as reader:
+                                        reader.seek(max(0, reader.seek(0, 2)-16000))
+                                        tail = reader.read().decode("utf-8", errors="replace")
+                                    matches = re.findall(
+                                        r"(?i)offloaded\s+(\d+)/(\d+)\s+layers?\s+to\s+GPU", tail)
+                                    if matches:
+                                        count, total = map(int, matches[-1])
+                                        if count:
+                                            effective_backend += f" · {count}/{total} GPU layers"
+                                        else:
+                                            effective_backend += " · 0 GPU layers (check driver)"
+                                    else:
+                                        effective_backend += " · offload unverified"
+                                except OSError:
+                                    effective_backend += " · offload unverified"
+                            with _lock:
+                                _active_backend = effective_backend
+                                _ready = True
+                                _error = ""
+                            log.write("Ready on " + effective_backend + "\n")
+                            log.flush()
+                            return
+                        time.sleep(0.5)
+                    else:
+                        reasons.append(attempt_label + " timed out")
+                except (OSError, ValueError) as exc:
+                    reasons.append(attempt_label + ": " + str(exc)[:150])
+                finally:
+                    if not _ready:
+                        if 'child' in locals() and child.poll() is None:
+                            child.terminate()
+                            try:
+                                child.wait(timeout=3)
+                            except subprocess.TimeoutExpired:
+                                child.kill()
+                                child.wait(timeout=3)
+                        with _lock:
+                            _server_process = None
+                        log.write("Attempt unsuccessful; " + " / ".join(reasons[-2:]) + "\n")
+        raise RuntimeError("All D1 backends failed. Check logs/llama-server.log. " + "; ".join(reasons[-3:]))
     except Exception as exc:
         with _lock:
             _error = f"{type(exc).__name__}: {exc}"
             _ready = False
+            _active_backend = "Unavailable"
         _release_server_lock()
     finally:
         with _lock:
@@ -333,7 +457,7 @@ def _terminate_stale_locked_server() -> None:
         pass
 
 def start_loading(fresh: bool = False) -> bool:
-    global _loading_server, _error, _server_process, _ready
+    global _loading_server, _error, _server_process, _ready, _active_backend
     key = selected_model()
     if fresh:
         _terminate_stale_locked_server()
@@ -357,18 +481,21 @@ def start_loading(fresh: bool = False) -> bool:
             download_model(key)
             return False
         _loading_server = True
+        _active_backend = "Detecting GPU / iGPU"
         _error = ""
         threading.Thread(target=_start_server_worker, args=(key,), name="d1-server-start", daemon=True).start()
         return False
 
 
 def stop_server() -> None:
-    global _server_process, _ready, _loading_server
+    global _server_process, _ready, _loading_server, _active_backend, _active_runtime_path
     with _lock:
         proc = _server_process
         _server_process = None
         _ready = False
         _loading_server = False
+        _active_backend = "Stopped"
+        _active_runtime_path = ""
     if proc is not None and proc.poll() is None:
         try:
             proc.terminate()
@@ -403,7 +530,8 @@ def status() -> dict[str, Any]:
         return {"ready": bool(_ready and alive), "loading": _loading_server,
                 "downloading": _downloading, "error": _error, "model": key,
                 "label": MODELS[key]["label"], "model_exists": model.is_file() and projector.is_file(),
-                "server": str(server_path())}
+                "server": _active_runtime_path or str(server_path()),
+                "backend": _active_backend if (_ready or _loading_server) else _detected_backend}
 
 
 def _wait_until_ready(timeout: float = 30.0) -> bool:
@@ -499,13 +627,16 @@ def answer_general_question(question: str, timeout: float = 20.0) -> str | None:
     clean = " ".join((question or "").split())
     if len(clean) < 2:
         return None
+    if selected_model() == "600m":
+        # This is not a runtime failure: 600M serves structured decisions, not
+        # free-form token generation. Do not poison Engine status with an error.
+        return None
     if not _wait_until_ready(timeout=max(30.0, timeout)):
         with _lock:
             if not _error:
                 _error = "D1 is not ready to answer questions. Check Engine status and logs/llama-server.log."
         return None
     payload = {
-        "model": "local-d1",
         "messages": [
             {"role": "system", "content": (
                 "You are the concise voice assistant for Spatial Desktop. Answer naturally "
