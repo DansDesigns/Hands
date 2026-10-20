@@ -7,6 +7,8 @@ if not exist "main.py" (
   echo ERROR: main.py was not found beside this installer or in the Hands subfolder.
   goto :failed
 )
+rem Keep original installer directory for bundled add-ons if main.py is in Hands.
+set "FREEHAND_INSTALLER_DIR=%~dp0"
 rem Repair a missing Start Menu shortcut without rerunning model downloads.
 rem Usage: install_windows.bat --shortcut-only
 if /I "%~1"=="--shortcut-only" goto :shortcut_step
@@ -52,6 +54,26 @@ if exist ".venv\Scripts\python.exe" (
 
 set "VPY=%CD%\.venv\Scripts\python.exe"
 echo.
+echo [3b/9] Installing Freehand Search and Indexing modules...
+rem The distributed package includes these files. Stage them next to main.py;
+rem do not download or replace user search settings or the SQLite index.
+for %%F in (freehand_search_index.py apply_freehand_search_settings.py) do (
+  if not exist "%%F" if exist "%FREEHAND_INSTALLER_DIR%%%F" (
+    copy /Y "%FREEHAND_INSTALLER_DIR%%%F" "%%F" >nul
+    if errorlevel 1 goto :search_setup_error
+  )
+  if not exist "%%F" (
+    echo ERROR: Required bundled Search and Indexing module is missing: %%F
+    echo Extract all files from the Freehand installer package into the app folder.
+    goto :search_setup_error
+  )
+)
+"%VPY%" -u apply_freehand_search_settings.py --main main.py
+if errorlevel 1 goto :search_setup_error
+"%VPY%" -c "from freehand_search_index import SearchIndex; print('Search indexing module ready; roots default to user home')"
+if errorlevel 1 goto :search_setup_error
+
+echo.
 echo [4/9] Installing Spatial Desktop and local document-search dependencies...
 "%VPY%" -c "import pip; print('Using pip', pip.__version__)"
 if errorlevel 1 (
@@ -71,7 +93,15 @@ if errorlevel 1 (
 )
 
 echo.
-echo [5/8] Installing optional offline StreamTTS runtime...
+echo [4c/9] Enabling optional local music tag recognition ^(Mutagen^)...
+"%VPY%" -c "import mutagen" >nul 2>&1
+if errorlevel 1 (
+  "%VPY%" -m pip install mutagen
+  if errorlevel 1 echo WARNING: Music indexing still works, but embedded artist/genre tags may not be available.
+)
+
+echo.
+echo [5/9] Installing optional offline StreamTTS runtime...
 "%VPY%" -u -m pip install --verbose -r requirements-voice.txt
 if errorlevel 1 (
   echo WARNING: StreamTTS dependencies could not be installed. Hand tracking and file search will still work.
@@ -150,6 +180,8 @@ echo ============================================================
 echo INSTALLATION COMPLETE
 echo Start Menu shortcut: Freehand - Spatial Computing
 echo Project folder: %CD%
+echo Search and Indexing is installed: home folder by default; add folders in Glass Settings - SEARCH.
+echo The index updates in the background when Freehand launches; existing indexed folders are preserved.
 echo Local search uses SQLite and remains available without d1. d1 is an optional local decision model.
 echo StreamTTS runs offline when its runtime and voice files are installed. d1 runs locally after its model is cached.
 echo Face Welcome is optional and local-only; enroll a user through Settings to enable it.
@@ -220,6 +252,11 @@ where py >nul 2>&1
 if not errorlevel 1 exit /b 0
 echo ERROR: Python installation completed but no usable interpreter was found.
 exit /b 1
+
+:search_setup_error
+echo ERROR: Search and Indexing setup failed. Existing Freehand files were left as intact as possible.
+echo Check that freehand_search_index.py and apply_freehand_search_settings.py were included.
+goto :failed
 
 :shortcut_error
 echo ERROR: Package installation finished, but Start Menu shortcut creation failed.

@@ -75,6 +75,23 @@ else
 fi
 VPY="$APP_DIR/.venv/bin/python"
 
+echo '[3b/9] Installing Freehand Search and Indexing modules...'
+# Do not silently proceed if the bundle is missing. User data lives outside APP_DIR
+# and must not be overwritten on upgrades.
+for addon in freehand_search_index.py apply_freehand_search_settings.py; do
+    if [ ! -f "$APP_DIR/$addon" ]; then
+        echo "ERROR: Missing bundled Search and Indexing module: $addon" >&2
+        echo 'Extract the entire installer package beside main.py before installing.' >&2
+        exit 1
+    fi
+done
+if [ ! -f "$APP_DIR/main.py" ]; then
+    echo 'ERROR: main.py must be beside install_linux.sh.' >&2
+    exit 1
+fi
+"$VPY" -u "$APP_DIR/apply_freehand_search_settings.py" --main "$APP_DIR/main.py"
+"$VPY" -c 'from freehand_search_index import SearchIndex; print("Search indexer module available")'
+
 echo '[4/9] Installing Spatial Desktop and local document-search dependencies...'
 if ! "$VPY" -c 'import pip; print("Using pip", pip.__version__)'; then
     "$VPY" -m ensurepip
@@ -84,6 +101,13 @@ echo '[4b] Installing the optional 3D hand renderer (moderngl / OpenGL)...'
 if ! "$VPY" -u -m pip install -r "$APP_DIR/requirements-3d.txt"; then
     echo 'WARNING: 3D hand rendering could not be installed. The Skeleton and Flat hand styles still work.' >&2
     echo "Retry later with: $VPY -m pip install -r $APP_DIR/requirements-3d.txt" >&2
+fi
+
+echo '[4c/9] Enabling optional local music metadata support (Mutagen)...'
+if ! "$VPY" -c 'import mutagen' >/dev/null 2>&1; then
+    if ! "$VPY" -m pip install mutagen; then
+        echo 'WARNING: Filename indexing works, but embedded audio tags may not be available.' >&2
+    fi
 fi
 
 echo '[5/9] Installing optional offline StreamTTS runtime...'
@@ -189,6 +213,8 @@ echo '============================================================'
 echo 'INSTALLATION COMPLETE'
 echo "Launcher: $APPS_DIR/spatial-desktop-prototype.desktop"
 echo 'Find Freehand: Spatial Computing in your app launcher.'
+echo 'Search and Indexing installed: home indexed by default; add folders in Glass Settings -> SEARCH.'
+echo 'The index refreshes in the background at startup; existing indexed-folder settings are preserved.'
 echo 'Local search uses SQLite and remains available without d1. d1 is an optional local decision model.'
 echo 'StreamTTS runs offline when its runtime and voice files are installed.'
 echo 'Face Welcome is optional and local-only; enroll a user through Settings to enable it.'
