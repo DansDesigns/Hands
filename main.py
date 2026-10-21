@@ -1953,6 +1953,8 @@ def load_ui_preferences() -> dict:
         "wake_word_trained": False,
         "wake_word_listening": False,
         "garden_onboarding_completed": False,
+        "garden_onboarding_progress": [],
+        "garden_onboarding_bonus_xp": 0,
         "sound_defaults_v1_applied": False,
         **{key: DEFAULT_UI_SOUNDS.get(key, "None") for key, _label in SOUND_SETTING_ROWS},
     }
@@ -1972,6 +1974,12 @@ def load_ui_preferences() -> dict:
             elif key in ("show_gesture_disabled_indicator", "garden_onboarding_completed", "debug_console", "start_on_login", "wake_word_trained", "wake_word_listening", "d1_autostart"):
                 if isinstance(value, bool):
                     result[key] = value
+            elif key == "garden_onboarding_progress":
+                if isinstance(value, list):
+                    result[key] = [step for step in value[:24] if isinstance(step, str) and len(step) <= 32]
+            elif key == "garden_onboarding_bonus_xp":
+                if type(value) is int:
+                    result[key] = max(0, min(1000, value))
             elif key == "wake_word_name":
                 result[key] = normalise_wake_word_name(value)
             elif key == "sound_defaults_v1_applied":
@@ -1999,6 +2007,12 @@ def save_ui_preferences(values: dict) -> None:
         elif key in ("show_gesture_disabled_indicator", "garden_onboarding_completed", "debug_console", "start_on_login", "wake_word_trained", "wake_word_listening", "d1_autostart"):
             if isinstance(value, bool):
                 current[key] = value
+        elif key == "garden_onboarding_progress":
+            if isinstance(value, list):
+                current[key] = [step for step in value[:24] if isinstance(step, str) and len(step) <= 32]
+        elif key == "garden_onboarding_bonus_xp":
+            if type(value) is int:
+                current[key] = max(0, min(1000, value))
         elif key == "wake_word_name":
             current[key] = normalise_wake_word_name(value)
         elif key == "sound_defaults_v1_applied":
@@ -3173,13 +3187,17 @@ class SearchHandOverlay(QWidget):
         # above ordinary desktop windows; immersive Windows shell surfaces such as
         # Task View may still be in a higher system z-order band.
         raise_interval = (0.55 if search_visible else 0.25) if active_visuals else 0.85
-        native_menu_open = (owner._native_context_menu_visual_guard(now) or
-                            owner._windows_task_view_active(now))
-        # Explorer raises grouped-app preview thumbnails *after* Freehand. Keep
-        # only the transparent hand layer above them, without taking focus or
-        # moving the taskbar itself. Context menus / Task View keep priority.
-        preview_open = (sys.platform.startswith('win') and
-                        not native_menu_open and _windows_shell_preview_visible(now))
+        task_view_open = owner._windows_task_view_active(now)
+        # The right-click visual guard lasts up to eight seconds. A *later*
+        # grouped-app preview is a DIFFERENT shell surface; leaving that guard
+        # in charge silently stops all re-raising, which made hands disappear
+        # behind thumbnails after using the Pinch Menu. Recognize a confirmed
+        # preview independently, but never try to cover Task View itself.
+        preview_open = (sys.platform.startswith('win') and not task_view_open and
+                        _windows_shell_preview_visible(now))
+        native_menu_open = (task_view_open or
+                            (owner._native_context_menu_visual_guard(now) and
+                             not preview_open))
         if preview_open:
             raise_interval = min(raise_interval, 0.045)
         if not native_menu_open and now-self._last_raise > raise_interval:
@@ -4003,10 +4021,35 @@ class SpatialDesktop(QWidget):
         self.space_constellations = list(self.virtual_desktop_data.get("constellations", []))
         # Play-based onboarding is contextual, not a modal calibration wizard.
         self._scene_tutorial_steps = set()
+        # Restore only a valid sequential prefix: stale saved IDs cannot skip lessons.
+        if not self.ui_preferences.get("garden_onboarding_completed", False):
+            saved = self.ui_preferences.get("garden_onboarding_progress", [])
+            if isinstance(saved, list):
+                for step_id, _title, _goal in self.ONBOARDING_LESSONS:
+                    if step_id not in saved:
+                        break
+                    self._scene_tutorial_steps.add(step_id)
+            # A disabled hand is a runtime state, not a persistent checkpoint.
+            # Repeat the lock/unlock pair on next launch rather than getting stuck.
+            if ("peace_disabled" in self._scene_tutorial_steps and
+                    "peace_enabled" not in self._scene_tutorial_steps):
+                self._scene_tutorial_steps.discard("peace_disabled")
+            if "space" in self._scene_tutorial_steps and "returned" not in self._scene_tutorial_steps:
+                self.virtual_scene = "space"
+                self.virtual_garden_mode = False
+                self.virtual_space_mode = True
         # A replayable, non-modal Garden playground. Only its temporary fist
         # exercises capture gestures; normal gesture handling is unchanged elsewhere.
         self._onboarding_enabled = not self.ui_preferences.get("garden_onboarding_completed", False)
         self._onboarding_celebrate_until = 0.0
+        self._onboarding_reward_until = 0.0
+        self._onboarding_reward_title = ""
+        self._onboarding_reward_points = 100
+        self._onboarding_bonus_xp = int(self.ui_preferences.get("garden_onboarding_bonus_xp", 0))
+        self._onboarding_level_started = time.monotonic()
+        self._onboarding_show_hint_until = 0.0
+        self._onboarding_hello_started = None
+        self._onboarding_guide_last_pose = None
         self._onboarding_disabled_side = None
         self._onboarding_practice_anchor = None
         self._onboarding_practice_progress = 0.0
@@ -4145,6 +4188,17 @@ class SpatialDesktop(QWidget):
         self._native_context_menu_visual_guard_until = 0.0
         self._task_view_checked_at = -100.0
         self._task_view_visible_cached = False
+        # Win+Tab's XAML surface is not always detectable via EnumWindows (the
+        # shell can reparent, temporarily cloak, or leave its title blank).
+        # Latch the actual keyboard chord with a cheap 20ms poll, and verify
+        # closure against the foreground window instead of relying on a title.
+        self._task_view_chord_was_down = False
+        self._task_view_escape_was_down = False
+        self._task_view_hotkey_opened_at = 0.0
+        self._task_view_hotkey_grace_until = 0.0
+        self._task_view_hotkey_last_seen = 0.0
+        self._task_view_native_mode = False
+        self._task_view_native_position = None
         # Focused-field dictation writes stable Vosk words into the currently focused OS field.
         self.focus_dictation_enabled = False
         self.focus_dictation_paused = False
@@ -4454,6 +4508,16 @@ class SpatialDesktop(QWidget):
         self.timer.setTimerType(Qt.PreciseTimer)
         self.timer.timeout.connect(self.update_scene)
         self.timer.start(50)
+        # A 15-30 FPS camera poll can entirely miss a quick Win+Tab chord.
+        # Poll ONLY two key states here; expensive shell/window checks remain
+        # cached in _windows_task_view_active, outside this hot path.
+        self._task_view_key_timer = None
+        if sys.platform.startswith('win'):
+            self._task_view_key_timer = QTimer(self)
+            self._task_view_key_timer.setTimerType(Qt.PreciseTimer)
+            self._task_view_key_timer.setInterval(20)
+            self._task_view_key_timer.timeout.connect(self._poll_windows_task_view_keys)
+            self._task_view_key_timer.start()
         self.custom_key_capture_poll_timer = QTimer(self)
         self.custom_key_capture_poll_timer.setInterval(20)
         self.custom_key_capture_poll_timer.timeout.connect(self._poll_custom_key_capture)
@@ -5242,6 +5306,8 @@ class SpatialDesktop(QWidget):
             if origin is not None:
                 ball["tutorial_travel"] = max(ball.get("tutorial_travel", 0.0),
                     math.hypot((x-origin[0])*width, (y-origin[1])*height))
+                if (self._onboarding_stage() or (None,))[0] == "ball":
+                    self._onboarding_practice_progress = min(1.0, ball["tutorial_travel"] / max(60.,height*.12))
             ball["last_drag_at"] = now
             self.update()
             event.accept()
@@ -5312,7 +5378,7 @@ class SpatialDesktop(QWidget):
 
     def _garden_toggle_sundial(self, now):
         self._garden_sundial_projection_active = not self._garden_sundial_projection_active
-        self._scene_tutorial_steps.add("sundial")
+        self._onboarding_complete_step("sundial")
         self.status = ("Sundial sky clock enabled" if self._garden_sundial_projection_active
                        else "Sundial sky clock disabled")
         self.update()
@@ -5393,6 +5459,8 @@ class SpatialDesktop(QWidget):
             if origin is not None:
                 ball["tutorial_travel"] = max(ball.get("tutorial_travel", 0.0),
                     math.hypot((x-origin[0])*width, (y-origin[1])*height))
+                if (self._onboarding_stage() or (None,))[0] == "ball":
+                    self._onboarding_practice_progress = min(1.0, ball["tutorial_travel"] / max(60.,height*.12))
         else:
             # Allow a tiny dropout, but release normally when the pinch opens.
             if ball.get("release_since") is None:
@@ -5415,6 +5483,13 @@ class SpatialDesktop(QWidget):
         moved = ball.pop("tutorial_travel", 0.0) >= 40.0
         ball.pop("tutorial_origin", None)
         if moved:
+            target_x, target_y = self._onboarding_ball_target()
+            width, height = max(1.0, float(self.width())), max(1.0, float(self.height()))
+            if ((self._onboarding_stage() or (None,))[0] == "ball" and
+                    math.hypot((ball["x"]-target_x)*width,
+                               (ball["y"]-target_y)*height) < max(60.0, height*0.13)):
+                self._onboarding_bonus_xp += 50
+                self._onboarding_ball_bonus = True
             self._onboarding_complete_step("ball")
         if self.gesture_owner == side:
             self.gesture_owner = None
@@ -5633,10 +5708,10 @@ class SpatialDesktop(QWidget):
         height = float(self.height() if height is None else height)
         if scene not in ("garden", "space"):
             return QRectF()
-        # During the two navigation lessons the user must actually pull with a
-        # right-hand fist, rather than skip the lesson by clicking either arrow.
-        if self._onboarding_enabled and (self._onboarding_stage() or (None,))[0] == (
-                "space" if scene == "garden" else "returned"):
+        # During quests, scene changes are unlocked ONLY by their actual fist
+        # challenges. Hiding the shortcuts also prevents entering the wrong world
+        # mid-lesson and getting stuck behind the guided-gesture filter.
+        if self._onboarding_enabled and self._onboarding_stage() is not None:
             return QRectF()
         y = 22.0 if scene == "garden" else max(8.0, height-95.0)
         return QRectF(max(8.0, (width-206.0)/2.0), y, min(206.0, width-16.0), 55.0)
@@ -5677,22 +5752,55 @@ class SpatialDesktop(QWidget):
         finally:
             painter.restore()
 
-    # The initial five activities teach discovery by playing with Garden and Space.
-    # Later lessons practise existing system gestures without synthesising OS input.
+    # Every mission is completed by an actual tracked pose or scene interaction,
+    # not by pressing Next. The chapter/XP HUD is only a view of this state machine.
     ONBOARDING_LESSONS = (
-        ("ball", "PICK UP & DROP", "Pinch the bouncing ball, move it around, then release."),
-        ("sundial", "TAP TO CLICK", "Tap or pinch-click the sundial to switch the sky clock on or off."),
-        ("space", "LOOK UP", "Make a RIGHT fist and PULL DOWN to lift the view into the stars."),
-        ("constellation", "DRAW IN SPACE", "Pinch a star, travel to other stars, then release."),
-        ("returned", "BACK TO EARTH", "Make a RIGHT fist and PULL UP to bring the Garden back into view."),
-        ("peace_disabled", "LOCK YOUR HAND", "Hold a peace sign until the timer circle finishes to disable a hand."),
-        ("peace_enabled", "UNLOCK YOUR HAND", "Hold the same peace sign until its timer finishes to re-enable it."),
-        ("pinch_menu", "OPEN THE PINCH MENU", "In an empty area, hold a thumb-index pinch until its timer finishes."),
-        ("right_click", "TRY RIGHT-CLICK", "Hold a LEFT fist and briefly pinch/release with RIGHT to open context actions."),
-        ("fist_scroll", "PRACTISE SCROLLING", "Close your RIGHT fist and move it up or down to fill the meter."),
-        ("two_fists", "PRACTISE WINDOW MOVING", "Hold your LEFT fist still; make a RIGHT fist and move it sideways."),
-        ("glass_menu", "TOGGLE THE GLASS MENU", "Open both hands and bring their coloured cursor circles together."),
+        ("hello", "AWAKEN YOUR HANDS", "Show your open RIGHT hand to the camera. Hold steady to power up."),
+        ("ball", "CATCH THE COMET", "Pinch the glowing ball, carry it, then open your fingers to drop it."),
+        ("sundial", "LIGHT UP THE SKY", "Aim at the stone sundial and make a quick thumb-index pinch."),
+        ("space", "LAUNCH INTO SPACE", "Make a RIGHT fist, then pull DOWN. Watch the lift meter."),
+        ("constellation", "CONNECT THE STARS", "Pinch a bright star, trace to another and release to save."),
+        ("returned", "RETURN TO EARTH", "Make a RIGHT fist and pull UP to bring the Garden back."),
+        ("peace_disabled", "STEALTH MODE", "Hold an index-and-middle-finger V sign to detach one hand."),
+        ("peace_enabled", "RESTORE YOUR POWER", "Hold the SAME V sign on that hand until tracking resumes."),
+        ("pinch_menu", "SUMMON THE PINCH MENU", "Pinch thumb and index in empty space, then KEEP HOLDING."),
+        ("right_click", "SECRET ACTION", "Hold LEFT fist as modifier, then quick pinch RIGHT and release."),
+        ("fist_scroll", "SCROLL SURFER", "Make a RIGHT fist and move UP or DOWN to charge the meter."),
+        ("two_fists", "WINDOW MOVER", "Keep LEFT fist steady; with RIGHT fist move sideways."),
+        ("glass_menu", "OPEN THE PORTAL", "Open both hands; bring their coloured cursor rings together."),
     )
+    ONBOARDING_TIPS = {
+        "hello": "Keep your fingers spread, palm visible and inside the camera frame. This confirms live hand tracking.",
+        "ball": "Bring the pointer circle over the orange ball. Touch thumb to index, move while pinched, then release. The glowing ring is a bonus target!",
+        "sundial": "The sundial sits on a short pedestal on the left. Make a quick real thumb-to-index contact; touching the pointer ring alone is not a click.",
+        "space": "Close all four fingers AND tuck your thumb. With that RIGHT fist held, pull down; the world travels upward.",
+        "constellation": "Start your pinch directly on a star, sweep across one or more nearby stars, then separate thumb and index to save.",
+        "returned": "Keep the RIGHT fist tightly closed. Pull your real hand UP to bring the Garden back down into view.",
+        "peace_disabled": "Raise only index and middle fingers in a V; tuck the others. Hold until the built-in circular timer finishes.",
+        "peace_enabled": "Use the same hand you disabled. Its V sign still works even when other gestures are detached.",
+        "pinch_menu": "Make fingertip CONTACT and stay still: first the protection buffer passes, then the timer circle fills. A quick pinch is a click.",
+        "right_click": "LEFT hand makes a full fist and stays held. With RIGHT, pinch and release quickly to get contextual actions.",
+        "fist_scroll": "A real closed fist has a tucked thumb. Keep LEFT hand open; move RIGHT fist vertically, not sideways.",
+        "two_fists": "Close both hands. Hold LEFT hand nearly stationary while moving RIGHT sideways, like picking up a window.",
+        "glass_menu": "Keep both hands OPEN. Overlap the red and blue pointer circles and hold until the activation ring completes.",
+    }
+    ONBOARDING_GESTURE_NAMES = {
+        "hello": "OPEN PALM", "ball": "PINCH + DRAG", "sundial": "QUICK PINCH",
+        "space": "RIGHT FIST", "constellation": "PINCH + DRAW", "returned": "RIGHT FIST",
+        "peace_disabled": "PEACE SIGN", "peace_enabled": "PEACE SIGN",
+        "pinch_menu": "HOLD PINCH", "right_click": "LEFT + RIGHT",
+        "fist_scroll": "FIST SCROLL", "two_fists": "TWO FISTS", "glass_menu": "TWO OPEN HANDS",
+    }
+
+    def _onboarding_chapter(self, step):
+        if step in ("hello", "ball", "sundial"):
+            return "01  GARDEN QUEST", QColor(96, 226, 157)
+        if step in ("space", "constellation", "returned"):
+            return "02  STAR QUEST", QColor(163, 147, 255)
+        return "03  GESTURE ACADEMY", QColor(91, 216, 244)
+
+    def _onboarding_points(self):
+        return len(self._scene_tutorial_steps) * 100 + self._onboarding_bonus_xp
 
     def _onboarding_stage(self):
         if not self._onboarding_enabled:
@@ -5715,6 +5823,8 @@ class SpatialDesktop(QWidget):
         self._onboarding_button_pinch_latched = {"left": False, "right": False}
         self._onboarding_celebrate_until = (time.monotonic()+10.0 if show_celebration else 0.0)
         self.ui_preferences["garden_onboarding_completed"] = True
+        self.ui_preferences["garden_onboarding_progress"] = [key for key, _, _ in self.ONBOARDING_LESSONS]
+        self.ui_preferences["garden_onboarding_bonus_xp"] = self._onboarding_bonus_xp
         save_ui_preferences(self.ui_preferences)
         self.update()
 
@@ -5727,6 +5837,19 @@ class SpatialDesktop(QWidget):
         self._scene_tutorial_steps.add(step)
         self._onboarding_practice_anchor = None
         self._onboarding_practice_progress = 0.0
+        self._onboarding_hello_started = None
+        self._onboarding_level_started = time.monotonic()
+        self._onboarding_show_hint_until = 0.0
+        self._onboarding_reward_until = self._onboarding_level_started + 2.0
+        self._onboarding_reward_title = stage[1]
+        self._onboarding_reward_points = 100 + (50 if step == "ball" and getattr(self, "_onboarding_ball_bonus", False) else 0)
+        self._onboarding_ball_bonus = False
+        self.ui_preferences["garden_onboarding_progress"] = [
+            key for key, _, _ in self.ONBOARDING_LESSONS if key in self._scene_tutorial_steps]
+        self.ui_preferences["garden_onboarding_bonus_xp"] = self._onboarding_bonus_xp
+        save_ui_preferences(self.ui_preferences)
+        # Reuse existing non-blocking menu-button audio; no new media dependencies.
+        play_ui_sound(self.ui_preferences.get("sound_glass_buttons", "None"))
         if step == "glass_menu":
             self._onboarding_finish()
         else:
@@ -5735,6 +5858,12 @@ class SpatialDesktop(QWidget):
     def _onboarding_replay(self):
         self._onboarding_enabled = True
         self._onboarding_celebrate_until = 0.0
+        self._onboarding_reward_until = 0.0
+        self._onboarding_bonus_xp = 0
+        self._onboarding_ball_bonus = False
+        self._onboarding_hello_started = None
+        self._onboarding_level_started = time.monotonic()
+        self._onboarding_show_hint_until = 0.0
         self._onboarding_disabled_side = None
         self._onboarding_practice_anchor = None
         self._onboarding_practice_progress = 0.0
@@ -5756,6 +5885,8 @@ class SpatialDesktop(QWidget):
         self._scene_arrow_pinch_previous = {"left": False, "right": False}
         self._scene_arrow_pinch_latched = {"left": False, "right": False}
         self.ui_preferences["garden_onboarding_completed"] = False
+        self.ui_preferences["garden_onboarding_progress"] = []
+        self.ui_preferences["garden_onboarding_bonus_xp"] = 0
         save_ui_preferences(self.ui_preferences)
         self.status = "Garden lessons restarted — learn by playing"
         self.update()
@@ -5767,17 +5898,24 @@ class SpatialDesktop(QWidget):
         self._show_gesture_map_overlay()
         self.update()
 
+    def _onboarding_ball_target(self):
+        """An optional, generous landing zone: missing it never fails the gesture."""
+        return 0.56, 0.72
+
     def _onboarding_controls(self, width=None, height=None):
         width = float(self.width() if width is None else width)
         height = float(self.height() if height is None else height)
-        chip = QRectF(18.0, 96.0, min(174.0, width-36.0), 35.0)
-        banner_w = min(max(220.0, width-28.0), 680.0)
-        banner_h = 158.0
-        banner = QRectF((width-banner_w)*0.5, (height-banner_h)*0.5, banner_w, banner_h)
+        banner_w = min(690.0, max(220.0, width-28.0))
+        banner_h = 178.0 if height > 500 else 144.0
+        banner = QRectF((width-banner_w)*0.5, min(68.0, max(14.0, height*0.065)), banner_w, banner_h)
+        chip = QRectF(16.0, 96.0, min(154.0, max(90.0, width-32.0)), 34.0)
+        if chip.right()+9 > banner.left() and chip.intersects(banner):
+            chip.moveTop(8.0)
         return {
             "chip": chip, "banner": banner,
-            "skip": QRectF(banner.right()-92.0, banner.top()+11.0, 76.0, 29.0),
-            "map": QRectF(banner.right()-146.0, banner.bottom()-39.0, 129.0, 29.0),
+            "skip": QRectF(banner.right()-82.0, banner.top()+11.0, 70.0, 28.0),
+            "hint": QRectF(banner.right()-232.0, banner.bottom()-37.0, 77.0, 28.0),
+            "map": QRectF(banner.right()-148.0, banner.bottom()-37.0, 136.0, 28.0),
         }
 
     def _onboarding_button_at(self, point):
@@ -5793,6 +5931,8 @@ class SpatialDesktop(QWidget):
         if self._onboarding_enabled:
             if rects["skip"].contains(point):
                 return "skip"
+            if rects["hint"].contains(point):
+                return "hint"
             if rects["map"].contains(point):
                 return "map"
         return None
@@ -5802,12 +5942,28 @@ class SpatialDesktop(QWidget):
             self._onboarding_finish(show_celebration=False)
         elif action == "replay":
             self._onboarding_replay()
+        elif action == "hint":
+            self._onboarding_show_hint_until = time.monotonic() + 12.0
+            self.update()
         elif action == "map":
             self._onboarding_open_gesture_map()
 
     def _onboarding_handle_button_frame(self, side, cursor, landmarks, edge_tolerant=False):
         """Pinch-click a lesson control once; hovering never arms the Pinch Menu."""
         action = self._onboarding_button_at(cursor)
+        # Warm-up mission uses the same full-open-palm classifier as grip release.
+        # It is processed during the existing frame pass, without any new webcam work.
+        if self._onboarding_enabled and (self._onboarding_stage() or (None,))[0] == "hello":
+            now = time.monotonic()
+            if side == "right" and is_fully_open_hand_pose(landmarks, edge_tolerant):
+                if self._onboarding_hello_started is None:
+                    self._onboarding_hello_started = now
+                self._onboarding_practice_progress = min(1.0, (now-self._onboarding_hello_started)/0.55)
+                if self._onboarding_practice_progress >= 1.0:
+                    self._onboarding_complete_step("hello")
+            elif side == "right":
+                self._onboarding_hello_started = None
+                self._onboarding_practice_progress = 0.0
         pinch = (not is_fist_or_grip_pose(landmarks, edge_tolerant=edge_tolerant) and
                  self._garden_object_pinch(landmarks, held=self._onboarding_button_pinch_latched[side]))
         previous = self._onboarding_button_pinch_previous[side]
@@ -6034,92 +6190,233 @@ class SpatialDesktop(QWidget):
             self._onboarding_complete_step("two_fists")
         return True
 
+    def _onboarding_paint_guide_icon(self, painter, cx, cy, key, accent):
+        """Tiny pose pictogram painted with cheap Qt primitives; no texture files."""
+        painter.save()
+        try:
+            painter.setRenderHint(QPainter.Antialiasing, True)
+            painter.setPen(QPen(accent, 4.0, Qt.SolidLine, Qt.RoundCap, Qt.RoundJoin))
+            kind = ("open" if key in ("hello", "glass_menu") else
+                    "peace" if key.startswith("peace") else
+                    "fist" if key in ("space", "returned", "fist_scroll", "two_fists", "right_click") else
+                    "pinch")
+            if kind == "open":
+                for dx, dy in ((-21, -23), (-10, -32), (2, -34), (14, -25), (25, -12)):
+                    painter.drawLine(QPointF(cx+dx*0.35, cy+8), QPointF(cx+dx, cy+dy))
+                painter.drawEllipse(QRectF(cx-15, cy+1, 30, 25))
+            elif kind == "peace":
+                painter.drawLine(QPointF(cx-2, cy+23), QPointF(cx-19, cy-32))
+                painter.drawLine(QPointF(cx+5, cy+19), QPointF(cx+17, cy-35))
+                painter.drawEllipse(QRectF(cx-17, cy+7, 33, 24))
+            elif kind == "fist":
+                painter.drawRoundedRect(QRectF(cx-24, cy-12, 48, 40), 12, 12)
+                for dx in (-13, 0, 13):
+                    painter.drawLine(QPointF(cx+dx, cy-11), QPointF(cx+dx, cy+1))
+            else:
+                painter.drawLine(QPointF(cx-23, cy+17), QPointF(cx-3, cy-6))
+                painter.drawLine(QPointF(cx+23, cy+17), QPointF(cx+4, cy-8))
+                painter.drawEllipse(QPointF(cx, cy-5), 7.0, 7.0)
+                painter.drawArc(QRectF(cx-28, cy-33, 56, 56), 20*16, 140*16)
+            painter.setPen(Qt.NoPen)
+            painter.setBrush(QColor(250, 255, 255, 235))
+            painter.drawEllipse(QPointF(cx, cy-5), 3.0, 3.0)
+        finally:
+            painter.restore()
+
+    def _onboarding_paint_world_cues(self, painter, width, height, scene, key, now, accent):
+        """Point to existing gameplay objects without intercepting gesture input."""
+        painter.save()
+        try:
+            painter.setRenderHint(QPainter.Antialiasing, True)
+            pulse = (1.0+0.065*math.sin(now*4.3))
+            if scene == "garden" and key in ("ball", "sundial"):
+                if key == "ball":
+                    x, y = self._garden_props["ball"]["x"]*width, self._garden_props["ball"]["y"]*height
+                    radius = max(35.0, height*.053)
+                    target_x, target_y = self._onboarding_ball_target()
+                    tx, ty = target_x*width, target_y*height
+                    painter.setBrush(QColor(88, 247, 173, 18))
+                    painter.setPen(QPen(QColor(111, 255, 187, 176), 4.0, Qt.DashLine))
+                    painter.drawEllipse(QPointF(tx, ty), height*.092*pulse, height*.060*pulse)
+                    painter.setPen(QColor(232, 255, 231))
+                    painter.setFont(self._ui_font(9, QFont.Bold))
+                    painter.drawText(QRectF(tx-115, ty+height*.076, 230, 25), Qt.AlignCenter, "BONUS LANDING  +50 XP")
+                else:
+                    x, y = self._garden_props["sundial"]["x"]*width, self._garden_props["sundial"]["y"]*height
+                    radius = max(34.0, height*.065)
+                painter.setPen(QPen(QColor(accent.red(),accent.green(),accent.blue(),210), 3.5))
+                painter.setBrush(Qt.NoBrush)
+                painter.drawEllipse(QPointF(x, y), radius*pulse, radius*pulse)
+                painter.setPen(QColor(250, 255, 255, 240))
+                painter.setFont(self._ui_font(10, QFont.Bold))
+                painter.drawText(QRectF(x-120, y-radius-37, 240, 27), Qt.AlignCenter,
+                                 "PINCH + CARRY" if key == "ball" else "PINCH TO ACTIVATE")
+            elif key in ("space", "returned") and (
+                    (scene == "garden" and key == "space") or (scene == "space" and key == "returned")):
+                # A rising/falling guide shows the actual inverse drag mapping.
+                cx, cy = width*.87, height*.52
+                direction = 1 if key == "space" else -1
+                painter.setPen(QPen(QColor(accent.red(),accent.green(),accent.blue(),180), 6, Qt.SolidLine, Qt.RoundCap))
+                painter.drawLine(QPointF(cx, cy-direction*75), QPointF(cx, cy+direction*68))
+                painter.drawLine(QPointF(cx-17, cy+direction*48), QPointF(cx, cy+direction*69))
+                painter.drawLine(QPointF(cx+17, cy+direction*48), QPointF(cx, cy+direction*69))
+            elif scene == "garden" and key in ("fist_scroll", "two_fists"):
+                # A lightweight training meter with a moving highlighted endpoint.
+                cx, cy = width*.80, height*.63
+                painter.setPen(QPen(QColor(accent.red(), accent.green(),accent.blue(),135), 4))
+                painter.setBrush(Qt.NoBrush)
+                painter.drawRoundedRect(QRectF(cx-65,cy-80,130,160),18,18)
+                painter.setPen(QColor(238, 251, 255, 220))
+                painter.setFont(self._ui_font(9, QFont.DemiBold))
+                painter.drawText(QRectF(cx-100,cy+86,200,30),Qt.AlignCenter,"PRACTICE ZONE")
+        finally:
+            painter.restore()
+
     def _paint_scene_tutorial_hint(self, painter, width, height, scene, weather=None):
-        """Contextual lessons plus a small replay control; no additional render timer."""
+        """A playable, non-modal quest HUD; the background/props remain usable."""
         if scene not in ("garden", "space") or (self.menu_open and self.hub_visible):
             return
+        now = time.monotonic()
         controls = self._onboarding_controls(width, height)
         painter.save()
         try:
             painter.setRenderHint(QPainter.Antialiasing, True)
-            painter.setPen(QPen(QColor(145, 225, 255, 170), 1.25))
-            painter.setBrush(QColor(8, 26, 50, 176))
+            painter.setPen(QPen(QColor(145, 225, 255, 150), 1.25))
+            painter.setBrush(QColor(8, 26, 50, 173))
             painter.drawRoundedRect(controls["chip"], 12.0, 12.0)
             painter.setPen(QColor(238, 251, 255))
             painter.setFont(self._ui_font(8, QFont.DemiBold))
             painter.drawText(controls["chip"], Qt.AlignCenter,
-                             "RESET TUTORIAL" if self._onboarding_enabled else "REPLAY TUTORIAL")
-            if (not self._onboarding_enabled and scene == "garden" and
-                    time.monotonic() < self._onboarding_celebrate_until):
-                message = "ALL SET!  Try more gestures in the Glass Menu's Gesture Map."
-                banner = controls["banner"]
-                painter.setBrush(QColor(9, 31, 56, 170))
-                painter.drawRoundedRect(banner, 18, 18)
-                painter.setFont(self._ui_font(12, QFont.DemiBold))
-                painter.drawText(banner.adjusted(24, 20, -24, -20),
-                                 Qt.AlignCenter | Qt.TextWordWrap, message)
+                             "RESTART QUEST" if self._onboarding_enabled else "REPLAY QUEST")
         finally:
             painter.restore()
         if not self._onboarding_enabled:
+            if scene == "garden" and now < self._onboarding_celebrate_until:
+                self._onboarding_paint_reward(painter, width, height, now, finished=True)
             return
         stage = self._onboarding_stage()
         if stage is None:
             return
         key, title, description = stage
-        # Lessons tied to a specific world remind the user where to practise.
+        chapter, accent = self._onboarding_chapter(key)
+        self._onboarding_paint_world_cues(painter, width, height, scene, key, now, accent)
         if scene == "space" and key not in ("constellation", "returned"):
-            title, description = "BACK TO THE GARDEN", "Make a RIGHT fist and PULL UP to return to the Garden."
+            title, description = "BACK TO THE GARDEN", "Make a RIGHT fist and pull UP to return to the Garden."
         elif scene == "garden" and key == "constellation":
-            title, description = "EXPLORE THE STARS", "Return to Space to draw your first constellation."
+            title, description = "RETURN TO THE STARS", "Reach Space to connect your constellation."
         elif scene == "garden" and key == "returned":
-            title, description = "BRING YOUR STARS HOME", "Visit Space and pull your RIGHT fist UP to return."
-        elif key == "returned":
-            title, description = "BRING YOUR STARS HOME", "Make a RIGHT fist and PULL UP to reveal the Garden."
+            title, description = "YOUR STARS ARE WAITING", "Visit Space and pull your RIGHT fist UP."
         if key == "peace_enabled" and self._onboarding_disabled_side:
-            description = ("Show a 2-second peace sign with your " +
-                           self._onboarding_disabled_side.upper() + " hand to turn it back on.")
-        controls = self._onboarding_controls(width, height)
+            description = "Hold the peace sign on your " + self._onboarding_disabled_side.upper() + " hand to switch it back on."
+        # Positive real-time reactions, not a timer-based fake completion.
+        if key == "ball" and self._garden_props["ball"].get("held") is not None:
+            description = "GREAT CATCH! Keep pinching as you carry the ball. Open your fingers to drop it."
+        elif key in ("space", "returned") and self._onboarding_practice_progress > .18:
+            description = f"THRUST {round(self._onboarding_practice_progress*100)}% — KEEP PULLING WITH YOUR FIST!"
+        elif key in ("fist_scroll", "two_fists") and self._onboarding_practice_progress > .15:
+            description = f"NICE CONTROL! {round(self._onboarding_practice_progress*100)}% — keep moving."
+        elif key == "constellation" and any(self.space_drawing_by_side.values()):
+            description = "STAR CAPTURED! Stay pinched and connect more stars, then release."
+        completed = len(self._scene_tutorial_steps)
+        total = len(self.ONBOARDING_LESSONS)
         banner = controls["banner"]
-        completed = sum(step in self._scene_tutorial_steps for step, _, _ in self.ONBOARDING_LESSONS)
+        small = banner.width() < 490 or banner.height() < 160
         painter.save()
         try:
             painter.setRenderHint(QPainter.Antialiasing, True)
-            painter.setPen(QPen(QColor(163, 229, 255, 180), 1.4))
-            painter.setBrush(QColor(6, 24, 47, 154))
-            painter.drawRoundedRect(banner, 17.0, 17.0)
-            painter.setPen(QColor(135, 225, 253, 240))
+            # Arcading accents are intentionally translucent and inexpensive.
+            painter.setPen(QPen(QColor(accent.red(),accent.green(),accent.blue(),202), 1.7))
+            painter.setBrush(QColor(5, 19, 43, 214))
+            painter.drawRoundedRect(banner, 20.0, 20.0)
+            progress_rect = QRectF(banner.x()+16, banner.y()+6, (banner.width()-32)*completed/max(1,total), 3.5)
+            painter.setPen(Qt.NoPen)
+            painter.setBrush(QColor(accent.red(),accent.green(),accent.blue(),240))
+            painter.drawRoundedRect(progress_rect, 2, 2)
+            painter.setPen(accent)
             painter.setFont(self._ui_font(8, QFont.DemiBold))
-            painter.drawText(banner.adjusted(22, 9, -100, -112), Qt.AlignLeft | Qt.AlignVCenter,
-                             f"LEARN BY PLAYING     {completed+1} / {len(self.ONBOARDING_LESSONS)}")
-            painter.setFont(self._ui_font(13, QFont.Bold))
-            painter.setPen(QColor(252, 254, 255))
-            painter.drawText(banner.adjusted(20, 44, -20, -73), Qt.AlignCenter | Qt.TextWordWrap, title)
-            painter.setFont(self._ui_font(10, QFont.DemiBold))
-            painter.setPen(QColor(232, 248, 255, 245))
-            painter.drawText(banner.adjusted(25, 84, -25, -34), Qt.AlignCenter | Qt.TextWordWrap, description)
-            # Progress is updated from real tracked practice gestures, not elapsed time.
-            if ((key in ("space", "fist_scroll", "two_fists") and scene == "garden") or
-                    (key == "returned" and scene == "space")):
-                track = QRectF(banner.x()+27, banner.bottom()-20, banner.width()-190, 6)
+            painter.drawText(QRectF(banner.x()+18, banner.y()+13, banner.width()-123, 20),
+                             Qt.AlignVCenter | Qt.AlignLeft, chapter + f"     LEVEL {completed+1}/{total}")
+            painter.setPen(QColor(255, 224, 139, 245))
+            painter.drawText(QRectF(banner.right()-242, banner.y()+13, 142, 20),
+                             Qt.AlignVCenter | Qt.AlignRight, f"{self._onboarding_points()} XP")
+            self._onboarding_paint_guide_icon(painter, banner.x()+59, banner.y()+97 if not small else banner.y()+80, key, accent)
+            painter.setPen(QColor(255,255,255))
+            painter.setFont(self._ui_font(13 if not small else 10, QFont.Bold))
+            painter.drawText(QRectF(banner.x()+108, banner.y()+46, banner.width()-130, 30),
+                             Qt.AlignVCenter | Qt.AlignLeft, title)
+            painter.setPen(QColor(225, 243, 254, 242))
+            painter.setFont(self._ui_font(9 if not small else 8))
+            painter.drawText(QRectF(banner.x()+111, banner.y()+77, banner.width()-134, 48 if not small else 34),
+                             Qt.AlignLeft | Qt.AlignTop | Qt.TextWordWrap, description)
+            painter.setPen(accent)
+            painter.setFont(self._ui_font(8, QFont.DemiBold))
+            painter.drawText(QRectF(banner.x()+17, banner.bottom()-34, min(275.,banner.width()*.48), 23),
+                             Qt.AlignVCenter | Qt.AlignLeft, self.ONBOARDING_GESTURE_NAMES[key])
+            if key in ("hello", "ball", "space", "returned", "fist_scroll", "two_fists"):
+                track = QRectF(banner.x()+185, banner.bottom()-26, max(20.0,banner.width()*.25), 7)
                 painter.setPen(Qt.NoPen)
-                painter.setBrush(QColor(109, 163, 194, 85))
-                painter.drawRoundedRect(track, 3, 3)
-                fill = QRectF(track.x(), track.y(), track.width()*self._onboarding_practice_progress, 6)
-                painter.setBrush(QColor(85, 238, 218, 230))
-                painter.drawRoundedRect(fill, 3, 3)
-                # The moving glow is a visible target for the fist exercise;
-                # it follows actual hand displacement, not an automatic timer.
-                painter.setBrush(QColor(199, 253, 241, 245))
-                painter.drawEllipse(QPointF(track.x()+track.width()*self._onboarding_practice_progress,
-                                            track.y()+3.0), 6.5, 6.5)
-            for name, text in (("skip", "SKIP"), ("map", "GESTURE MAP")):
+                painter.setBrush(QColor(90, 145, 175, 94))
+                painter.drawRoundedRect(track,4,4)
+                painter.setBrush(accent)
+                painter.drawRoundedRect(QRectF(track.x(),track.y(),track.width()*min(1,self._onboarding_practice_progress),7),4,4)
+            for name, text in (("skip", "SKIP"), ("hint", "HINT"), ("map", "GESTURE MAP")):
                 rect = controls[name]
-                painter.setPen(QPen(QColor(143, 215, 247, 135), 1.1))
-                painter.setBrush(QColor(19, 55, 83, 176))
-                painter.drawRoundedRect(rect, 8, 8)
-                painter.setPen(QColor(239, 251, 255))
+                painter.setPen(QPen(QColor(154, 224, 249, 135), 1.0))
+                painter.setBrush(QColor(23, 69, 93, 204))
+                painter.drawRoundedRect(rect,8,8)
+                painter.setPen(QColor(245, 255, 255))
                 painter.setFont(self._ui_font(7, QFont.DemiBold))
-                painter.drawText(rect, Qt.AlignCenter, text)
+                painter.drawText(rect,Qt.AlignCenter,text)
+            if now < self._onboarding_show_hint_until or now - self._onboarding_level_started > 14.0:
+                tip = self.ONBOARDING_TIPS.get(key, "")
+                if tip:
+                    # Tips appear below the top HUD, never cover the ball or dial.
+                    tip_rect = QRectF(banner.x()+12, banner.bottom()+9, banner.width()-24, 52)
+                    painter.setBrush(QColor(12, 44, 57, 218))
+                    painter.setPen(QPen(QColor(accent.red(), accent.green(), accent.blue(), 150), 1))
+                    painter.drawRoundedRect(tip_rect, 12, 12)
+                    painter.setPen(QColor(233,255,245))
+                    painter.setFont(self._ui_font(8))
+                    painter.drawText(tip_rect.adjusted(13,4,-13,-4), Qt.AlignCenter | Qt.TextWordWrap, tip)
+        finally:
+            painter.restore()
+        if now < self._onboarding_reward_until:
+            self._onboarding_paint_reward(painter,width,height,now)
+
+    def _onboarding_paint_reward(self, painter, width, height, now, finished=False):
+        """Small celebratory particles, deterministic per frame (no per-frame RNG)."""
+        duration = 8.0 if finished else 2.0
+        until = self._onboarding_celebrate_until if finished else self._onboarding_reward_until
+        phase = max(0.0, min(1.0,(until-now)/duration))
+        if phase <= 0:
+            return
+        # Sit between the top quest bar and the central play area.
+        cx, cy = width*.5, min(height*.49, 380.)
+        radius = (1.0-phase)*min(width*.23, 230.)
+        painter.save()
+        try:
+            painter.setRenderHint(QPainter.Antialiasing, True)
+            if finished:
+                heading, sub = "ADVENTURE COMPLETE!", f"{self._onboarding_points()} XP EARNED  -  FREEHAND UNLOCKED"
+            else:
+                heading, sub = "MISSION COMPLETE", f"+{self._onboarding_reward_points} XP  -  {self._onboarding_reward_title}"
+            painter.setPen(Qt.NoPen)
+            painter.setBrush(QColor(5,25,47,int(180*min(1,phase*3))))
+            bg = QRectF(cx-min(width*.35,265.), cy-40, min(width*.70,530.), 91)
+            painter.drawRoundedRect(bg, 19, 19)
+            painter.setPen(QColor(255,236,164,int(255*min(1,phase*3))))
+            painter.setFont(self._ui_font(17, QFont.Bold))
+            painter.drawText(bg.adjusted(12,8,-12,-42),Qt.AlignCenter,heading)
+            painter.setPen(QColor(167,255,212,int(255*min(1,phase*3))))
+            painter.setFont(self._ui_font(9, QFont.DemiBold))
+            painter.drawText(bg.adjusted(10,49,-10,-5),Qt.AlignCenter,sub)
+            for i in range(12):
+                angle = (i/12.0)*2*math.pi
+                px = cx+math.cos(angle)*(78+radius)
+                py = cy+math.sin(angle)*(44+radius*.55)
+                painter.setBrush(QColor(137 if i%2 else 255,250,178,int(220*phase)))
+                r = 2.5 + (i%3)
+                painter.drawEllipse(QPointF(px,py),r,r)
         finally:
             painter.restore()
 
@@ -6147,7 +6444,7 @@ class SpatialDesktop(QWidget):
         target_scene = "space" if source_scene == "garden" else "garden"
         source_image = self._render_scene_slide_frame(source_scene)
         self._set_virtual_scene(target_scene)
-        self._scene_tutorial_steps.add("space" if target_scene == "space" else "returned")
+        self._onboarding_complete_step("space" if target_scene == "space" else "returned")
         target_image = self._render_scene_slide_frame(target_scene)
         self._scene_transition = {
             "from": source_scene, "to": target_scene, "started": now,
@@ -6352,7 +6649,7 @@ class SpatialDesktop(QWidget):
             self.space_constellations = self.space_constellations[-120:]
             self._space_constellation_revision += 1
             self._garden_constellation_cache = None
-            self._scene_tutorial_steps.add("constellation")
+            self._onboarding_complete_step("constellation")
             self._schedule_virtual_desktop_save()
             self.status = f"Constellation saved · {len(state['stars'])} stars connected"
         self.update()
@@ -8459,6 +8756,9 @@ class SpatialDesktop(QWidget):
     def _set_floating_clipboard_visible(self, visible):
         self.floating_clipboard_visible = bool(visible)
         if self.floating_clipboard_visible:
+            # The UI is drawn into a mouse-transparent overlay. Stop any
+            # pending touchscreen contact from continuing under the new card.
+            self._end_two_hand_touch()
             self.floating_clipboard_scroll_offset = 0
             self.status = f"Floating clipboard shown — {len(self.floating_clipboard_entries)} item(s); grab or pinch an item to drag it"
         else:
@@ -8535,7 +8835,12 @@ class SpatialDesktop(QWidget):
 
     def _floating_clipboard_contains(self, point):
         layout = self._floating_clipboard_layout()
-        return bool(layout is not None and point is not None and layout["panel"].contains(point))
+        if layout is None or point is None:
+            return False
+        # The drawn card has a rounded border, and landmark jitter can straddle
+        # that border. Reserve a small perimeter around the whole panel too;
+        # an OS click must NEVER pass through an apparently touched clipboard.
+        return layout["panel"].adjusted(-7.0, -7.0, 7.0, 7.0).contains(point)
 
     def _floating_clipboard_hit_test(self, point):
         layout = self._floating_clipboard_layout()
@@ -8554,6 +8859,11 @@ class SpatialDesktop(QWidget):
         for entry, rect in layout["cards"]:
             if rect.contains(point):
                 return {"type": "entry", "entry": entry}
+        # Padding, the space below the last card, and the narrow card gutters
+        # are still *part of the clipboard*, not holes into the OS window.
+        # They behave as additional panel drag handles, not native clicks.
+        if self._floating_clipboard_contains(point):
+            return {"type": "control", "name": "header"}
         return None
 
     def _paint_floating_clipboard(self, painter, now=None):
@@ -9898,6 +10208,11 @@ class SpatialDesktop(QWidget):
         """Route a discrete gesture click to glass controls or the native OS pointer."""
         if point is None:
             return
+        # Last-resort click-through protection for both legacy mouse gestures
+        # and native touch fallbacks: clipboard interaction is handled only by
+        # its own gesture state machine, never by the underlying application.
+        if self._floating_clipboard_contains(point):
+            return
         # An open glass menu is modal for gesture clicks: a pinch outside its panel
         # must not click an underlying application or the desktop.
         if self.menu_open and self.hub_visible and not self._canvas_menu_panel_contains(point):
@@ -10316,6 +10631,8 @@ class SpatialDesktop(QWidget):
         """
         if point is None:
             return
+        if self._floating_clipboard_contains(point):
+            return
         click_point = QPointF(point)
         native_target = (self.desktop_mode == "os" and
                          not self.mouse_detached_by_side.get(side, False) and
@@ -10346,6 +10663,8 @@ class SpatialDesktop(QWidget):
     def _activate_canvas_right_click(self, point, side, now):
         """Send a right-click at the captured TPI point (used by Right-click Mode)."""
         if point is None or self._canvas_menu_panel_contains(point):
+            return
+        if self._floating_clipboard_contains(point):
             return
         if self.menu_open and self.hub_visible:
             return
@@ -10570,6 +10889,7 @@ class SpatialDesktop(QWidget):
         should_hide = bool(
             sys.platform.startswith("win") and self.desktop_mode == "os"
             and not self.hand_tracking_paused and
+            not self._windows_task_view_active() and
             (self._os_fist_scroll_active() or self._os_two_fist_window_drag_active())
         )
         if should_hide == self._native_scroll_cursor_hidden:
@@ -10585,110 +10905,171 @@ class SpatialDesktop(QWidget):
             return
         self._native_scroll_cursor_hidden = should_hide
 
-    def _windows_task_view_active(self, now=None):
-        """Temporary native-mouse mode while the Windows Win+Tab switcher is up.
+    def _poll_windows_task_view_keys(self):
+        """Catch short Win+Tab chords which a 15 FPS camera loop can miss.
 
-        Inspect the shell at a bounded cadence; neither the camera thread nor
-        every hand joint makes Win32 window-enumeration calls. Never change the
-        user's stored per-hand peace-sign detach choice.
+        This polling runs ONLY on Windows and reads three key states; it never
+        enumerates windows or performs a desktop capture. No system-wide hook,
+        elevation, or extra install components are necessary.
         """
-        if not sys.platform.startswith("win") or self.desktop_mode != "os":
+        if (self.desktop_mode != "os" or
+                getattr(self, "_native_shortcut_capture", None) is not None):
+            self._task_view_chord_was_down = False
+            if self.desktop_mode != "os":
+                self._task_view_hotkey_grace_until = 0.0
+            return
+        try:
+            user = ctypes.windll.user32
+            user.GetAsyncKeyState.argtypes = (ctypes.c_int,)
+            user.GetAsyncKeyState.restype = ctypes.c_short
+            down = lambda key: bool(user.GetAsyncKeyState(key) & 0x8000)
+            chord = down(0x09) and (down(0x5B) or down(0x5C))
+            escape = down(0x1B)
+        except (OSError, AttributeError, ValueError, TypeError):
+            return
+        now = time.monotonic()
+        if chord and not self._task_view_chord_was_down:
+            # Win+Tab is a *toggle*. A second invocation while the switcher is
+            # present dismisses it; do not leave the native cursor attached.
+            if (self._task_view_hotkey_grace_until > now and
+                    now - self._task_view_hotkey_opened_at > 0.40):
+                self._task_view_hotkey_grace_until = 0.0
+            else:
+                self._task_view_hotkey_opened_at = now
+                # A task switcher can remain open while somebody reviews many
+                # windows; a 1.6s latch made the mouse suddenly stop following
+                # the hand. Exit is driven by Esc, a second Win+Tab or a known
+                # non-switcher foreground surface, with a bounded failsafe.
+                self._task_view_hotkey_grace_until = now + 90.0
+            self._task_view_checked_at = -100.0
+        if escape and not self._task_view_escape_was_down:
+            self._task_view_hotkey_grace_until = 0.0
+            self._task_view_checked_at = -100.0
+        self._task_view_chord_was_down = chord
+        self._task_view_escape_was_down = escape
+
+    def _windows_task_view_active(self, now=None):
+        """Native cursor mode for Win+Tab, including untitled Win11 XAML hosts.
+
+        Strong detection: a visible, uncloaked Task View shell HWND. Fallback:
+        the actual Win+Tab chord, held briefly through XAML start-up and while
+        the foreground is still shell-owned. Never mistake taskbar thumbnail
+        popups, Start or ordinary Explorer windows for Task View.
+        """
+        if not sys.platform.startswith('win') or self.desktop_mode != 'os':
             return False
         now = time.monotonic() if now is None else float(now)
-        if now - getattr(self, "_task_view_checked_at", -100.0) < 0.12:
-            return bool(getattr(self, "_task_view_visible_cached", False))
+        if now - self._task_view_checked_at < 0.10:
+            return bool(self._task_view_visible_cached)
         self._task_view_checked_at = now
-        visible = False
+        native_view = False
+        foreground_is_app = False
+        foreground_is_exit_surface = False
+        foreground_process = ''
         try:
-            user32 = ctypes.windll.user32
-            user32.GetAsyncKeyState.argtypes = (ctypes.c_int,)
-            user32.GetAsyncKeyState.restype = ctypes.c_short
-            user32.IsWindowVisible.argtypes = (wintypes.HWND,)
-            user32.IsWindowVisible.restype = wintypes.BOOL
-            # Include the chord's opening animation. Detection continues from
-            # the shell window itself after the user releases Win + Tab.
-            key_down = lambda key: bool(user32.GetAsyncKeyState(key) & 0x8000)
-            visible = (key_down(0x09) and (key_down(0x5B) or key_down(0x5C)))
-            if not visible:
-                # Task View hosts can remain allocated but DWM-cloaked when
-                # Win+Tab is closed. Do not keep mouse mode enabled for these.
-                dwm = None
-                try:
-                    dwm = ctypes.windll.dwmapi.DwmGetWindowAttribute
-                    dwm.argtypes = [wintypes.HWND, wintypes.DWORD,
-                                    ctypes.c_void_p, wintypes.DWORD]
-                    dwm.restype = ctypes.c_long
-                except (OSError, AttributeError):
-                    pass
-                get_class = user32.GetClassNameW
-                get_class.argtypes = (wintypes.HWND, ctypes.c_wchar_p, ctypes.c_int)
-                get_title = user32.GetWindowTextW
-                get_title.argtypes = (wintypes.HWND, ctypes.c_wchar_p, ctypes.c_int)
-                callback_type = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
-                @callback_type
-                def check_window(hwnd, _arg):
-                    nonlocal visible
-                    if not user32.IsWindowVisible(hwnd):
-                        return True
-                    if dwm is not None:
-                        cloaked = wintypes.DWORD(0)
-                        if (dwm(hwnd, 14, ctypes.byref(cloaked),
-                                ctypes.sizeof(cloaked)) == 0 and cloaked.value):
-                            return True
-                    klass = ctypes.create_unicode_buffer(160)
-                    get_class(hwnd, klass, len(klass))
-                    # Most windows do not belong to the shell; only query their
-                    # titles when the class has a plausible task-switcher host.
-                    if klass.value.casefold() not in (
-                        'multitaskingviewframe', 'taskswitcherwnd',
-                        'windows.ui.core.corewindow', 'xamlexplorerhostislandwindow',
-                        'applicationframewindow',
-                        'windows.ui.composition.desktopwindowcontentbridge'):
-                        return True
-                    title = ctypes.create_unicode_buffer(160)
-                    get_title(hwnd, title, len(title))
-                    if _windows_task_view_window_identity(klass.value, title.value):
-                        visible = True
-                        return False
+            user = ctypes.windll.user32
+            user.IsWindowVisible.argtypes = (wintypes.HWND,)
+            user.IsWindowVisible.restype = wintypes.BOOL
+            user.GetClassNameW.argtypes = (wintypes.HWND, ctypes.c_wchar_p, ctypes.c_int)
+            user.GetClassNameW.restype = ctypes.c_int
+            user.GetWindowTextW.argtypes = (wintypes.HWND, ctypes.c_wchar_p, ctypes.c_int)
+            user.GetWindowTextW.restype = ctypes.c_int
+            user.GetForegroundWindow.restype = wintypes.HWND
+            user.GetAncestor.argtypes = (wintypes.HWND, ctypes.c_uint)
+            user.GetAncestor.restype = wintypes.HWND
+            foreground = user.GetForegroundWindow()
+            root = user.GetAncestor(foreground, 2) if foreground else None
+            foreground = root or foreground
+            view_classes = ('multitaskingviewframe', 'taskswitcherwnd',
+                            'xamlexplorerhostislandwindow',
+                            'windows.ui.core.corewindow',
+                            'windows.ui.composition.desktopwindowcontentbridge')
+            def matches(hwnd):
+                if not hwnd or not user.IsWindowVisible(hwnd):
+                    return False
+                cls_buf = ctypes.create_unicode_buffer(160)
+                text_buf = ctypes.create_unicode_buffer(160)
+                user.GetClassNameW(hwnd, cls_buf, len(cls_buf))
+                cls = cls_buf.value.casefold()
+                if cls in ('multitaskingviewframe', 'taskswitcherwnd'):
                     return True
-                user32.EnumWindows.argtypes = (callback_type, wintypes.LPARAM)
-                user32.EnumWindows.restype = wintypes.BOOL
-                user32.EnumWindows(check_window, 0)
+                if cls not in view_classes:
+                    return False
+                user.GetWindowTextW(hwnd, text_buf, len(text_buf))
+                if 'task view' not in text_buf.value.casefold():
+                    return False
+                return _windows_process_name(hwnd) in ('explorer.exe',
+                       'shellexperiencehost.exe')
+            if foreground and matches(foreground):
+                native_view = True
+            elif foreground and user.IsWindowVisible(foreground):
+                foreground_process = _windows_process_name(foreground)
+                cls_buf = ctypes.create_unicode_buffer(160)
+                user.GetClassNameW(foreground, cls_buf, len(cls_buf))
+                cls = cls_buf.value.casefold()
+                foreground_is_app = (foreground_process not in (
+                    'explorer.exe', 'shellexperiencehost.exe', 'searchhost.exe',
+                    'startmenuexperiencehost.exe', '') and
+                    cls not in ('qt5152qwindowicon', 'qt6qwindowicon'))
+                # Task View can close back to the desktop, the taskbar or an
+                # ordinary Explorer folder without changing the *process*.
+                # Those are distinct from its immersive XAML host.
+                foreground_is_exit_surface = (foreground_process == 'explorer.exe' and
+                    cls in ('progman', 'workerw', 'shell_traywnd',
+                            'shell_secondarytraywnd', 'cabinetwclass', 'explorewclass'))
+                # Win11 sometimes uses a titleless Explorer-owned XAML island
+                # for Task View. Only trust this ambiguous signature AFTER an
+                # observed Win+Tab chord; otherwise it could be an app preview.
+                if (self._task_view_hotkey_grace_until > now and
+                        foreground_process in ('explorer.exe', 'shellexperiencehost.exe') and
+                        cls in view_classes):
+                    native_view = True
+            if not native_view and (self._task_view_hotkey_grace_until > now or
+                                    self._task_view_visible_cached or
+                                    foreground_process in ('explorer.exe',
+                                                           'shellexperiencehost.exe')):
+                # Search for an actual visible task-switcher HWND. DWM-cloaked
+                # survivors must be ignored, or mouse mode remains stuck on.
+                dwm = getattr(ctypes.windll, 'dwmapi', None)
+                get_dwm = getattr(dwm, 'DwmGetWindowAttribute', None)
+                if get_dwm is not None:
+                    get_dwm.argtypes = (wintypes.HWND, wintypes.DWORD,
+                                        ctypes.c_void_p, wintypes.DWORD)
+                    get_dwm.restype = ctypes.c_long
+                callback_type = ctypes.WINFUNCTYPE(wintypes.BOOL,
+                                                   wintypes.HWND, wintypes.LPARAM)
+                @callback_type
+                def inspect(hwnd, _arg):
+                    nonlocal native_view
+                    if not matches(hwnd):
+                        return True
+                    if get_dwm is not None:
+                        cloaked = wintypes.DWORD(0)
+                        if (get_dwm(hwnd, 14, ctypes.byref(cloaked),
+                                    ctypes.sizeof(cloaked)) == 0 and cloaked.value):
+                            return True
+                    native_view = True
+                    return False
+                user.EnumWindows.argtypes = (callback_type, wintypes.LPARAM)
+                user.EnumWindows.restype = wintypes.BOOL
+                user.EnumWindows(inspect, 0)
         except (OSError, AttributeError, ValueError, TypeError):
             pass
-        if not visible:
-            # On current Windows 11 builds Task View's XAML host often has no
-            # window title, so EnumWindows' class+title test above misses it.
-            # Use the *foreground* shell-host process and screen coverage instead.
-            # Regular Explorer folders, the taskbar, and compact previews cannot
-            # satisfy both constraints.
-            try:
-                foreground = user32.GetForegroundWindow
-                foreground.restype = wintypes.HWND
-                hwnd = foreground()
-                if hwnd and user32.IsWindowVisible(hwnd):
-                    cls_buf = ctypes.create_unicode_buffer(160)
-                    user32.GetClassNameW(hwnd, cls_buf, len(cls_buf))
-                    cls = cls_buf.value.casefold()
-                    if cls in ('multitaskingviewframe', 'taskswitcherwnd'):
-                        visible = True
-                    elif cls in ('xamlexplorerhostislandwindow',
-                                 'windows.ui.core.corewindow',
-                                 'windows.ui.composition.desktopwindowcontentbridge'):
-                        host = _windows_process_name(hwnd)
-                        rect = wintypes.RECT()
-                        user32.GetWindowRect.argtypes = (
-                            wintypes.HWND, ctypes.POINTER(wintypes.RECT))
-                        user32.GetWindowRect.restype = wintypes.BOOL
-                        if user32.GetWindowRect(hwnd, ctypes.byref(rect)):
-                            w, h = rect.right-rect.left, rect.bottom-rect.top
-                            screen = QApplication.primaryScreen()
-                            sw = screen.geometry().width() if screen is not None else 1280
-                            sh = screen.geometry().height() if screen is not None else 720
-                            visible = (host in ('explorer.exe', 'shellexperiencehost.exe') and
-                                       w >= 0.65*sw and h >= 0.65*sh)
-            except (OSError, AttributeError, TypeError, ValueError):
-                pass
+
+        if native_view:
+            self._task_view_hotkey_last_seen = now
+        # Don't stop following the hand merely because Win11's animation has
+        # temporarily hidden its window title or foreground owner.
+        hotkey_grace = (now < self._task_view_hotkey_grace_until and
+                        (now - self._task_view_hotkey_opened_at < 1.0 or
+                         not (foreground_is_app or foreground_is_exit_surface)))
+        visible = native_view or hotkey_grace
+        if ((foreground_is_app or foreground_is_exit_surface) and
+                now - self._task_view_hotkey_opened_at >= 1.0):
+            self._task_view_hotkey_grace_until = 0.0
+            # The old shell HWND can stay visible during its exit animation.
+            # If a regular application has focus, Task View is no longer interactive.
+            visible = False
         self._task_view_visible_cached = bool(visible)
         return bool(visible)
 
@@ -10699,6 +11080,11 @@ class SpatialDesktop(QWidget):
         though their context menu accepts a right mouse click. A single pinch
         on the taskbar is a normal mouse left-click, never both input types.
         """
+        # A release from a pinch on the overlay must not become an OS tap,
+        # even when it reached this helper through an old pending touch.
+        local = self.mapFromGlobal(QPoint(int(global_point[0]), int(global_point[1])))
+        if self._floating_clipboard_contains(QPointF(local)):
+            return False
         if (sys.platform.startswith('win') and
                 self._windows_task_view_active(now)):
             use_mouse = True
@@ -10775,6 +11161,8 @@ class SpatialDesktop(QWidget):
 
     def _begin_pinch_drag(self, side, cursor, now):
         """Begin a native drag, with a small forgiving capture zone for resize borders."""
+        if self._floating_clipboard_contains(cursor):
+            return False  # Never issue mouseDown to content under the clipboard.
         if self._gesture_ui_modal_open():
             return False
         if self.mouse_detached_by_side.get(side, False):
@@ -16128,7 +16516,14 @@ try {
             # Task View temporarily reattaches the mouse *regardless* of normal
             # touch mode or peace-sign detach. That preference is not modified.
             if position is not None:
-                self._set_os_pointer_global(position)
+                physical = _windows_touch_screen_pixels((position.x(), position.y()))
+                try:
+                    user = ctypes.windll.user32
+                    user.SetCursorPos.argtypes = (ctypes.c_int, ctypes.c_int)
+                    user.SetCursorPos.restype = wintypes.BOOL
+                    user.SetCursorPos(*physical)
+                except (OSError, AttributeError, ValueError, TypeError):
+                    self._set_os_pointer_global(position)
                 self._task_view_native_position = (int(position.x()), int(position.y()))
         pinched = bool(poses.get(side, {}).get('pinch', False))
         if self._task_view_wait_release:
@@ -16158,6 +16553,18 @@ try {
         for two simultaneous pinches. Quick tap releases inject DOWN + UP and
         consume the release, preventing a duplicate native mouse click.
         """
+        # The floating clipboard lives in a mouse-transparent drawing layer,
+        # so native touch would go straight through it into the app behind.
+        # Give its gesture handler *first refusal* over every point in the card,
+        # and keep that ownership after a drag leaves the card rectangle.
+        if getattr(self, "floating_clipboard_visible", False) and (
+                any(self._floating_clipboard_contains(p) for p in cursor_points.values()) or
+                any(self.floating_clipboard_drag_state.values())):
+            injector = getattr(self, "_native_touch", None)
+            if (self._touch_pending or self._touch_drag_sides or
+                    (injector is not None and injector.active)):
+                self._end_two_hand_touch()
+            return False
         injector = getattr(self, "_native_touch", None)
         if injector is None or injector.unavailable:
             # On Linux don't silently turn a failed touchscreen into hand-driven
@@ -16825,10 +17232,26 @@ try {
             self._stop_inactive_timer_during_sounds()
             return
 
-        self._process_custom_gestures(hands_by_side, cursor_points, poses, now)
+        clipboard_interacting = bool(self.floating_clipboard_visible and (
+            any(self._floating_clipboard_contains(p) for p in cursor_points.values()) or
+            any(self.floating_clipboard_drag_state.values())))
+        if not clipboard_interacting:
+            self._process_custom_gestures(hands_by_side, cursor_points, poses, now)
 
-        modifier_was_active = self.left_click_modifier_active
-        modifier_active = self._update_left_click_modifier(poses, now)
+        if clipboard_interacting:
+            # A left fist manipulating the floating clipboard is a grab,
+            # NOT the left-hand right-click modifier. Without this override
+            # the modifier arms after two camera frames, steals gesture
+            # ownership and can reset the other hand's clipboard press.
+            self.left_click_modifier_active = False
+            self.left_modifier_fist_frames = 0
+            self.left_modifier_open_frames = 0
+            self.left_modifier_last_fist_at = None
+            self.left_modifier_release_candidate_since = None
+            modifier_was_active = modifier_active = False
+        else:
+            modifier_was_active = self.left_click_modifier_active
+            modifier_active = self._update_left_click_modifier(poses, now)
         if modifier_active and not modifier_was_active:
             # Entering modifier mode cancels any half-started menu timer or long action.
             self._suppress_hand_for_modifier("left")
@@ -17161,35 +17584,59 @@ try {
                         self.gesture_owner = None
                 else:
                     continue
-            elif (self.floating_clipboard_visible and (is_fist or is_pinch) and
-                  self.active_action.get(side) is None and not self.pinch_drag_active.get(side, False) and
-                  not self.fist_action_menu_open.get(side, False) and
-                  not self.action_stop_wait_open.get(side, False) and
-                  self.fist_started_at.get(side) is None and self.menu_pinch_started.get(side) is None and
-                  not self.left_click_modifier_active and self.gesture_owner in (None, side)):
-                hit = self._floating_clipboard_hit_test(cursor)
-                if hit is not None:
-                    can_drag = bool(self.desktop_mode == "os" and pyautogui is not None and
-                                    not self.mouse_detached_by_side.get(side, False))
-                    selected_entry = hit.get("entry")
-                    preview_pixmap = self._clipboard_drag_pixmap(selected_entry) if selected_entry is not None else None
-                    panel_layout = self._floating_clipboard_layout() if (
-                        hit.get("type") == "control" and hit.get("name") == "header") else None
-                    panel_start = QPointF(panel_layout["panel"].topLeft()) if panel_layout is not None else None
-                    state = {"id": uuid.uuid4().hex, "type": hit["type"],
-                             "entry_id": (selected_entry.get("id") if selected_entry is not None
-                                          else hit.get("entry_id")),
-                             "control": hit.get("name"), "start": QPointF(cursor),
-                             "panel_start": panel_start,
-                             "last_cursor": QPointF(cursor), "started_at": now,
-                             "last_held_at": now, "release_candidate_since": None,
-                             "preview_pixmap": preview_pixmap, "running": False, "moved": False,
-                             "can_drag": can_drag, "release_sent": False}
-                    self.floating_clipboard_drag_state[side] = state
-                    self.gesture_owner = side
-                    self.canvas_active_side = side
-                    self.active_push_sides.add(side)
-                    continue
+            elif self.floating_clipboard_visible and self._floating_clipboard_contains(cursor):
+                # This panel is an application-owned gesture surface, regardless
+                # of whether an unrelated fist/menu/pinch timer was armed first.
+                # Never let a new pinch/fist fall through to native OS input.
+                if is_fist or is_pinch:
+                    # Preserve the release requirement after a previous drag;
+                    # holding the original pinch must not start a second drag.
+                    if self.action_stop_wait_open.get(side, False):
+                        continue
+                    if any(self.floating_clipboard_drag_state.get(other) is not None
+                           for other in ("left", "right") if other != side):
+                        continue
+                    self._end_pinch_drag(side, status=False)
+                    self._clear_menu_pinch_sequence(side)
+                    if self.fist_started_at.get(side) is not None:
+                        self._reset_fist_gesture(side)
+                    self.fist_action_menu_open[side] = False
+                    self.active_action[side] = None
+                    hit = self._floating_clipboard_hit_test(cursor)
+                    if hit is not None:
+                        can_drag = bool(self.desktop_mode == "os" and pyautogui is not None and
+                                        not self.mouse_detached_by_side.get(side, False))
+                        selected_entry = hit.get("entry")
+                        preview_pixmap = (self._clipboard_drag_pixmap(selected_entry)
+                                          if selected_entry is not None else None)
+                        panel_layout = self._floating_clipboard_layout() if (
+                            hit.get("type") == "control" and hit.get("name") == "header") else None
+                        panel_start = (QPointF(panel_layout["panel"].topLeft())
+                                       if panel_layout is not None else None)
+                        self.floating_clipboard_drag_state[side] = {
+                            "id": uuid.uuid4().hex, "type": hit["type"],
+                            "entry_id": (selected_entry.get("id") if selected_entry is not None
+                                         else hit.get("entry_id")),
+                            "control": hit.get("name"), "start": QPointF(cursor),
+                            "panel_start": panel_start, "last_cursor": QPointF(cursor),
+                            "started_at": now, "last_held_at": now,
+                            "release_candidate_since": None,
+                            "preview_pixmap": preview_pixmap, "running": False,
+                            "moved": False, "can_drag": can_drag, "release_sent": False,
+                        }
+                        self.gesture_owner = side
+                        self.canvas_active_side = side
+                        self.active_push_sides.add(side)
+                else:
+                    # Clear the post-drag release gate while hovering the panel;
+                    # don't make the user move off the clipboard to re-grab it.
+                    if self.action_stop_wait_open.get(side, False) and is_open:
+                        if self.action_stop_open_since[side] is None:
+                            self.action_stop_open_since[side] = now
+                        elif now-self.action_stop_open_since[side] >= 0.14:
+                            self.action_stop_wait_open[side] = False
+                            self.action_stop_open_since[side] = None
+                continue
 
             # When the Virtual Pen is selected, thumb/index pinch is drawing input on
             # the virtual canvas, not a native click or Pinch Menu hold. Dock/palette
@@ -18118,6 +18565,9 @@ try {
         self.voice_lasso_start = None
         self.focus_dictation_enabled = False
         self.focus_dictation_committed_words = []
+        task_view_timer = getattr(self, "_task_view_key_timer", None)
+        if task_view_timer is not None:
+            task_view_timer.stop()
         if getattr(self, "search_hand_overlay", None) is not None:
             self.search_hand_overlay.sync_timer.stop()
             self.search_hand_overlay.hide()
@@ -18160,6 +18610,8 @@ try {
             if origin is not None:
                 ball["tutorial_travel"] = max(ball.get("tutorial_travel", 0.0),
                     math.hypot((x-origin[0])*width, (y-origin[1])*height))
+                if (self._onboarding_stage() or (None,))[0] == "ball":
+                    self._onboarding_practice_progress = min(1.0, ball["tutorial_travel"] / max(60.,height*.12))
             ball["last_drag_at"] = now
             self.update()
         event.accept()
