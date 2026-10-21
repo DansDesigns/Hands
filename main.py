@@ -604,29 +604,490 @@ def _mac_accessible_text_at(x, y):
         return False
 
 
-def _pinch_origin_over_text(point):
-    """Probe the origin and a tiny adjacent area, once when drag intention appears."""
+# Keep the text-selection capture zone measured in *displayed* TPI pixels.
+# Probes are restricted to a 20px radius; outside it a pinch-drag pans/scrolls.
+TEXT_SELECTION_SNAP_RADIUS = 20
+
+
+def _distance_to_screen_rect(px, py, rect):
+    """Squared distance from a point to a visible native-pixel text rectangle."""
+    left, top, right, bottom = rect
+    dx = max(left-px, 0.0, px-right)
+    dy = max(top-py, 0.0, py-bottom)
+    return dx*dx + dy*dy
+
+
+def _windows_text_anchor_from_rectangles(point, rectangles):
+    """Choose a selectable point at most 20 *logical* pixels from the TPI.
+
+    Windows UI Automation returns physical screen pixels. Translate through
+    the same monitor geometry used by native touch injection, not Qt's often
+    rounded devicePixelRatio (especially near the taskbar).
+    """
+    if not rectangles:
+        return None
+    x, y = float(point[0]), float(point[1])
+    px, py = _windows_touch_screen_pixels((x, y))
+    rx, _ = _windows_touch_screen_pixels((x + TEXT_SELECTION_SNAP_RADIUS, y))
+    _, ry = _windows_touch_screen_pixels((x, y + TEXT_SELECTION_SNAP_RADIUS))
+    radius_x = max(1.0, abs(rx-px))
+    radius_y = max(1.0, abs(ry-py))
+    match = None
+    for left, top, right, bottom in rectangles:
+        if not all(math.isfinite(v) for v in (left, top, right, bottom)):
+            continue
+        if right <= left or bottom <= top:
+            continue
+        dx = max(left-px, 0.0, px-right) / radius_x
+        dy = max(top-py, 0.0, py-bottom) / radius_y
+        distance = dx*dx + dy*dy
+        if distance <= 1.0 and (match is None or distance < match[0]):
+            # Click within the text bounds, not just at the closest *edge*.
+            sx = min(max(px, left+min(2.0, (right-left)*0.35)), right-0.5)
+            sy = min(max(py, top+min(2.0, (bottom-top)*0.35)), bottom-0.5)
+            match = (distance, sx, sy)
+    if match is None:
+        return None
+    _, tx, ty = match
+    try:
+        screen = QApplication.screenAt(QPoint(round(x), round(y)))
+        if screen is not None:
+            rect = screen.geometry()
+            monitors = _windows_monitor_rectangles()
+            device = str(screen.name() or '').casefold()
+            bounds = next((bounds for name, bounds, _ in monitors if name == device), None)
+            if bounds is None and len(monitors) == 1 and len(QApplication.screens()) == 1:
+                bounds = monitors[0][1]
+            if bounds is None and screen == QApplication.primaryScreen():
+                bounds = next((b for _, b, primary in monitors if primary), None)
+            if bounds is not None:
+                l, t, r, b = bounds
+                return (round(rect.x()+(tx-l)*rect.width()/max(1.0, r-l)),
+                        round(rect.y()+(ty-t)*rect.height()/max(1.0, b-t)))
+            ratio = max(0.1, float(screen.devicePixelRatio()))
+            return (round(rect.x()+(tx-rect.x())/ratio),
+                    round(rect.y()+(ty-rect.y())/ratio))
+    except (OSError, ValueError, AttributeError, RuntimeError, TypeError):
+        pass
+    return (round(x), round(y))
+
+
+def _windows_uia_text_rectangles_at(x, y):
+    """Read a real text character's screen bounds using native Windows UIA.
+
+    Chromium browsers (including Brave) expose page text through TextPattern,
+    while their MSAA hit-test often reports only a document or web container.
+    UIA's RangeFromPoint *snaps to nearby text*, so its character bounds MUST
+    be checked before we decide whether to turn touch panning into selection.
+    This is deliberately called only when a pinch becomes a drag. No packages,
+    browser extensions, or global text scanning are needed.
+    """
+    if not sys.platform.startswith('win'):
+        return []
+    class _GUID(ctypes.Structure):
+        _fields_ = [('a', ctypes.c_uint32), ('b', ctypes.c_uint16),
+                    ('c', ctypes.c_uint16), ('d', ctypes.c_ubyte*8)]
+        @classmethod
+        def from_string(cls, value):
+            raw = uuid.UUID(value).bytes_le
+            return cls.from_buffer_copy(raw)
+
+    # COM IUnknown vtable calls, with explicit 32-bit HRESULT on all ABIs.
+    def invoke(pointer, index, argtypes, *args):
+        vtable = ctypes.cast(pointer, ctypes.POINTER(
+            ctypes.POINTER(ctypes.c_void_p))).contents
+        method = ctypes.WINFUNCTYPE(ctypes.c_int32, ctypes.c_void_p, *argtypes)(vtable[index])
+        return method(pointer, *args)
+
+    def release(pointer):
+        if pointer and pointer.value:
+            try:
+                invoke(pointer, 2, ())
+            except (OSError, ValueError, TypeError):
+                pass
+
+    ole32 = None
+    coinited = False
+    automation = ctypes.c_void_p()
+    walker = ctypes.c_void_p()
+    element = ctypes.c_void_p()
+    rectangles = []
+    try:
+        ole32 = ctypes.OleDLL('ole32')
+        init = ole32.CoInitializeEx
+        init.argtypes = (ctypes.c_void_p, ctypes.c_uint32)
+        init.restype = ctypes.c_int32
+        hr = init(None, 2)  # COM STA, as used by Qt's GUI thread
+        coinited = hr in (0, 1)
+        if hr not in (0, 1, -2147417850):  # RPC_E_CHANGED_MODE
+            return []
+        create = ole32.CoCreateInstance
+        create.argtypes = (ctypes.POINTER(_GUID), ctypes.c_void_p, ctypes.c_uint32,
+                           ctypes.POINTER(_GUID), ctypes.POINTER(ctypes.c_void_p))
+        create.restype = ctypes.c_int32
+        clsid = _GUID.from_string('ff48dba4-60ef-4201-aa87-54103eef594e')
+        iid = _GUID.from_string('30cbe57d-d9d0-452a-ab13-7ac5ac4825ee')
+        if create(ctypes.byref(clsid), None, 1, ctypes.byref(iid),
+                  ctypes.byref(automation)) != 0 or not automation.value:
+            return []
+        # IUIAutomation.ElementFromPoint = slot 7. This is a *physical* point.
+        if invoke(automation, 7, (wintypes.POINT, ctypes.POINTER(ctypes.c_void_p)),
+                  wintypes.POINT(int(x), int(y)), ctypes.byref(element)) != 0:
+            return []
+        if not element.value:
+            return []
+        # A web page's text leaf usually does not implement TextPattern itself;
+        # the containing document does. Walk towards the provider's document.
+        invoke(automation, 16, (ctypes.POINTER(ctypes.c_void_p),), ctypes.byref(walker))
+        for _ in range(9):
+            unknown = ctypes.c_void_p()
+            pattern = ctypes.c_void_p()
+            try:
+                # GetCurrentPattern returns an IUnknown, not a guaranteed
+                # IUIAutomationTextPattern vtable. Query the exact interface
+                # before calling RangeFromPoint (critical with COM proxies).
+                if invoke(element, 16, (ctypes.c_int32, ctypes.POINTER(ctypes.c_void_p)),
+                          10014, ctypes.byref(unknown)) == 0 and unknown.value:
+                    text_iid = _GUID.from_string('32eba289-3583-42c9-9c59-3b6d9a1e9b6a')
+                    if invoke(unknown, 0, (ctypes.POINTER(_GUID),
+                                           ctypes.POINTER(ctypes.c_void_p)),
+                              ctypes.byref(text_iid), ctypes.byref(pattern)) != 0:
+                        pattern = ctypes.c_void_p()
+                if pattern.value:
+                    # IUIAutomationTextPattern.RangeFromPoint is slot 3, NOT 8.
+                    # Slot 8 has a different ABI; calling it as RangeFromPoint
+                    # can silently fail or crash on Chromium's UIA provider.
+                    text_range = ctypes.c_void_p()
+                    try:
+                        if invoke(pattern, 3, (wintypes.POINT, ctypes.POINTER(ctypes.c_void_p)),
+                                  wintypes.POINT(int(x), int(y)),
+                                  ctypes.byref(text_range)) == 0 and text_range.value:
+                            # RangeFromPoint is a zero-width caret. Expand by one
+                            # character, then request the real on-screen bounds.
+                            if invoke(text_range, 6, (ctypes.c_int32,), 0) == 0:
+                                array = ctypes.c_void_p()
+                                if invoke(text_range, 10, (ctypes.POINTER(ctypes.c_void_p),),
+                                          ctypes.byref(array)) == 0 and array.value:
+                                    oleaut32 = ctypes.OleDLL('oleaut32')
+                                    get_lower = oleaut32.SafeArrayGetLBound
+                                    get_upper = oleaut32.SafeArrayGetUBound
+                                    access = oleaut32.SafeArrayAccessData
+                                    unaccess = oleaut32.SafeArrayUnaccessData
+                                    destroy = oleaut32.SafeArrayDestroy
+                                    get_lower.argtypes = get_upper.argtypes = (
+                                        ctypes.c_void_p, ctypes.c_uint32,
+                                        ctypes.POINTER(ctypes.c_int32))
+                                    access.argtypes = (ctypes.c_void_p,
+                                                       ctypes.POINTER(ctypes.c_void_p))
+                                    unaccess.argtypes = destroy.argtypes = (ctypes.c_void_p,)
+                                    lower = ctypes.c_int32()
+                                    upper = ctypes.c_int32()
+                                    data = ctypes.c_void_p()
+                                    try:
+                                        if (get_lower(array, 1, ctypes.byref(lower)) == 0 and
+                                                get_upper(array, 1, ctypes.byref(upper)) == 0 and
+                                                4 <= upper.value-lower.value+1 <= 400 and
+                                                access(array, ctypes.byref(data)) == 0):
+                                            try:
+                                                numbers = ctypes.cast(data, ctypes.POINTER(ctypes.c_double))
+                                                n = (upper.value-lower.value+1)//4
+                                                rectangles = [(numbers[i*4], numbers[i*4+1],
+                                                               numbers[i*4]+numbers[i*4+2],
+                                                               numbers[i*4+1]+numbers[i*4+3])
+                                                              for i in range(n)]
+                                            finally:
+                                                unaccess(array)
+                                    finally:
+                                        destroy(array)
+                    finally:
+                        release(text_range)
+                if rectangles:
+                    return rectangles
+            finally:
+                release(pattern)
+                release(unknown)  # GetCurrentPattern returns an owned IUnknown.
+            if not walker.value:
+                break
+            parent = ctypes.c_void_p()
+            # IUIAutomationTreeWalker.GetParentElement = slot 3.
+            if invoke(walker, 3, (ctypes.c_void_p, ctypes.POINTER(ctypes.c_void_p)),
+                      element, ctypes.byref(parent)) != 0 or not parent.value:
+                break
+            release(element)
+            element = parent
+    except (OSError, ValueError, TypeError, AttributeError, OverflowError):
+        return []
+    finally:
+        release(element)
+        release(walker)
+        release(automation)
+        if coinited and ole32 is not None:
+            ole32.CoUninitialize()
+    return rectangles
+
+
+def _pinch_text_anchor(point):
+    """Nearest actual text within 20 logical pixels of the pinch origin.
+
+    UI Automation makes this work for Brave and other Chromium pages: their
+    text is often exposed through a parent document's TextPattern rather than
+    as the legacy MSAA 'text' role. This check happens only once per drag.
+    """
     x, y = int(round(point[0])), int(round(point[1]))
     if sys.platform.startswith('win'):
+        px, py = _windows_touch_screen_pixels((x, y))
+        # A native editor/MSAA leaf is cheap to detect. Avoid slower UIA
+        # document-provider traversals when the exact origin is already text.
+        if _windows_native_editor_at(px, py) or _windows_accessible_text_at(px, py):
+            return x, y
+        anchor = _windows_text_anchor_from_rectangles(
+            (x, y), _windows_uia_text_rectangles_at(px, py))
+        if anchor is not None:
+            return anchor
         def probe(a, b):
-            # Win32 accessibility queries also expect native pixels, unlike
-            # the already-calibrated and visually drawn Qt TPI point.
-            physical_x, physical_y = _windows_touch_screen_pixels((a, b))
-            return (_windows_accessible_text_at(physical_x, physical_y) or
-                    _windows_native_editor_at(physical_x, physical_y))
+            px, py = _windows_touch_screen_pixels((a, b))
+            return (_windows_accessible_text_at(px, py) or
+                    _windows_native_editor_at(px, py))
     elif sys.platform.startswith('linux'):
         probe = _linux_accessible_text_at
     elif sys.platform == 'darwin':
         probe = _mac_accessible_text_at
     else:
-        return False
-    # Near-text tolerance is less than the default 30-pixel TPI diameter.
-    offsets = ((0, 0), (0, -12), (0, 12), (-12, 0), (12, 0))
-    # Cross-process AT-SPI calls cost more than Win32 role queries: probe the
-    # centre and the closest two text-line offsets, not five full tree walks.
+        return None
+    # Conservative legacy fallback for apps without UIA TextPattern support.
+    offsets = ((0, -10), (0, 10), (-10, 0), (10, 0),
+               (-14, -14), (14, -14), (-14, 14), (14, 14),
+               (0, -20), (0, 20), (-20, 0), (20, 0))
     if sys.platform.startswith('linux'):
-        offsets = offsets[:3]
-    return any(probe(x+dx, y+dy) for dx, dy in offsets)
+        offsets = offsets[:4] + offsets[8:]
+    for dx, dy in offsets:
+        if probe(x + dx, y + dy):
+            return (x + dx, y + dy)
+    return None
+
+
+def _pinch_origin_over_text(point):
+    """Compatibility predicate for native text, with the strict 20px limit."""
+    return _pinch_text_anchor(point) is not None
+
+
+def _windows_process_name(hwnd):
+    """Return a process basename for one HWND without depending on window titles.
+
+    Only used for OS shell input detection, not hand-frame rendering.
+    """
+    if not sys.platform.startswith('win') or not hwnd:
+        return ''
+    try:
+        user = ctypes.windll.user32
+        kernel = ctypes.windll.kernel32
+        get_pid = user.GetWindowThreadProcessId
+        get_pid.argtypes = (wintypes.HWND, ctypes.POINTER(wintypes.DWORD))
+        get_pid.restype = wintypes.DWORD
+        pid = wintypes.DWORD()
+        if not get_pid(wintypes.HWND(int(hwnd)), ctypes.byref(pid)) or not pid.value:
+            return ''
+        kernel.OpenProcess.argtypes = (wintypes.DWORD, wintypes.BOOL, wintypes.DWORD)
+        kernel.OpenProcess.restype = wintypes.HANDLE
+        kernel.QueryFullProcessImageNameW.argtypes = (
+            wintypes.HANDLE, wintypes.DWORD, ctypes.c_wchar_p, ctypes.POINTER(wintypes.DWORD))
+        kernel.QueryFullProcessImageNameW.restype = wintypes.BOOL
+        kernel.CloseHandle.argtypes = (wintypes.HANDLE,)
+        kernel.CloseHandle.restype = wintypes.BOOL
+        handle = kernel.OpenProcess(0x1000, False, pid.value)  # QUERY_LIMITED_INFORMATION
+        if not handle:
+            return ''
+        try:
+            buf = ctypes.create_unicode_buffer(1024)
+            size = wintypes.DWORD(len(buf))
+            if kernel.QueryFullProcessImageNameW(handle, 0, buf, ctypes.byref(size)):
+                return buf.value.rsplit('\\', 1)[-1].casefold()
+        finally:
+            kernel.CloseHandle(handle)
+    except (OSError, AttributeError, TypeError, ValueError):
+        pass
+    return ''
+
+
+def _windows_native_left_click(global_point):
+    """Click a Windows shell surface at native *physical* pixel coordinates.
+
+    The separate translucent Freehand HWND and PT_TOUCH contacts do not reliably
+    deliver clicks to Explorer's previews or Task Manager. SendInput is the
+    normal desktop input path, and reports a blocked click (e.g. elevated target).
+    """
+    if not sys.platform.startswith('win') or global_point is None:
+        return False
+    class MOUSEINPUT(ctypes.Structure):
+        _fields_ = [('dx', ctypes.c_int32), ('dy', ctypes.c_int32),
+                    ('mouseData', ctypes.c_uint32), ('dwFlags', ctypes.c_uint32),
+                    ('time', ctypes.c_uint32), ('dwExtraInfo', ctypes.c_size_t)]
+    class INPUT(ctypes.Structure):
+        _fields_ = [('type', ctypes.c_uint32), ('mi', MOUSEINPUT)]
+    try:
+        user = ctypes.WinDLL('user32', use_last_error=True)
+        px, py = _windows_touch_screen_pixels(global_point)
+        user.SetCursorPos.argtypes = (ctypes.c_int, ctypes.c_int)
+        user.SetCursorPos.restype = wintypes.BOOL
+        user.SendInput.argtypes = (wintypes.UINT, ctypes.POINTER(INPUT), ctypes.c_int)
+        user.SendInput.restype = wintypes.UINT
+        if not user.SetCursorPos(int(px), int(py)):
+            return False
+        events = (INPUT * 2)(INPUT(0, MOUSEINPUT(0, 0, 0, 0x0002, 0, 0)),
+                             INPUT(0, MOUSEINPUT(0, 0, 0, 0x0004, 0, 0)))
+        return user.SendInput(2, events, ctypes.sizeof(INPUT)) == 2
+    except (OSError, AttributeError, TypeError, ValueError):
+        return False
+
+
+def _windows_shell_preview_visible(now=None):
+    """Detect visible taskbar previews on Windows 10 and 11.
+
+    Win11 can put the thumbnail content in an Explorer XAML island rather than
+    exposing the older TaskListThumbnailWnd as a top-level window. Both class
+    and a preview-sized, on-screen rect are required; ordinary Explorer windows,
+    Task View, desktop surfaces, and context menus are explicitly excluded.
+    """
+    if not sys.platform.startswith('win'):
+        return False
+    now = time.monotonic() if now is None else float(now)
+    cached = getattr(_windows_shell_preview_visible, '_cached', None)
+    if cached and now-cached[0] < (0.065 if cached[1] else 0.20):
+        return cached[1]
+    found = False
+    try:
+        user = ctypes.windll.user32
+        user.IsWindowVisible.argtypes = (wintypes.HWND,)
+        user.IsWindowVisible.restype = wintypes.BOOL
+        user.GetClassNameW.argtypes = (wintypes.HWND, ctypes.c_wchar_p, ctypes.c_int)
+        user.GetClassNameW.restype = ctypes.c_int
+        user.GetWindowRect.argtypes = (wintypes.HWND, ctypes.POINTER(wintypes.RECT))
+        user.GetWindowRect.restype = wintypes.BOOL
+        user.GetSystemMetrics.argtypes = (ctypes.c_int,)
+        user.GetSystemMetrics.restype = ctypes.c_int
+        screen_w = max(1, user.GetSystemMetrics(0))
+        screen_h = max(1, user.GetSystemMetrics(1))
+        callback_type = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
+        @callback_type
+        def inspect(hwnd, _):
+            nonlocal found
+            if not user.IsWindowVisible(hwnd):
+                return True
+            buff = ctypes.create_unicode_buffer(128)
+            user.GetClassNameW(hwnd, buff, len(buff))
+            cls = buff.value.casefold()
+            classic = ('thumbnail' in cls or 'tasklist' in cls)
+            xaml = cls in ('xamlexplorerhostislandwindow',
+                           'windows.ui.composition.desktopwindowcontentbridge')
+            if not (classic or xaml):
+                return True
+            r = wintypes.RECT()
+            if not user.GetWindowRect(hwnd, ctypes.byref(r)):
+                return True
+            w, h = r.right-r.left, r.bottom-r.top
+            # Preview windows are smaller than the entire screen; both portrait
+            # and landscape grouped preview cards must be supported.
+            if not (75 <= w < screen_w*0.92 and 45 <= h < screen_h*0.88):
+                return True
+            if xaml:
+                # Do not interpret other app XAML popups as taskbar previews.
+                # Explorer-owned content islands adjacent to the taskbar qualify.
+                if _windows_process_name(hwnd) != 'explorer.exe':
+                    return True
+                if r.bottom < screen_h*0.40:
+                    return True
+            try:
+                dwm = ctypes.windll.dwmapi.DwmGetWindowAttribute
+                dwm.argtypes = (wintypes.HWND, wintypes.DWORD,
+                                ctypes.c_void_p, wintypes.DWORD)
+                dwm.restype = ctypes.c_long
+                cloaked = wintypes.DWORD()
+                if dwm(hwnd, 14, ctypes.byref(cloaked), ctypes.sizeof(cloaked)) == 0 and cloaked.value:
+                    return True
+            except (OSError, AttributeError):
+                pass
+            found = True
+            return False
+        user.EnumWindows.argtypes = (callback_type, wintypes.LPARAM)
+        user.EnumWindows.restype = wintypes.BOOL
+        user.EnumWindows(inspect, 0)
+    except (OSError, AttributeError, TypeError, ValueError):
+        pass
+    _windows_shell_preview_visible._cached = (now, found)
+    return found
+
+
+def _windows_window_uses_native_mouse(screen_point):
+    """Prefer a native mouse click for Task Manager and shell thumbnails.
+
+    Unlike ordinary applications, these surfaces can ignore a PT_TOUCH tap
+    routed through Freehand's fullscreen transparent HWND. Called only on a
+    *completed quick pinch*, never for every landmark or camera frame.
+    The argument is in global Qt logical coordinates.
+    """
+    if not sys.platform.startswith('win') or screen_point is None:
+        return False
+    try:
+        user = ctypes.windll.user32
+        point = wintypes.POINT(*_windows_touch_screen_pixels(screen_point))
+        user.WindowFromPoint.argtypes = (wintypes.POINT,)
+        user.WindowFromPoint.restype = wintypes.HWND
+        user.GetAncestor.argtypes = (wintypes.HWND, ctypes.c_uint)
+        user.GetAncestor.restype = wintypes.HWND
+        user.GetClassNameW.argtypes = (wintypes.HWND, ctypes.c_wchar_p, ctypes.c_int)
+        user.GetClassNameW.restype = ctypes.c_int
+        user.GetWindowTextW.argtypes = (wintypes.HWND, ctypes.c_wchar_p, ctypes.c_int)
+        user.GetWindowTextW.restype = ctypes.c_int
+        user.GetWindowRect.argtypes = (wintypes.HWND, ctypes.POINTER(wintypes.RECT))
+        user.GetWindowRect.restype = wintypes.BOOL
+        user.GetWindowThreadProcessId.argtypes = (wintypes.HWND, ctypes.POINTER(wintypes.DWORD))
+        user.GetWindowThreadProcessId.restype = wintypes.DWORD
+        user.GetForegroundWindow.restype = wintypes.HWND
+
+        def is_special(hwnd):
+            if not hwnd:
+                return False
+            root = user.GetAncestor(hwnd, 2) or hwnd
+            class_buffer = ctypes.create_unicode_buffer(160)
+            user.GetClassNameW(root, class_buffer, len(class_buffer))
+            classname = class_buffer.value.casefold()
+            if 'thumbnail' in classname or 'tasklist' in classname:
+                return True
+            title = ctypes.create_unicode_buffer(200)
+            user.GetWindowTextW(root, title, len(title))
+            if classname == 'taskmanagerwindow' or title.value.strip().casefold() == 'task manager':
+                return True
+            # Process identity survives Windows 11 Task Manager's XAML hosts,
+            # translated window titles and per-monitor DPI changes.
+            return _windows_process_name(root) == 'taskmgr.exe'
+
+        window = user.WindowFromPoint(point)
+        if is_special(window):
+            return True
+        foreground = user.GetForegroundWindow()
+        if foreground:
+            rect = wintypes.RECT()
+            # A transparent always-on-top Freehand visual layer may be returned
+            # by WindowFromPoint. Trust an actual foreground Task Manager window
+            # whose physical bounds include the target, even behind that layer.
+            if (user.GetWindowRect(foreground, ctypes.byref(rect))
+                    and rect.left <= point.x < rect.right
+                    and rect.top <= point.y < rect.bottom):
+                return is_special(foreground)
+    except (OSError, AttributeError, ValueError, TypeError):
+        pass
+    return False
+
+
+def _windows_task_view_window_identity(class_name, title):
+    """Conservative Win+Tab shell detection; don't match ordinary app windows."""
+    cls = str(class_name or '').casefold()
+    name = str(title or '').casefold().strip()
+    if cls in ('multitaskingviewframe', 'taskswitcherwnd'):
+        return True
+    return (cls in ('windows.ui.core.corewindow', 'xamlexplorerhostislandwindow',
+                    'applicationframewindow', 'windows.ui.composition.desktopwindowcontentbridge')
+            and any(term in name for term in ('task view', 'task switching')))
 
 
 def _windows_monitor_rectangles():
@@ -2712,7 +3173,15 @@ class SearchHandOverlay(QWidget):
         # above ordinary desktop windows; immersive Windows shell surfaces such as
         # Task View may still be in a higher system z-order band.
         raise_interval = (0.55 if search_visible else 0.25) if active_visuals else 0.85
-        native_menu_open = owner._native_context_menu_visual_guard(now)
+        native_menu_open = (owner._native_context_menu_visual_guard(now) or
+                            owner._windows_task_view_active(now))
+        # Explorer raises grouped-app preview thumbnails *after* Freehand. Keep
+        # only the transparent hand layer above them, without taking focus or
+        # moving the taskbar itself. Context menus / Task View keep priority.
+        preview_open = (sys.platform.startswith('win') and
+                        not native_menu_open and _windows_shell_preview_visible(now))
+        if preview_open:
+            raise_interval = min(raise_interval, 0.045)
         if not native_menu_open and now-self._last_raise > raise_interval:
             self.raise_()
             self._last_raise = now
@@ -2721,7 +3190,12 @@ class SearchHandOverlay(QWidget):
             try:
                 hwnd = int(self.winId())
                 user32 = ctypes.windll.user32
-                # HWND_TOPMOST, SWP_NOSIZE|SWP_NOMOVE|SWP_NOACTIVATE|SWP_SHOWWINDOW.
+                user32.SetWindowPos.argtypes = (wintypes.HWND, wintypes.HWND,
+                                                ctypes.c_int, ctypes.c_int,
+                                                ctypes.c_int, ctypes.c_int, wintypes.UINT)
+                user32.SetWindowPos.restype = wintypes.BOOL
+                # Reorder only the transparent hand layer, without taking focus
+                # or moving native thumbnail windows.
                 user32.SetWindowPos(wintypes.HWND(hwnd), wintypes.HWND(-1), 0, 0, 0, 0,
                                     0x0001 | 0x0002 | 0x0010 | 0x0040)
                 self._last_native_raise = now
@@ -3669,6 +4143,8 @@ class SpatialDesktop(QWidget):
         # keep the foreground and z-order until an actual user selection.
         self._native_context_menu_protect_until = 0.0
         self._native_context_menu_visual_guard_until = 0.0
+        self._task_view_checked_at = -100.0
+        self._task_view_visible_cached = False
         # Focused-field dictation writes stable Vosk words into the currently focused OS field.
         self.focus_dictation_enabled = False
         self.focus_dictation_paused = False
@@ -8816,6 +9292,13 @@ class SpatialDesktop(QWidget):
             return False
         try:
             user32 = ctypes.windll.user32
+            # Native HWNDs are pointer-sized. Without explicit signatures Python
+            # can truncate them to 32-bit values on x64, making taskbar discovery
+            # fail even though a right mouse click at the same point works.
+            user32.GetClassNameW.argtypes = (wintypes.HWND, ctypes.c_wchar_p, ctypes.c_int)
+            user32.GetClassNameW.restype = ctypes.c_int
+            user32.GetWindowRect.argtypes = (wintypes.HWND, ctypes.POINTER(wintypes.RECT))
+            user32.GetWindowRect.restype = wintypes.BOOL
             global_point = self._virtual_point_to_global(point)
             # Win32 shell window rectangles are physical pixels, while our TPI
             # uses Qt device-independent coordinates on scaled displays.
@@ -8836,6 +9319,8 @@ class SpatialDesktop(QWidget):
                     return False
                 return True
 
+            user32.EnumWindows.argtypes = (enum_type, wintypes.LPARAM)
+            user32.EnumWindows.restype = wintypes.BOOL
             user32.EnumWindows(enum_type(enum_window), 0)
             return bool(found["inside"])
         except Exception:
@@ -10099,6 +10584,151 @@ class SpatialDesktop(QWidget):
             # optional global cursor visibility API cannot be called.
             return
         self._native_scroll_cursor_hidden = should_hide
+
+    def _windows_task_view_active(self, now=None):
+        """Temporary native-mouse mode while the Windows Win+Tab switcher is up.
+
+        Inspect the shell at a bounded cadence; neither the camera thread nor
+        every hand joint makes Win32 window-enumeration calls. Never change the
+        user's stored per-hand peace-sign detach choice.
+        """
+        if not sys.platform.startswith("win") or self.desktop_mode != "os":
+            return False
+        now = time.monotonic() if now is None else float(now)
+        if now - getattr(self, "_task_view_checked_at", -100.0) < 0.12:
+            return bool(getattr(self, "_task_view_visible_cached", False))
+        self._task_view_checked_at = now
+        visible = False
+        try:
+            user32 = ctypes.windll.user32
+            user32.GetAsyncKeyState.argtypes = (ctypes.c_int,)
+            user32.GetAsyncKeyState.restype = ctypes.c_short
+            user32.IsWindowVisible.argtypes = (wintypes.HWND,)
+            user32.IsWindowVisible.restype = wintypes.BOOL
+            # Include the chord's opening animation. Detection continues from
+            # the shell window itself after the user releases Win + Tab.
+            key_down = lambda key: bool(user32.GetAsyncKeyState(key) & 0x8000)
+            visible = (key_down(0x09) and (key_down(0x5B) or key_down(0x5C)))
+            if not visible:
+                # Task View hosts can remain allocated but DWM-cloaked when
+                # Win+Tab is closed. Do not keep mouse mode enabled for these.
+                dwm = None
+                try:
+                    dwm = ctypes.windll.dwmapi.DwmGetWindowAttribute
+                    dwm.argtypes = [wintypes.HWND, wintypes.DWORD,
+                                    ctypes.c_void_p, wintypes.DWORD]
+                    dwm.restype = ctypes.c_long
+                except (OSError, AttributeError):
+                    pass
+                get_class = user32.GetClassNameW
+                get_class.argtypes = (wintypes.HWND, ctypes.c_wchar_p, ctypes.c_int)
+                get_title = user32.GetWindowTextW
+                get_title.argtypes = (wintypes.HWND, ctypes.c_wchar_p, ctypes.c_int)
+                callback_type = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
+                @callback_type
+                def check_window(hwnd, _arg):
+                    nonlocal visible
+                    if not user32.IsWindowVisible(hwnd):
+                        return True
+                    if dwm is not None:
+                        cloaked = wintypes.DWORD(0)
+                        if (dwm(hwnd, 14, ctypes.byref(cloaked),
+                                ctypes.sizeof(cloaked)) == 0 and cloaked.value):
+                            return True
+                    klass = ctypes.create_unicode_buffer(160)
+                    get_class(hwnd, klass, len(klass))
+                    # Most windows do not belong to the shell; only query their
+                    # titles when the class has a plausible task-switcher host.
+                    if klass.value.casefold() not in (
+                        'multitaskingviewframe', 'taskswitcherwnd',
+                        'windows.ui.core.corewindow', 'xamlexplorerhostislandwindow',
+                        'applicationframewindow',
+                        'windows.ui.composition.desktopwindowcontentbridge'):
+                        return True
+                    title = ctypes.create_unicode_buffer(160)
+                    get_title(hwnd, title, len(title))
+                    if _windows_task_view_window_identity(klass.value, title.value):
+                        visible = True
+                        return False
+                    return True
+                user32.EnumWindows.argtypes = (callback_type, wintypes.LPARAM)
+                user32.EnumWindows.restype = wintypes.BOOL
+                user32.EnumWindows(check_window, 0)
+        except (OSError, AttributeError, ValueError, TypeError):
+            pass
+        if not visible:
+            # On current Windows 11 builds Task View's XAML host often has no
+            # window title, so EnumWindows' class+title test above misses it.
+            # Use the *foreground* shell-host process and screen coverage instead.
+            # Regular Explorer folders, the taskbar, and compact previews cannot
+            # satisfy both constraints.
+            try:
+                foreground = user32.GetForegroundWindow
+                foreground.restype = wintypes.HWND
+                hwnd = foreground()
+                if hwnd and user32.IsWindowVisible(hwnd):
+                    cls_buf = ctypes.create_unicode_buffer(160)
+                    user32.GetClassNameW(hwnd, cls_buf, len(cls_buf))
+                    cls = cls_buf.value.casefold()
+                    if cls in ('multitaskingviewframe', 'taskswitcherwnd'):
+                        visible = True
+                    elif cls in ('xamlexplorerhostislandwindow',
+                                 'windows.ui.core.corewindow',
+                                 'windows.ui.composition.desktopwindowcontentbridge'):
+                        host = _windows_process_name(hwnd)
+                        rect = wintypes.RECT()
+                        user32.GetWindowRect.argtypes = (
+                            wintypes.HWND, ctypes.POINTER(wintypes.RECT))
+                        user32.GetWindowRect.restype = wintypes.BOOL
+                        if user32.GetWindowRect(hwnd, ctypes.byref(rect)):
+                            w, h = rect.right-rect.left, rect.bottom-rect.top
+                            screen = QApplication.primaryScreen()
+                            sw = screen.geometry().width() if screen is not None else 1280
+                            sh = screen.geometry().height() if screen is not None else 720
+                            visible = (host in ('explorer.exe', 'shellexperiencehost.exe') and
+                                       w >= 0.65*sw and h >= 0.65*sh)
+            except (OSError, AttributeError, TypeError, ValueError):
+                pass
+        self._task_view_visible_cached = bool(visible)
+        return bool(visible)
+
+    def _dispatch_quick_os_touch_tap(self, side, global_point, now):
+        """Shell/taskbar gets native mouse clicks; app content keeps multitouch.
+
+        Windows taskbar Start/app tiles can ignore simulated PT_TOUCH even
+        though their context menu accepts a right mouse click. A single pinch
+        on the taskbar is a normal mouse left-click, never both input types.
+        """
+        if (sys.platform.startswith('win') and
+                self._windows_task_view_active(now)):
+            use_mouse = True
+        elif sys.platform.startswith('win'):
+            local = self.mapFromGlobal(QPoint(int(global_point[0]), int(global_point[1])))
+            use_mouse = (self._is_native_taskbar_point(QPointF(local)) or
+                         _windows_window_uses_native_mouse(global_point))
+        else:
+            use_mouse = False
+        if use_mouse:
+            # No existing simulated finger can remain pressed when Explorer
+            # processes an ordinary mouse button on Start/taskbar/Task View.
+            injector = getattr(self, '_native_touch', None)
+            if injector is not None:
+                injector.end()
+            if not _windows_native_left_click(global_point):
+                self.status = ('Windows native click blocked: check whether the target '
+                               'is elevated or Freehand has a different integrity level')
+                return False
+            self.right_click_context_active[side] = False
+            self._native_context_menu_visual_guard_until = max(
+                self._native_context_menu_visual_guard_until, float(now) + 0.16)
+            return True
+        injector = getattr(self, '_native_touch', None)
+        if injector is None or injector.unavailable:
+            return False
+        if not injector.tap(side, global_point):
+            self.status = 'Touch tap unavailable: ' + injector.last_error
+            return False
+        return True
 
     def _native_context_menu_block_active(self, now=None):
         """Very short debounce for the *selection* gesture, never a global UI freeze.
@@ -12220,18 +12850,27 @@ try {
         if sys.platform.startswith("win"):
             try:
                 hwnd = int(self.winId())
-                get_long = ctypes.windll.user32.GetWindowLongW
-                set_long = ctypes.windll.user32.SetWindowLongW
-                style = get_long(hwnd, -20)
+                user32 = ctypes.windll.user32
+                get_long = getattr(user32, 'GetWindowLongPtrW', user32.GetWindowLongW)
+                set_long = getattr(user32, 'SetWindowLongPtrW', user32.SetWindowLongW)
+                get_long.argtypes = (wintypes.HWND, ctypes.c_int)
+                get_long.restype = ctypes.c_ssize_t
+                set_long.argtypes = (wintypes.HWND, ctypes.c_int, ctypes.c_ssize_t)
+                set_long.restype = ctypes.c_ssize_t
+                style = get_long(wintypes.HWND(hwnd), -20)
                 transparent, toolwindow, layered = 0x00000020, 0x00000080, 0x00080000
                 style |= toolwindow
                 if self.desktop_mode == "os":
                     style |= transparent | layered
                 else:
                     style &= ~transparent
-                set_long(hwnd, -20, style)
-                ctypes.windll.user32.SetWindowPos(hwnd, -1, 0, 0, 0, 0,
-                    0x0001 | 0x0002 | 0x0004 | 0x0010)
+                set_long(wintypes.HWND(hwnd), -20, style)
+                user32.SetWindowPos.argtypes = (wintypes.HWND, wintypes.HWND,
+                                                ctypes.c_int, ctypes.c_int,
+                                                ctypes.c_int, ctypes.c_int, wintypes.UINT)
+                user32.SetWindowPos.restype = wintypes.BOOL
+                user32.SetWindowPos(wintypes.HWND(hwnd), wintypes.HWND(-1), 0, 0, 0, 0,
+                                    0x0001 | 0x0002 | 0x0004 | 0x0010 | 0x0020)
             except Exception as exc:
                 print("Overlay window configuration:", exc)
         elif sys.platform.startswith("linux") or sys.platform == "darwin":
@@ -15128,8 +15767,9 @@ try {
         """
         if getattr(self, "_capturing_glass_backdrop", False):
             return
-        if self._native_context_menu_visual_guard():
-            return  # Do not raise an overlay over a native OS context menu.
+        if (self._native_context_menu_visual_guard() or
+                self._windows_task_view_active(now)):
+            return  # Preserve native context menus and Win+Tab Task View z-order.
         # A native wake-word training popup must remain above the fullscreen
         # click-through owner (and must keep keyboard/mouse focus for Cancel).
         training = getattr(self, '_wake_word_training_dialog', None)
@@ -15142,6 +15782,10 @@ try {
             self._sync_linux_fullscreen_geometry()
         search = getattr(self, "search_dialog", None)
         reassert_interval = 0.40 if search is not None and search.isVisible() else 0.12
+        if sys.platform.startswith('win') and _windows_shell_preview_visible(now):
+            # Let the hand-only layer reassert above a grouped-app preview.
+            # The underlying fullscreen HUD must not jump over that popup.
+            return
         if now-self._last_native_topmost_reassert <= reassert_interval:
             return
 
@@ -15453,6 +16097,59 @@ try {
             self._touch_last_pose_at.clear()
             self._touch_drag_sides.clear()
 
+    def _process_windows_task_view_input(self, cursor_points, poses, now):
+        """While Win+Tab is open, use the REAL mouse for moving and selecting.
+
+        Normal PT_TOUCH and the Pinch Menu are intentionally bypassed until the
+        switcher closes. This is the path that the previous implementation lacked:
+        it moved a cursor (only if not detached), then returned False before
+        ever generating a completed pinch click.
+        """
+        if not (sys.platform.startswith('win') and self.desktop_mode == 'os'
+                and self._windows_task_view_active(now)):
+            self._task_view_native_mode = False
+            self._task_view_pinch_since = None
+            self._task_view_wait_release = False
+            return False
+        if not getattr(self, '_task_view_native_mode', False):
+            self._task_view_native_mode = True
+            self._task_view_pinch_since = None
+            # Never fire a click for an already-held pinch when Task View opens.
+            self._task_view_wait_release = any(
+                pose.get('pinch', False) for pose in poses.values())
+        injector = getattr(self, '_native_touch', None)
+        if injector is not None and (injector.active or self._touch_pending):
+            self._end_two_hand_touch()
+        side = self.cursor_lock_priority
+        if side not in cursor_points:
+            side = 'left' if side == 'right' else 'right'
+        if side in cursor_points:
+            position = self._virtual_point_to_global(cursor_points[side])
+            # Task View temporarily reattaches the mouse *regardless* of normal
+            # touch mode or peace-sign detach. That preference is not modified.
+            if position is not None:
+                self._set_os_pointer_global(position)
+                self._task_view_native_position = (int(position.x()), int(position.y()))
+        pinched = bool(poses.get(side, {}).get('pinch', False))
+        if self._task_view_wait_release:
+            if not pinched:
+                self._task_view_wait_release = False
+        elif pinched:
+            if self._task_view_pinch_since is None:
+                self._task_view_pinch_since = float(now)
+        elif self._task_view_pinch_since is not None:
+            duration = float(now)-self._task_view_pinch_since
+            self._task_view_pinch_since = None
+            if (0.05 <= duration <= 1.0 and side in cursor_points and
+                    getattr(self, '_task_view_native_position', None)):
+                if not _windows_native_left_click(self._task_view_native_position):
+                    self.status = 'Task View click blocked (check elevation/UIPI)'
+                else:
+                    play_ui_sound(self.ui_preferences.get('sound_pinch', 'None'))
+        for tracked in ('left', 'right'):
+            self._clear_menu_pinch_sequence(tracked)
+        return True
+
     def _process_two_hand_touch(self, cursor_points, poses, now):
         """Cross-platform two-hand touch via thumb-index pinches.
 
@@ -15534,6 +16231,12 @@ try {
                 self._touch_pending[side] = {
                     "started": float(now), "last": float(now),
                     "origin": point, "point": point,
+                    # Task Manager (and Explorer previews) need a native
+                    # mouse click even when natural hand jitter is large enough
+                    # to be interpreted as a touchscreen drag. Choose once at
+                    # pinch start, not on every frame or after the pointer moves.
+                    "special_native_mouse": (sys.platform.startswith('win') and
+                                             _windows_window_uses_native_mouse(point)),
                 }
             elif side in self._touch_pending:
                 pending = self._touch_pending[side]
@@ -15545,12 +16248,8 @@ try {
                     duration = released_at-pending["started"]
                     if (self.quick_pinch_click_min_seconds <= duration <=
                             self.fist_quick_click_max_seconds):
-                        if injector.tap(side, pending["origin"]):
+                        if self._dispatch_quick_os_touch_tap(side, pending["origin"], now):
                             play_ui_sound(self.ui_preferences.get("sound_pinch", "None"))
-                            if (sys.platform.startswith("win") and
-                                    self._is_native_taskbar_point(cursor_points.get(side))):
-                                self._native_context_menu_visual_guard_until = max(
-                                    self._native_context_menu_visual_guard_until, now + 8.0)
                         self._clear_menu_pinch_sequence(side)
                     pending.update(started=float(now), origin=point)
                 pending["release_started"] = None
@@ -15574,25 +16273,42 @@ try {
                 point = candidates[side]
                 dx = point[0]-pending["origin"][0]
                 dy = point[1]-pending["origin"][1]
-                if (now-pending["started"] >= PINCH_DRAG_MIN_HOLD_SECONDS and
-                        dx*dx+dy*dy >= self.pinch_drag_start_distance**2):
-                    # Prioritise native mouse text selection for a one-hand drag
-                    # beginning on/near text. Else preserve touch panning/scroll.
-                    # In a two-hand pinch, the native multi-contact path above wins.
-                    is_text_target = (len(candidates) == 1 and
-                                      _pinch_origin_over_text(pending["origin"]))
-                    # Accessibility may be disabled by an app or desktop session.
-                    # A deliberate 0.55s stationary hold before moving provides
-                    # a selection fallback, below the existing Pinch Menu timer.
-                    held_to_select = (len(candidates) == 1 and
-                                      now-pending["started"] >= 0.55)
-                    if is_text_target or held_to_select:
+                distance_squared = dx*dx + dy*dy
+                elapsed = now-pending["started"]
+                # Never promote Task Manager or Explorer preview pinches into
+                # PT_TOUCH scrolling; even a small amount of hand jitter can
+                # otherwise steal their clicks. The ordinary timed Pinch Menu
+                # is still allowed to arm on a stationary hold.
+                if pending.get("special_native_mouse"):
+                    continue
+                # Probe for real nearby text early in the movement. Chromium's
+                # UIA text leaf often differs from its legacy MSAA hit target.
+                # Cache the choice *per pinch*, not per screen frame: costly
+                # cross-process COM calls must never run at 30–120 Hz.
+                if (len(candidates) == 1 and distance_squared >= 4.0**2
+                        and not pending.get("text_probed", False)):
+                    pending["text_probed"] = True
+                    pending["text_anchor"] = _pinch_text_anchor(pending["origin"])
+                    if pending["text_anchor"] is None:
+                        pending["text_anchor"] = _pinch_text_anchor(point)
+                text_anchor = pending.get("text_anchor") if len(candidates) == 1 else None
+                text_selection_ready = (text_anchor is not None and
+                                        elapsed >= max(0.045, PINCH_DRAG_MIN_HOLD_SECONDS * 0.6)
+                                        and distance_squared >= 7.0**2)
+                touch_scroll_ready = (elapsed >= PINCH_DRAG_MIN_HOLD_SECONDS and
+                                      distance_squared >= self.pinch_drag_start_distance**2)
+                if text_selection_ready or touch_scroll_ready:
+                    # A native mouse text selection takes priority whenever
+                    # the drag begins within 20px of a real text character.
+                    # Else, preserve ordinary touchscreen panning and scrolling.
+                    # Two simultaneous pinches still enter native multitouch.
+                    if text_anchor is not None:
                         if sys.platform.startswith("linux"):
                             screen_origin = self._interaction_screen_geometry().topLeft()
-                            origin_local = QPoint(int(pending["origin"][0] - screen_origin.x()),
-                                                  int(pending["origin"][1] - screen_origin.y()))
+                            origin_local = QPoint(int(text_anchor[0] - screen_origin.x()),
+                                                  int(text_anchor[1] - screen_origin.y()))
                         else:
-                            origin_local = self.mapFromGlobal(QPoint(*pending["origin"]))
+                            origin_local = self.mapFromGlobal(QPoint(*text_anchor))
                         # Text-selection drags deliberately use a held mouse
                         # button, unlike ordinary Linux touchscreen taps.
                         if self._begin_pinch_drag(side, QPointF(origin_local), now):
@@ -15620,19 +16336,21 @@ try {
                     continue
                 elapsed = pending["release_started"]-pending["started"]
                 pose = poses.get(side, {})
-                if (self.quick_pinch_click_min_seconds <= elapsed <= self.fist_quick_click_max_seconds
-                        and side in poses and not pose.get("fingers_closed", False)
-                        and not pose.get("fist", False)
+                native_special = bool(pending.get("special_native_mouse"))
+                # Give native XAML shell surfaces more release tolerance than a
+                # PT_TOUCH tap. Do not turn a long Pinch Menu hold into a click.
+                max_click_hold = (min(0.90, self.pinch_buffer_seconds)
+                                  if native_special else self.fist_quick_click_max_seconds)
+                if ((0.045 if native_special else self.quick_pinch_click_min_seconds)
+                        <= elapsed <= max_click_hold
+                        and side in poses and not pose.get("fist", False)
+                        and side not in self.menu_pinch_latched
+                        and not self.fist_action_menu_open.get(side, False)
                         and not self._forming_fist_pinch_guard.get(side, False)):
-                    # The pointer stays where it was: this click is a touch tap.
-                    if not injector.tap(side, pending["origin"]):
-                        self.status = "Touch tap unavailable: " + injector.last_error
-                    else:
+                    # A released pinch may leave the other fingers partly curled:
+                    # that's not a fist and must not suppress Start/taskbar taps.
+                    if self._dispatch_quick_os_touch_tap(side, pending["origin"], now):
                         play_ui_sound(self.ui_preferences.get("sound_pinch", "None"))
-                        if (sys.platform.startswith("win") and
-                                self._is_native_taskbar_point(cursor_points.get(side))):
-                            self._native_context_menu_visual_guard_until = max(
-                                self._native_context_menu_visual_guard_until, now + 8.0)
                     self._touch_pending.pop(side, None)
                     self._clear_menu_pinch_sequence(side)
                     if self.gesture_owner == side:
@@ -16097,7 +16815,8 @@ try {
             self._stop_inactive_timer_during_sounds()
             return
 
-        if self._process_two_hand_touch(cursor_points, poses, now):
+        if (self._process_windows_task_view_input(cursor_points, poses, now) or
+                self._process_two_hand_touch(cursor_points, poses, now)):
             self.pointer_side = None
             self.active_push_sides.clear()
             self.depth += (self.target_depth-self.depth)*0.16
