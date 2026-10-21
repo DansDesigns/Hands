@@ -629,18 +629,68 @@ def _pinch_origin_over_text(point):
     return any(probe(x+dx, y+dy) for dx, dy in offsets)
 
 
+def _windows_monitor_rectangles():
+    """Return cached monitor device names and physical pixel bounds from Win32.
+
+    Qt's devicePixelRatio and global logical coordinates do not always describe
+    the full taskbar-inclusive native display, notably with mixed DPI scaling.
+    Never query EnumDisplayMonitors for every touch UPDATE.
+    """
+    if not sys.platform.startswith("win"):
+        return []
+    now = time.monotonic()
+    cached = getattr(_windows_monitor_rectangles, "_cached", None)
+    if cached is not None and now - cached[0] < 3.0:
+        return cached[1]
+    rects = []
+    try:
+        user32 = ctypes.windll.user32
+        class MONITORINFOEXW(ctypes.Structure):
+            _fields_ = [("cbSize", wintypes.DWORD), ("rcMonitor", wintypes.RECT),
+                        ("rcWork", wintypes.RECT), ("dwFlags", wintypes.DWORD),
+                        ("szDevice", ctypes.c_wchar * 32)]
+        callback_type = ctypes.WINFUNCTYPE(ctypes.c_int, ctypes.c_void_p,
+                                           ctypes.c_void_p, ctypes.c_void_p,
+                                           ctypes.c_ssize_t)
+        get_info = user32.GetMonitorInfoW
+        get_info.argtypes = (ctypes.c_void_p, ctypes.POINTER(MONITORINFOEXW))
+        get_info.restype = wintypes.BOOL
+        def callback(handle, _hdc, _rect, _data):
+            info = MONITORINFOEXW()
+            info.cbSize = ctypes.sizeof(info)
+            if get_info(handle, ctypes.byref(info)):
+                r = info.rcMonitor
+                rects.append((str(info.szDevice).casefold(),
+                              (int(r.left), int(r.top), int(r.right), int(r.bottom)),
+                              bool(info.dwFlags & 1)))
+            return 1
+        enum_monitors = user32.EnumDisplayMonitors
+        enum_monitors.argtypes = (ctypes.c_void_p, ctypes.c_void_p, callback_type, ctypes.c_ssize_t)
+        enum_monitors.restype = wintypes.BOOL
+        enum_monitors(None, None, callback_type(callback), 0)
+    except (OSError, AttributeError, ValueError, TypeError):
+        rects = []
+    _windows_monitor_rectangles._cached = (now, rects)
+    return rects
+
+
+def _map_logical_to_physical(point, logical_rect, physical_rect):
+    """Map Qt desktop-DIP position into native pixels, including physical bottom row."""
+    lx, ly, lw, lh = logical_rect
+    left, top, right, bottom = physical_rect
+    sx = (right-left)/max(1.0, lw)
+    sy = (bottom-top)/max(1.0, lh)
+    return (int(round(left + (float(point[0])-lx)*sx)),
+            int(round(top + (float(point[1])-ly)*sy)))
+
+
 def _windows_touch_screen_pixels(point):
-    """Convert a Qt desktop-global point to Win32 physical screen pixels.
+    """Convert the visible Qt TPI centre to *physical* Windows touch pixels.
 
-    Qt 6 uses device-independent pixels for its TPI and mapToGlobal(), while
-    InjectTouchInput, WindowFromPoint and MSAA hit-testing require physical
-    screen pixels.  At 125%/150% display scaling, passing Qt coordinates
-    unconverted taps up and to the left of the drawn TPI.  On Windows Qt keeps
-    each monitor's global origin at its native position but scales its size;
-    scale *relative to that monitor's origin*, not to desktop (0, 0).
-
-    Don't change the Qt-side TPI, smoothing, pinch origins or Linux/macOS touch
-    backends. They must continue using their existing coordinate systems.
+    Win32 InjectTouchInput expects physical pixels, unlike the logical Qt display.
+    Use monitor bounds rather than relying on Qt's possibly rounded DPR. This
+    fixes touch contacts falling *above* the taskbar when the displayed TPI is
+    already inside it. A failed Win32 lookup retains the previous DPR method.
     """
     px, py = float(point[0]), float(point[1])
     if not sys.platform.startswith("win"):
@@ -649,26 +699,32 @@ def _windows_touch_screen_pixels(point):
         location = QPoint(int(round(px)), int(round(py)))
         screen = QApplication.screenAt(location)
         if screen is None:
-            # Qt's Windows high-DPI "islands" can have gaps between screens.
-            # Select the closest Qt monitor rather than using the primary one's
-            # scale for a point on a secondary display.
             screens = QApplication.screens()
             if screens:
                 def distance_sq(item):
                     rect = item.geometry()
                     dx = max(rect.left()-px, 0.0, px-rect.right())
                     dy = max(rect.top()-py, 0.0, py-rect.bottom())
-                    return dx*dx+dy*dy
+                    return dx*dx + dy*dy
                 screen = min(screens, key=distance_sq)
         if screen is not None:
             rect = screen.geometry()
+            matches = _windows_monitor_rectangles()
+            device = str(screen.name() or "").casefold()
+            matched = next((bounds for name,bounds,_ in matches if name == device), None)
+            if matched is None and len(matches) == 1 and len(QApplication.screens()) == 1:
+                matched = matches[0][1]
+            if matched is None and screen == QApplication.primaryScreen():
+                matched = next((bounds for name,bounds,primary in matches if primary), None)
+            if matched is not None:
+                return _map_logical_to_physical((px, py),
+                                                (rect.x(), rect.y(), rect.width(), rect.height()),
+                                                matched)
             ratio = float(screen.devicePixelRatio())
-            if math.isfinite(ratio) and ratio > 0.0:
+            if math.isfinite(ratio) and ratio > 0:
                 px = rect.x() + (px-rect.x())*ratio
                 py = rect.y() + (py-rect.y())*ratio
     except (AttributeError, RuntimeError, TypeError, ValueError):
-        # On a display with 100% scaling or when Qt hasn't found a screen,
-        # the original global point remains a better fallback than guessing.
         pass
     return (int(round(px)), int(round(py)))
 
@@ -1434,6 +1490,7 @@ def load_ui_preferences() -> dict:
         "d1_autostart": False,
         "wake_word_name": "",
         "wake_word_trained": False,
+        "wake_word_listening": False,
         "garden_onboarding_completed": False,
         "sound_defaults_v1_applied": False,
         **{key: DEFAULT_UI_SOUNDS.get(key, "None") for key, _label in SOUND_SETTING_ROWS},
@@ -1451,7 +1508,7 @@ def load_ui_preferences() -> dict:
                     result[key] = min(1.4, max(0.7, float(value)))
                 except (TypeError, ValueError):
                     pass
-            elif key in ("show_gesture_disabled_indicator", "garden_onboarding_completed", "debug_console", "start_on_login", "wake_word_trained", "d1_autostart"):
+            elif key in ("show_gesture_disabled_indicator", "garden_onboarding_completed", "debug_console", "start_on_login", "wake_word_trained", "wake_word_listening", "d1_autostart"):
                 if isinstance(value, bool):
                     result[key] = value
             elif key == "wake_word_name":
@@ -1478,7 +1535,7 @@ def save_ui_preferences(values: dict) -> None:
                 current[key] = min(1.4, max(0.7, float(value)))
             except (TypeError, ValueError):
                 pass
-        elif key in ("show_gesture_disabled_indicator", "garden_onboarding_completed", "debug_console", "start_on_login", "wake_word_trained", "d1_autostart"):
+        elif key in ("show_gesture_disabled_indicator", "garden_onboarding_completed", "debug_console", "start_on_login", "wake_word_trained", "wake_word_listening", "d1_autostart"):
             if isinstance(value, bool):
                 current[key] = value
         elif key == "wake_word_name":
@@ -2585,6 +2642,11 @@ class SearchHandOverlay(QWidget):
         # inference, the gesture state machine, or pointer/TPI input cadence.
         hand_frame_ms = max(1, round(1000.0 / effective_hand_visual_fps(
             owner.hand_display_fps, owner.hand_capture_fps)))
+        # The search bar does its own text painting. Keep the transparent
+        # hand overlay at a smooth 30 FPS there rather than saturating the GUI
+        # with 90/120-FPS fullscreen alpha composition during typing.
+        if search_visible:
+            hand_frame_ms = max(hand_frame_ms, 33)
         wanted_interval = hand_frame_ms if active_visuals else 180
         if self.sync_timer.interval() != wanted_interval:
             self.sync_timer.setInterval(wanted_interval)
@@ -2649,11 +2711,13 @@ class SearchHandOverlay(QWidget):
         # Reassert the topmost position without activation. This orders the overlay
         # above ordinary desktop windows; immersive Windows shell surfaces such as
         # Task View may still be in a higher system z-order band.
-        raise_interval = 0.12 if active_visuals else 0.65
-        if now-self._last_raise > raise_interval:
+        raise_interval = (0.55 if search_visible else 0.25) if active_visuals else 0.85
+        native_menu_open = owner._native_context_menu_visual_guard(now)
+        if not native_menu_open and now-self._last_raise > raise_interval:
             self.raise_()
             self._last_raise = now
-        if sys.platform.startswith("win") and now-self._last_native_raise > raise_interval:
+        if (not native_menu_open and sys.platform.startswith("win")
+                and now-self._last_native_raise > raise_interval):
             try:
                 hwnd = int(self.winId())
                 user32 = ctypes.windll.user32
@@ -2682,6 +2746,7 @@ class SearchHandOverlay(QWidget):
                      getattr(owner, "hand_render_style", None),
                      float(getattr(owner, "hand_transparency", 75.0)),
                      bool(getattr(owner, "floating_clipboard_visible", False)),
+                     bool(getattr(owner, "_selection_drag", None)),
                      tuple(side in owner.active_push_sides for side in ("left", "right")))
         animated = bool(
             any(owner.peace_hold_started.get(side) is not None
@@ -2695,7 +2760,8 @@ class SearchHandOverlay(QWidget):
             any(now < float((owner.gesture_timer_fade.get(side) or {}).get("started_at", 0)) + 0.4
                 for side in ("left", "right")) or
             now < owner.click_flash_until or
-            bool(getattr(owner, "floating_clipboard_visible", False))
+            bool(getattr(owner, "floating_clipboard_visible", False)) or
+            bool(getattr(owner, "_selection_drag", None))
         )
         if (signature != getattr(self, "_last_painted_hand_signature", None)
                 or animated or getattr(self, "_last_painted_hand_at", 0) == 0):
@@ -2752,6 +2818,7 @@ class SearchHandOverlay(QWidget):
             owner._paint_gesture_timer_fade(painter, side, now)
             owner._paint_pinch_menu(painter, side, now)
         owner._paint_floating_clipboard(painter, now)
+        owner._paint_selected_item_drag(painter)
         # This overlay is the sole hand-visual owner while Search is visible; the main
         # window skips the identical layer to avoid double-painted ghost silhouettes.
         for side in ("left", "right"):
@@ -3598,6 +3665,10 @@ class SpatialDesktop(QWidget):
         self.heard_popup_generation = 0
         self.heard_popup_shake_until = 0.0
         self.search_dialog = None
+        # Native shell menus (especially the Windows taskbar context menu) must
+        # keep the foreground and z-order until an actual user selection.
+        self._native_context_menu_protect_until = 0.0
+        self._native_context_menu_visual_guard_until = 0.0
         # Focused-field dictation writes stable Vosk words into the currently focused OS field.
         self.focus_dictation_enabled = False
         self.focus_dictation_paused = False
@@ -3773,6 +3844,10 @@ class SpatialDesktop(QWidget):
         self._touch_last_pose_at = {}  # last confirmed pinch, for dropout tolerance
         self._touch_drag_sides = set()
         self._touch_text_drag_sides = set()  # native mouse selection, never touch-scroll
+        self._recent_text_selection = None  # region, owner hand, creation time
+        self._selection_drag = None  # held fist transferring a selected MIME payload
+        self._selection_pickup_latched = {"left": False, "right": False}
+        self._selection_copy_generation = 0
         self.fist_quick_click_max_seconds = 0.65
         self.fist_started_at = {side: None for side in sides}
         self.fist_release_candidate_since = {side: None for side in sides}
@@ -6687,6 +6762,7 @@ class SpatialDesktop(QWidget):
             y += 23.0
             stack('wake_word_field', h=40.0)
             stack('wake_word_train', h=42.0)
+            stack('wake_word_listening_toggle', h=42.0)
             texts["status"] = (L, y, W, 48.0)
             y += 48.0 + gap
         elif page == "update":
@@ -7529,6 +7605,195 @@ class SpatialDesktop(QWidget):
         distance, name = min(candidates)
         return name if distance <= y_limit else None
 
+    def _point_on_recent_selection(self, point, now=None):
+        """Hit test the area selected via a native pinch-drag, not all nearby text."""
+        selection = getattr(self, "_recent_text_selection", None)
+        if (selection is None or point is None or self.desktop_mode != "os" or
+                self.menu_open or
+                (self.floating_clipboard_visible and self._floating_clipboard_contains(point))):
+            return False
+        now = time.monotonic() if now is None else float(now)
+        return now-selection["created"] <= 75.0 and selection["rect"].contains(point)
+
+    @staticmethod
+    def _clone_clipboard_mime(mime):
+        """Preserve ordinary native clipboard formats during a selection-copy probe."""
+        if mime is None:
+            return None
+        clone = QMimeData()
+        try:
+            total = 0
+            for fmt in mime.formats():
+                value = bytes(mime.data(fmt))
+                if total+len(value) > 16*1024*1024:
+                    # Can't safely restore the previous clipboard; don't replace
+                    # it merely to inspect a text/file selection.
+                    return None
+                clone.setData(fmt, value)
+                total += len(value)
+        except Exception:
+            return None
+        return clone
+
+    def _start_selected_item_drag(self, side, point, now):
+        """Copy a confirmed OS selection on demand without changing the source."""
+        if pyautogui is None or self._selection_drag is not None:
+            return False
+        if not self._point_on_recent_selection(point, now):
+            return False
+        clipboard = getattr(self, "_system_clipboard", None) or QApplication.clipboard()
+        original_mime = clipboard.mimeData()
+        previous = self._clone_clipboard_mime(original_mime)
+        if previous is None and original_mime is not None and original_mime.formats():
+            self.status = "Cannot inspect selection without overwriting current clipboard"
+            return True
+        previous_payload = self._clipboard_payload_from_mime(original_mime)
+        state = {"side": side, "point": QPointF(point), "held": True,
+                 "created": now, "phase": "copying", "payload": None,
+                 "previous": previous,
+                 "old_signature": previous_payload["signature"] if previous_payload else None}
+        self._selection_drag = state
+        self._selection_copy_generation += 1
+        generation = self._selection_copy_generation
+        self._clipboard_capture_suppression_until = now + 1.0
+        try:
+            command = "command" if sys.platform == "darwin" else "ctrl"
+            pyautogui.hotkey(command, "c", _pause=False)
+        except Exception as exc:
+            self._selection_drag = None
+            self.status = f"Selected item could not be copied: {exc}"
+            return True
+        # A fist grabbing a highlighted selection reveals the existing floating
+        # clipboard immediately, *before* the asynchronous Copy check completes.
+        # Leave any already-visible clipboard in place (including a user-moved one).
+        if not self.floating_clipboard_visible:
+            self._set_floating_clipboard_visible(True)
+            # Avoid opening the drop target under the hand that is picking up
+            # the selection. If the saved/default panel overlaps the grab point,
+            # put it on the opposite side so the item must be deliberately dragged
+            # to the clipboard before release.
+            layout = self._floating_clipboard_layout()
+            if layout is not None and layout["panel"].adjusted(-16, -16, 16, 16).contains(point):
+                panel = layout["panel"]
+                new_x = (8.0 if point.x() >= self.width() * 0.5
+                         else max(8.0, self.width()-panel.width()-8.0))
+                self.floating_clipboard_position = QPointF(
+                    new_x, max(8.0, min(panel.y(), self.height()-panel.height()-8.0)))
+                self.update()
+                overlay = getattr(self, "search_hand_overlay", None)
+                if overlay is not None:
+                    overlay.update()
+        QTimer.singleShot(135, lambda: self._complete_selected_item_capture(generation))
+        self.status = "Picking up highlighted selection — drag to Clipboard…"
+        return True
+
+    def _complete_selected_item_capture(self, generation):
+        """Read Ctrl+C result, then restore the user's previous OS clipboard."""
+        state = getattr(self, "_selection_drag", None)
+        if state is None or generation != self._selection_copy_generation:
+            return
+        clipboard = self._system_clipboard
+        payload = self._clipboard_payload_from_mime(clipboard.mimeData())
+        old_signature = state["old_signature"]
+        # An unchanged clipboard is not evidence that the application had a
+        # transferable selection (it may not support Copy at all).
+        valid = (payload is not None and
+                 (payload["signature"] != old_signature or state.get("copy_changed", False)))
+        previous = state.pop("previous", None)
+        self._clipboard_capture_suppression_until = time.monotonic() + 0.5
+        try:
+            if previous is None:
+                clipboard.clear()
+            else:
+                clipboard.setMimeData(previous)
+        except Exception:
+            pass
+        if not valid:
+            self._selection_drag = None
+            self.status = "This app did not expose a copyable selection"
+            return
+        if not state.get("held", False):
+            self._selection_drag = None
+            return
+        state["payload"] = payload
+        state["phase"] = "ready"
+        if not self.floating_clipboard_visible:
+            self._set_floating_clipboard_visible(True)
+        self.status = "Selection picked up — move over Clipboard and open your fist to drop"
+        self.update()
+
+    def _handle_selected_item_drag(self, side, point, is_fist, now):
+        """Pick up selected text/files/images; drop into the floating clipboard."""
+        state = getattr(self, "_selection_drag", None)
+        if state is None:
+            # A failed/unsupported Ctrl+C must not re-trigger on every camera
+            # frame or turn a single fist into a torrent of native copy events.
+            if not is_fist:
+                self._selection_pickup_latched[side] = False
+                return False
+            if self._selection_pickup_latched.get(side, False):
+                return True
+            if self._point_on_recent_selection(point, now):
+                self._selection_pickup_latched[side] = True
+                return self._start_selected_item_drag(side, point, now)
+            return False
+        if state["side"] != side:
+            return False
+        if is_fist:
+            state["point"] = QPointF(point)
+            state["held"] = True
+            state["open_since"] = None
+        else:
+            state["held"] = False
+            if state.get("phase") == "copying":
+                # Still restore the user's clipboard when the async Copy finishes.
+                return True
+            if state.get("open_since") is None:
+                state["open_since"] = now
+            if now-state["open_since"] < 0.08:
+                return True
+            payload = state.get("payload")
+            if payload is not None and self._floating_clipboard_contains(state["point"]):
+                entry = {**payload, "image_path": None,
+                         "group_count": len(payload["urls"]) if payload["kind"] == "files" else 1}
+                mime = self._clipboard_mime_for_entry(entry, for_drag=False)
+                self._clipboard_capture_suppression_until = 0.0
+                self._system_clipboard.setMimeData(mime)
+                # QClipboard.dataChanged populates the existing card/history
+                # using the same path as Ctrl+C from an external application.
+                self._capture_system_clipboard()
+                self.status = "Item added to Clipboard"
+                self._recent_text_selection = None
+            else:
+                self.status = "Selection released without copying"
+            self._selection_drag = None
+            self._selection_copy_generation += 1
+            self.update()
+            return True
+        return True
+
+    def _paint_selected_item_drag(self, painter):
+        state = getattr(self, "_selection_drag", None)
+        if not state:
+            return
+        point = state.get("point")
+        if point is None:
+            return
+        payload = state.get("payload")
+        label = "PICKING UP…" if payload is None else {
+            "text": "DRAG TEXT", "files": "DRAG FILES", "image": "DRAG IMAGE",
+            "links": "DRAG LINKS"}.get(payload["kind"], "DRAG ITEM")
+        painter.save()
+        painter.setBrush(QBrush(QColor(10, 35, 49, 224)))
+        painter.setPen(QPen(QColor(95, 239, 241, 239), 2))
+        bounds = QRectF(point.x()+16, point.y()-47, 144, 36)
+        bounds.moveLeft(min(bounds.left(), max(4.0, self.width()-bounds.width()-4.0)))
+        painter.drawRoundedRect(bounds, 10, 10)
+        painter.setPen(QColor(243, 255, 255))
+        painter.setFont(self._ui_font(9, QFont.DemiBold))
+        painter.drawText(bounds, Qt.AlignCenter, label)
+        painter.restore()
+
     def _clipboard_payload_from_mime(self, mime):
         """Snapshot ordinary system clipboard contents into a portable history entry."""
         if mime is None:
@@ -7617,6 +7882,9 @@ class SpatialDesktop(QWidget):
             return
         if payload is None:
             return
+        state = getattr(self, "_selection_drag", None)
+        if state is not None and state.get("phase") == "copying":
+            state["copy_changed"] = True
         now = time.monotonic()
         if now < getattr(self, "_clipboard_capture_suppression_until", 0.0):
             return
@@ -8225,7 +8493,8 @@ class SpatialDesktop(QWidget):
                 (self.search_dialog is not None and self.search_dialog.isVisible() and
                  self.search_dialog.dictation_enabled)):
             return
-        if self._has_trained_wake_word():
+        if (self.ui_preferences.get('wake_word_listening', False) and
+                self._has_trained_wake_word()):
             if not self.speech.running and self.speech.start():
                 self.status = 'Voice input off — waiting for the wake word'
         elif self.speech.running:
@@ -8255,7 +8524,9 @@ class SpatialDesktop(QWidget):
         was_enabled = self.stt_enabled
         self._set_voice_input_enabled(not was_enabled)
         self.status = ('Vosk speech recognition enabled' if self.stt_enabled else
-                       'Voice input off — waiting for the wake word' if self._has_trained_wake_word() else
+                       'Voice input off — waiting for the wake word' if (
+                           self.ui_preferences.get('wake_word_listening', False) and
+                           self._has_trained_wake_word()) else
                        'Vosk speech recognition stopped' if was_enabled else
                        'Vosk speech recognition could not start')
         self._announce_voice_input_state(self.stt_enabled)
@@ -8546,7 +8817,9 @@ class SpatialDesktop(QWidget):
         try:
             user32 = ctypes.windll.user32
             global_point = self._virtual_point_to_global(point)
-            px, py = int(global_point.x()), int(global_point.y())
+            # Win32 shell window rectangles are physical pixels, while our TPI
+            # uses Qt device-independent coordinates on scaled displays.
+            px, py = _windows_touch_screen_pixels((global_point.x(), global_point.y()))
             found = {"inside": False}
             enum_type = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
 
@@ -8986,7 +9259,7 @@ class SpatialDesktop(QWidget):
         if action == "right_click":
             # The menu selection gesture can overlap the native context-menu opening.
             # Ignore outside-dismiss gestures briefly so the OS menu stays open.
-            self.pinch_menu_dismiss_block_until = now + 2.0
+            self.pinch_menu_dismiss_block_until = now + 2.5
             self.right_click_mode_enabled = False
             self.scroll_mode_enabled = False
             # Right-click must target the original TLI captured when the Pinch Menu
@@ -9436,6 +9709,15 @@ class SpatialDesktop(QWidget):
                     self._focus_wake_word_entry()
                 elif pressed('wake_word_train'):
                     self._open_wake_word_training()
+                elif pressed('wake_word_listening_toggle'):
+                    enabled = not bool(self.ui_preferences.get('wake_word_listening', False))
+                    self.ui_preferences['wake_word_listening'] = enabled
+                    self._wake_word_armed_until = 0.0
+                    save_ui_preferences(self.ui_preferences)
+                    self._refresh_wake_word_listener()
+                    self.status = ('Wake-word listening enabled' if enabled else
+                                   'Wake-word listening disabled — standby microphone off')
+                    self.update()
                 elif pressed("tts_toggle"):
                     self.tts.set_enabled(not self.tts.enabled)
                     self.status = "Local TTS " + ("enabled" if self.tts.enabled else "disabled")
@@ -9519,6 +9801,17 @@ class SpatialDesktop(QWidget):
         # an outside-menu pinch must never move/click the native OS pointer.
         if self.mouse_detached_by_side.get(side, False):
             return
+        if self.desktop_mode == "os" and sys.platform.startswith("linux"):
+            injector = self._native_touch
+            if injector is None or injector.unavailable:
+                self.status = ("Native touchscreen unavailable: " +
+                               str(getattr(injector, "last_error", "check /dev/uinput permissions")))
+                return
+            global_pos = self._virtual_point_to_global(point)
+            if global_pos is not None and not injector.tap(
+                    side, (int(global_pos.x()), int(global_pos.y()))):
+                self.status = "Linux touch tap failed: " + injector.last_error
+            return
         if self.desktop_mode == "os" and pyautogui is not None:
             try:
                 global_pos = self._virtual_point_to_global(point)
@@ -9580,9 +9873,14 @@ class SpatialDesktop(QWidget):
                 and not self.mouse_detached_by_side.get(side, False)):
             try:
                 global_pos = self._virtual_point_to_global(point)
+                self._end_two_hand_touch()
                 self._set_os_pointer_global(global_pos)
                 pyautogui.click(button="right", _pause=False)
                 self.right_click_context_active[side] = True
+                # Raising either full-screen translucent window after this click
+                # immediately dismisses native Explorer/taskbar context menus.
+                self._native_context_menu_protect_until = time.monotonic() + 0.18
+                self._native_context_menu_visual_guard_until = time.monotonic() + 8.0
             except Exception as exc:
                 self.status = f"OS right-click failed: {exc}"
 
@@ -9702,6 +10000,9 @@ class SpatialDesktop(QWidget):
         """
         if global_pos is None:
             return False
+        # Ordinary Linux hand tracking never calls this method: the scene loop
+        # uses /dev/uinput contacts instead. Explicit text selection, clipboard
+        # paste, context menus and accessibility actions may still move the mouse.
         if sys.platform.startswith("linux") and getattr(self, "_linux_native_pointer_warp_compatible", False):
             context = self._linux_x11_screen_context()
             if context is not None:
@@ -9799,6 +10100,25 @@ class SpatialDesktop(QWidget):
             return
         self._native_scroll_cursor_hidden = should_hide
 
+    def _native_context_menu_block_active(self, now=None):
+        """Very short debounce for the *selection* gesture, never a global UI freeze.
+
+        The old check searched every Windows #32768 window. Shell/other-app popups
+        can stay alive after closing and blocked all taskbar taps indefinitely.
+        """
+        now = time.monotonic() if now is None else float(now)
+        return now < float(getattr(self, "_native_context_menu_protect_until", 0.0))
+
+    def _native_context_menu_visual_guard(self, now=None):
+        """Refrain from foreground-raising overlays while a native menu is in use.
+
+        Visual protection intentionally does NOT suppress gestures or native taps.
+        It is bounded, because the Explorer menu can close without notifying us.
+        """
+        now = time.monotonic() if now is None else float(now)
+        return (sys.platform.startswith("win") and
+                now < float(getattr(self, "_native_context_menu_visual_guard_until", 0.0)))
+
     def _set_os_pointer(self, point):
         clipboard_interaction_active = any(
             state is not None for state in getattr(self, "floating_clipboard_drag_state", {}).values()
@@ -9807,6 +10127,7 @@ class SpatialDesktop(QWidget):
         # it must be allowed to move the native pointer out of the glass panel and into
         # another application even if the main Glass Menu remains visible behind it.
         if (point is None or self._os_scroll_pointer_detached() or
+                self._native_context_menu_block_active() or
                 (self._gesture_ui_modal_open() and not clipboard_interaction_active)):
             return
         global_pos = self._virtual_point_to_global(point)
@@ -9909,6 +10230,20 @@ class SpatialDesktop(QWidget):
     def _end_pinch_drag(self, side, status=True):
         """Release a pinch-held mouse button safely and clear drag state."""
         was_active = bool(self.pinch_drag_active.get(side, False))
+        was_text_select = side in self._touch_text_drag_sides
+        selection_origin = self.pinch_drag_origin_points.get(side)
+        selection_end = self.pinch_drag_last_points.get(side)
+        # Selection survives the mouse-up and remains highlighted. Don't send
+        # Ctrl+C until the user actually picks the selection up with a fist.
+        if (was_active and status and was_text_select and
+                selection_origin is not None and selection_end is not None and
+                math.hypot(selection_end.x()-selection_origin.x(),
+                           selection_end.y()-selection_origin.y()) >= 8.0):
+            rect = QRectF(QPointF(selection_origin), QPointF(selection_end)).normalized()
+            self._recent_text_selection = {
+                "rect": rect.adjusted(-26, -26, 26, 26),
+                "created": time.monotonic(), "side": side,
+            }
         self.pinch_drag_active[side] = False
         self.pinch_drag_origin_points[side] = None
         self.pinch_drag_last_points[side] = None
@@ -11563,7 +11898,8 @@ try {
         if not self.stt_enabled:
             # Passive wake-word mode: no voice commands, file operations or
             # dictation can run until the correctly recognised name is heard.
-            if not self._has_trained_wake_word():
+            if (not self.ui_preferences.get('wake_word_listening', False) or
+                    not self._has_trained_wake_word()):
                 return
             matched, command_after_name = wake_word_command(
                 text, self.ui_preferences.get('wake_word_name', ''))
@@ -14792,6 +15128,8 @@ try {
         """
         if getattr(self, "_capturing_glass_backdrop", False):
             return
+        if self._native_context_menu_visual_guard():
+            return  # Do not raise an overlay over a native OS context menu.
         # A native wake-word training popup must remain above the fullscreen
         # click-through owner (and must keep keyboard/mouse focus for Cancel).
         training = getattr(self, '_wake_word_training_dialog', None)
@@ -14802,7 +15140,9 @@ try {
                 getattr(self, "_last_linux_geometry_sync_check", 0.0)) >= 0.5:
             self._last_linux_geometry_sync_check = now
             self._sync_linux_fullscreen_geometry()
-        if now-self._last_native_topmost_reassert <= 0.06:
+        search = getattr(self, "search_dialog", None)
+        reassert_interval = 0.40 if search is not None and search.isVisible() else 0.12
+        if now-self._last_native_topmost_reassert <= reassert_interval:
             return
 
         if sys.platform.startswith("linux"):
@@ -15044,7 +15384,14 @@ try {
         # when the display target is much higher than actual capture FPS.
         # Keep the gesture/update timer running independently at its original rate.
         elapsed = now - getattr(self, "_last_scene_repaint", 0.0)
-        if self._scene_is_idle(now):
+        search = getattr(self, "search_dialog", None)
+        search_visible = bool(search is not None and search.isVisible())
+        if search_visible and self.desktop_mode == "os":
+            # The separate SearchHandOverlay renders hand/TPI movement. Keeping
+            # a second full-screen transparent HUD repaint at camera rate slows
+            # search typing and even other desktop applications unnecessarily.
+            minimum_interval = 0.12
+        elif self._scene_is_idle(now):
             minimum_interval = self.IDLE_REPAINT_INTERVAL
         elif self._scene_transition is not None:
             # The Garden/Space slide is a real animation with cached scene images.
@@ -15087,6 +15434,11 @@ try {
             desired_ms = active_frame_ms if hand_present else 66
         else:
             desired_ms = active_frame_ms if hand_present else 100
+        search = getattr(self, "search_dialog", None)
+        if search is not None and search.isVisible():
+            # Search has a dedicated independently refreshed hand layer.
+            # Maintain gestures at ~30Hz without needlessly redrawing the HUD.
+            desired_ms = max(33, desired_ms)
         timer = getattr(self, "timer", None)
         if timer is not None and timer.interval() != desired_ms:
             timer.setInterval(desired_ms)
@@ -15111,7 +15463,16 @@ try {
         """
         injector = getattr(self, "_native_touch", None)
         if injector is None or injector.unavailable:
-            return False  # Preserve legacy pointer/mouse fallback on API failure.
+            # On Linux don't silently turn a failed touchscreen into hand-driven
+            # pointer warping. Surface the uinput failure instead; glass UI works.
+            if sys.platform.startswith("linux") and self.desktop_mode == "os":
+                if not getattr(self, "_linux_touch_failure_reported", False):
+                    self._linux_touch_failure_reported = True
+                    self.status = ("Linux native multitouch unavailable: " +
+                                   str(getattr(injector, "last_error", "no /dev/uinput device")))
+                    print("Freehand:", self.status, flush=True)
+                self._touch_pending.clear()
+            return False
         if self._touch_text_drag_sides:
             # A mouse-button text selection is committed until release; do not
             # inject a competing touch (or convert to scroll mid-gesture).
@@ -15186,6 +15547,10 @@ try {
                             self.fist_quick_click_max_seconds):
                         if injector.tap(side, pending["origin"]):
                             play_ui_sound(self.ui_preferences.get("sound_pinch", "None"))
+                            if (sys.platform.startswith("win") and
+                                    self._is_native_taskbar_point(cursor_points.get(side))):
+                                self._native_context_menu_visual_guard_until = max(
+                                    self._native_context_menu_visual_guard_until, now + 8.0)
                         self._clear_menu_pinch_sequence(side)
                     pending.update(started=float(now), origin=point)
                 pending["release_started"] = None
@@ -15228,7 +15593,11 @@ try {
                                                   int(pending["origin"][1] - screen_origin.y()))
                         else:
                             origin_local = self.mapFromGlobal(QPoint(*pending["origin"]))
+                        # Text-selection drags deliberately use a held mouse
+                        # button, unlike ordinary Linux touchscreen taps.
                         if self._begin_pinch_drag(side, QPointF(origin_local), now):
+                            self.pinch_drag_origin_points[side] = QPointF(origin_local)
+                            self._recent_text_selection = None
                             self._touch_text_drag_sides.add(side)
                             self._touch_pending.pop(side, None)
                             # Send a real drag movement from the *original* press
@@ -15260,6 +15629,10 @@ try {
                         self.status = "Touch tap unavailable: " + injector.last_error
                     else:
                         play_ui_sound(self.ui_preferences.get("sound_pinch", "None"))
+                        if (sys.platform.startswith("win") and
+                                self._is_native_taskbar_point(cursor_points.get(side))):
+                            self._native_context_menu_visual_guard_until = max(
+                                self._native_context_menu_visual_guard_until, now + 8.0)
                     self._touch_pending.pop(side, None)
                     self._clear_menu_pinch_sequence(side)
                     if self.gesture_owner == side:
@@ -15314,6 +15687,11 @@ try {
         self._timer_during_sound_seen_keys.clear()
         self._remember_external_foreground_window()
         now = time.monotonic()
+        if self.desktop_mode == "os" and self._native_context_menu_block_active(now):
+            # The right-click was already emitted; never reinterpret its held
+            # selection pinch as a click on (and instant dismissal of) Explorer.
+            self._request_scene_repaint(now)
+            return
         previous_scene_time = getattr(self, "_last_update_scene_time", now)
         # Bound the per-frame scroll integration delta so a delayed frame cannot
         # generate a large burst of wheel events.
@@ -15893,6 +16271,11 @@ try {
                 # Once a fist gesture has begun, a non-open pinch classification is noise;
                 # keep the fist action in control until the user clearly opens the hand.
                 is_fist, is_pinch = True, False
+
+            # A fist on recently highlighted text picks it up as transferable MIME
+            # data. Gesture ownership prevents the normal fist-scroll/window drag.
+            if self._handle_selected_item_drag(side, cursor, is_fist, now):
+                continue
 
             # Floating clipboard cards take gesture ownership before ordinary pinch/fist
             # clicks. Moving a held gesture out of a card starts a real OS MIME drag; a
@@ -16549,6 +16932,14 @@ try {
                             self.right_click_mode_enabled = False
                             self.scroll_mode_enabled = False
                             self.status = "Normal mode restored — release the pinch; pinch again to open the menu"
+                        elif self._point_on_recent_selection(cursor, now):
+                            # Over highlighted text a long pinch invokes the native
+                            # editing context menu instead of our circular Pinch Menu.
+                            self._activate_canvas_right_click(QPointF(cursor), side, now)
+                            self._clear_menu_pinch_sequence(side)
+                            self.action_stop_wait_open[side] = True
+                            self.action_stop_open_since[side] = None
+                            self.status = "Native text context menu — release before next gesture"
                         else:
                             self._set_pinch_menu_open(side, True, now, timer_completed=True)
                             self.fist_origin_points[side] = QPointF(cursor)
@@ -16951,7 +17342,8 @@ try {
         # An active fist scroll uses the tracked hand for scrolling, but must not
         # move the OS cursor. Restore it immediately after full-hand release.
         self._sync_scroll_cursor_visibility()
-        if (self.desktop_mode == "os" and not self._os_scroll_pointer_detached()
+        if (self.desktop_mode == "os" and not sys.platform.startswith("linux")
+                and not self._os_scroll_pointer_detached()
                 and (self._native_touch is None or self._native_touch.unavailable)):
             mouse_side = self.pointer_side
             if mouse_side not in cursor_points or self.mouse_detached_by_side.get(mouse_side, False):
@@ -17968,8 +18360,17 @@ try {
                         self._draw_fitted_button_label(painter, train_rect,
                             'TRAIN WAKE WORD  ·  ' + ('VERIFIED' if trained else '3 RECOGNITIONS'),
                             base_size=label_size, min_size=6, inset=12*scale)
+                        listen_rect = controls['wake_word_listening_toggle']
+                        listening = bool(self.ui_preferences.get('wake_word_listening', False))
+                        painter.setBrush(QBrush(QColor(39, 123, 84, 228) if listening else QColor(75, 80, 89, 205)))
+                        painter.setPen(QPen(QColor(155, 245, 185, 215) if listening else QColor(155, 162, 172, 200), 1.5*scale))
+                        painter.drawRoundedRect(listen_rect, 10*scale, 10*scale)
+                        painter.setPen(QColor(240, 253, 255))
+                        self._draw_fitted_button_label(painter, listen_rect,
+                            'WAKE-WORD LISTENING  ·  ' + ('ON' if listening else 'OFF'),
+                            base_size=label_size, min_size=6, inset=12*scale)
                         wake_status = ('Wake standby: microphone listening locally  ·  '
-                                       if trained and not self.stt_enabled and self.speech.running else '')
+                                       if listening and trained and not self.stt_enabled and self.speech.running else '')
                         voice_status = wake_status + f"{self.tts.status}  ·  {self.face_enrollment_status}"
                         self._draw_wrapped_fitted_text(painter, text_rects["status"], voice_status[:150],
                                                        base_size=max(6, int(7*scale)), min_size=6)
@@ -18216,6 +18617,7 @@ try {
                 self._paint_gesture_timer_fade(painter, side, now)
                 self._paint_pinch_menu(painter, side, now)
             self._paint_floating_clipboard(painter, now)
+            self._paint_selected_item_drag(painter)
 
             # Reticle and skeleton use the fixed hand-relative (optionally calibrated) TLI anchor.
             # During TLI calibration the dedicated target window is the sole visual owner;
@@ -18492,7 +18894,8 @@ try {
             active_indicators.append(("🎤>_", "dictation_indicator_position", QColor(104, 235, 180, 255)))
         if self.stt_enabled:
             active_indicators.append(("🎤", "stt_indicator_position", QColor(110, 220, 250, 255)))
-        elif self._has_trained_wake_word() and self.speech.running:
+        elif (self.ui_preferences.get('wake_word_listening', False) and
+              self._has_trained_wake_word() and self.speech.running):
             active_indicators.append(("WAKE", "stt_indicator_position", QColor(195, 205, 135, 255)))
         for indicator_text, position_key, accent in active_indicators:
             indicator_rect = self._notification_rect(
