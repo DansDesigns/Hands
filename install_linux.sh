@@ -19,7 +19,9 @@ if [ "${1:-}" = "--configure-uinput" ]; then
         groupadd --system freehand-uinput
     fi
     mkdir -p /etc/udev/rules.d
-    printf '%s\n' 'KERNEL=="uinput", SUBSYSTEM=="misc", GROUP="freehand-uinput", MODE="0660"' > /etc/udev/rules.d/70-freehand-uinput.rules
+    # Use group ownership on desktops without logind; where available,
+    # uaccess also grants the active graphical user direct access.
+    printf '%s\n' 'KERNEL=="uinput", SUBSYSTEM=="misc", GROUP="freehand-uinput", MODE="0660", TAG+="uaccess"' > /etc/udev/rules.d/70-freehand-uinput.rules
     if command -v modprobe >/dev/null 2>&1; then
         modprobe uinput || echo 'Note: uinput may be built into the kernel.'
     fi
@@ -34,8 +36,23 @@ if [ "${1:-}" = "--configure-uinput" ]; then
             chmod 0660 "$device"
         fi
     done
-    echo "Freehand multitouch enabled for account: $account"
-    echo 'Log out and log back in before using multitouch if group membership is new.'
+    # The new group membership applies at the next login. Where POSIX ACLs
+    # are available, make the existing /dev/uinput usable immediately, without
+    # temporarily opening the device to every local user or adding a repair step.
+    IMMEDIATE_TOUCH=0
+    if command -v setfacl >/dev/null 2>&1; then
+        for device in /dev/uinput /dev/input/uinput; do
+            if [ -e "$device" ] && setfacl -m "u:$account:rw" "$device"; then
+                IMMEDIATE_TOUCH=1
+            fi
+        done
+    fi
+    echo "Freehand multitouch configured for account: $account"
+    if [ "$IMMEDIATE_TOUCH" -eq 1 ]; then
+        echo 'The current account can access /dev/uinput immediately (POSIX ACL).'
+    elif ! id -nG "$account" | tr ' ' '\n' | grep -qx freehand-uinput; then
+        echo 'IMPORTANT: Log out and sign back in for the new multitouch group membership.'
+    fi
     exit 0
 fi
 
