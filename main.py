@@ -139,6 +139,7 @@ from d1_decision import (classify_voice_command, start_loading as start_d1_loadi
                          status as d1_status, MODELS as D1_MODELS, stop_server as stop_d1_server,
                          start_loading as start_d1_server)
 from search_launcher import SearchLauncherDialog
+from freehand_search_index import SearchIndex
 from face_welcome import FaceWelcomeService
 from tli_calibration import encode_relative_tli, resolve_relative_tli, mean_relative_tli
 from tpi_screen_calibration import (
@@ -160,13 +161,8 @@ from hand_calibration import (
 import cv2
 import numpy as np
 
-try:
-    import mediapipe as mp
-    from mediapipe.tasks import python
-    from mediapipe.tasks.python import vision
-except Exception as exc:
-    print("MediaPipe is required:", exc)
-    raise SystemExit(1)
+# MediaPipe's native model runtime is imported only by the tracker worker.
+# Loading it at module import used to delay the first visible Qt window.
 
 from PySide6.QtCore import Qt, QTimer, QPoint, QPointF, QRect, QRectF, QObject, Signal, QMimeData, QBuffer, QIODevice
 from PySide6.QtGui import QPainter, QColor, QPen, QBrush, QFont, QFontMetricsF, QCursor, QLinearGradient, QImage, QPainterPath, QPainterPathStroker, QRadialGradient, QGradient, QPolygonF, QDrag, QPixmap
@@ -183,12 +179,7 @@ try:
 except Exception:
     pyautogui = None
 
-try:
-    import vosk
-    import sounddevice as sd
-except Exception:
-    vosk = None
-    sd = None
+# Voice services own their Vosk/audio imports; they are unused in this module.
 
 ROOT = Path(__file__).resolve().parent
 MODELS = ROOT / "models"
@@ -1328,7 +1319,8 @@ def _set_start_on_login(enabled, app_root=ROOT):
                 content = ("[Desktop Entry]\n"
                            "Type=Application\n"
                            "Name=Freehand: Spatial Computing\n"
-                           f'Exec="{quoted}"\n'
+                           f'Exec=/bin/bash "{quoted}"\n'
+                           f'Path={app_root}\n'
                            "Terminal=false\n"
                            "X-GNOME-Autostart-enabled=true\n"
                            "Categories=Utility;\n")
@@ -1348,6 +1340,77 @@ def _set_start_on_login(enabled, app_root=ROOT):
     return False, "Start on Login is supported on Windows and Linux"
 
 
+def repair_linux_app_shortcut(app_root=ROOT):
+    """Repair the installed application-menu entry using a known-working script.
+
+    Shell scripts may not be executable or may require their own working directory;
+    desktop files are not shells, so launch the existing run_linux.sh via Bash.
+    A user-local entry overrides the same-named system entry without sudo.
+    """
+    if not sys.platform.startswith("linux"):
+        return False
+    app_root = Path(app_root).resolve()
+    launcher = app_root / "run_linux.sh"
+    if not launcher.is_file():
+        return False  # Do not write a shortcut that cannot launch the app.
+    applications = Path(os.environ.get("XDG_DATA_HOME") or Path.home() / ".local/share") / "applications"
+    # This is the canonical filename installed by install_linux.sh; update it
+    # in place rather than producing another application-menu shortcut.
+    target_name = "spatial-desktop-prototype.desktop"
+    legacy_names = ("freehand.desktop", "freehand-spatial-computing.desktop",
+                    "spatial-desktop.desktop", "spatial_desktop.desktop")
+
+    def quote_exec_path(path):
+        value = str(path)
+        for old, new in (("\\", "\\\\"), ('"', '\\"'), ("$", "\\$"), ("`", "\\`")):
+            value = value.replace(old, new)
+        return '"' + value + '"'
+
+    icon = None
+    for rel in ("Freehand_logo_small.png", "assets/icons/freehand.png", "assets/icons/icon.png", "assets/icon.png",
+                "assets/icon.ico", "freehand.png", "icon.png"):
+        candidate = app_root / rel
+        if candidate.is_file():
+            icon = str(candidate)
+            break
+    content = ("[Desktop Entry]\n"
+               "Type=Application\n"
+               "Name=Freehand: Spatial Computing\n"
+               "Comment=Hand tracking and voice-driven spatial desktop\n"
+               f"Exec=/bin/bash {quote_exec_path(launcher)}\n"
+               f"Path={app_root}\n"
+               "Terminal=false\n"
+               "StartupNotify=false\n"
+               "Categories=Utility;Accessibility;\n"
+               + (f"Icon={icon}\n" if icon else ""))
+    try:
+        applications.mkdir(parents=True, exist_ok=True)
+        target = applications / target_name
+        if not target.exists() or target.read_text(encoding="utf-8") != content:
+            temporary = target.with_suffix(".desktop.tmp")
+            try:
+                temporary.write_text(content, encoding="utf-8")
+                os.chmod(temporary, 0o644)
+                os.replace(temporary, target)
+            finally:
+                temporary.unlink(missing_ok=True)
+        # Remove only recognized Freehand entries from older releases, leaving
+        # unrelated and user-customized desktop shortcuts untouched.
+        for name in legacy_names:
+            stale = applications / name
+            try:
+                entry = stale.read_text(encoding="utf-8")
+                if ("Name=Freehand: Spatial Computing" in entry and
+                        "run_linux.sh" in entry):
+                    stale.unlink(missing_ok=True)
+            except (OSError, UnicodeError):
+                pass
+        return True
+    except OSError as exc:
+        print("Could not repair Linux launcher:", exc, flush=True)
+        return False
+
+
 def load_ui_preferences() -> dict:
     defaults = {
         "paused_notice_position": "bottom-center",
@@ -1360,6 +1423,7 @@ def load_ui_preferences() -> dict:
         "show_gesture_disabled_indicator": True,
         "debug_console": False,
         "start_on_login": False,
+        "d1_autostart": False,
         "wake_word_name": "",
         "wake_word_trained": False,
         "garden_onboarding_completed": False,
@@ -1379,7 +1443,7 @@ def load_ui_preferences() -> dict:
                     result[key] = min(1.4, max(0.7, float(value)))
                 except (TypeError, ValueError):
                     pass
-            elif key in ("show_gesture_disabled_indicator", "garden_onboarding_completed", "debug_console", "start_on_login", "wake_word_trained"):
+            elif key in ("show_gesture_disabled_indicator", "garden_onboarding_completed", "debug_console", "start_on_login", "wake_word_trained", "d1_autostart"):
                 if isinstance(value, bool):
                     result[key] = value
             elif key == "wake_word_name":
@@ -1406,7 +1470,7 @@ def save_ui_preferences(values: dict) -> None:
                 current[key] = min(1.4, max(0.7, float(value)))
             except (TypeError, ValueError):
                 pass
-        elif key in ("show_gesture_disabled_indicator", "garden_onboarding_completed", "debug_console", "start_on_login", "wake_word_trained"):
+        elif key in ("show_gesture_disabled_indicator", "garden_onboarding_completed", "debug_console", "start_on_login", "wake_word_trained", "d1_autostart"):
             if isinstance(value, bool):
                 current[key] = value
         elif key == "wake_word_name":
@@ -1477,6 +1541,35 @@ def save_tli_calibrations(values: dict) -> bool:
         return False
 
 
+# User-facing rendering targets. Gesture/camera inference is deliberately independent.
+HAND_DISPLAY_FPS_CHOICES = (30, 60, 90, 120)
+HAND_CAPTURE_FPS_MIN = 5
+HAND_CAPTURE_FPS_MAX = 120
+
+
+def clamp_hand_capture_fps(value, default=15):
+    """Five-FPS camera/inference steps, preserving 15 FPS for existing installs."""
+    try:
+        requested = float(value)
+        if not math.isfinite(requested):
+            raise ValueError("non-finite capture rate")
+    except (ValueError, TypeError):
+        requested = float(default)
+    return int(min(HAND_CAPTURE_FPS_MAX, max(HAND_CAPTURE_FPS_MIN,
+                                           round(requested / 5.0) * 5)))
+
+
+def snap_hand_display_fps(value, default=30):
+    """Normalize old settings and slider movement to supported FPS steps."""
+    try:
+        fps = float(value)
+        if not math.isfinite(fps):
+            raise ValueError("non-finite FPS")
+    except (ValueError, TypeError):
+        fps = float(default)
+    return min(HAND_DISPLAY_FPS_CHOICES, key=lambda choice: (abs(choice - fps), choice))
+
+
 def save_gesture_settings(values: dict) -> None:
     """Persist settings used by the shape-and-timing hand input system."""
     def clamped(key, low, high, default):
@@ -1537,7 +1630,8 @@ def save_gesture_settings(values: dict) -> None:
         "#",
         "# SETTINGS",
         "# hand_visual_scale: skeleton/TPI scale, 0.1 to 1.0.",
-        "# hand_display_fps: visual hand refresh cap, 5 to 30 FPS; default 15. Hand detection runs separately.",
+        "# hand_display_fps: visual refresh targets 30/60/90/120 FPS, default 30. Camera inference runs independently.",
+        "# hand_capture_fps: camera/MediaPipe inference target 5 to 120 FPS, in steps of 5; default 15. Hardware/performance may limit the achieved rate.",
         "# hand_contact_band_ratio: palm attraction distance beyond touch, in palm widths; 0.0 to 0.9; default 0.02.",
         "# palm_attract_acceleration: speed multiplier for the virtual hands blending toward shared contact alignment; 0.2 to 5.0x; default 0.33x.",
         "# skin_tone_darkness: 0 to 100 percent extra warm darkening of the skin-like hand mesh.",
@@ -1574,7 +1668,8 @@ def save_gesture_settings(values: dict) -> None:
         "# Settings slider drag uses a reduced gain (0.42x) for finer control; initial pickup preserves the value.",
         "# Default TPI colours: LEFT red, RIGHT blue. Swatches can still cycle independently.",
         f"hand_visual_scale={clamped('hand_visual_scale', 0.1, 1.0, 0.3):.2f}",
-        f"hand_display_fps={clamped('hand_display_fps', 5.0, 30.0, 15.0):.0f}",
+        f"hand_display_fps={snap_hand_display_fps(values.get('hand_display_fps'))}",
+        f"hand_capture_fps={clamp_hand_capture_fps(values.get('hand_capture_fps', 15))}",
         f"hand_recognition_threshold={clamped('hand_recognition_threshold', 0.30, 0.90, 0.60):.2f}",
         f"hand_contact_band_ratio={clamped('hand_contact_band_ratio', 0.0, 0.9, 0.02):.2f}",
         f"palm_attract_acceleration={clamped('palm_attract_acceleration', 0.2, 5.0, 0.33):.2f}",
@@ -1622,7 +1717,8 @@ def load_gesture_settings() -> dict:
     """Load settings for cursor mapping, smoothing, timing, and hand colours."""
     values = {
         "hand_visual_scale": 0.3,
-        "hand_display_fps": 15.0,
+        "hand_display_fps": 30.0,
+        "hand_capture_fps": 15.0,
         "hand_recognition_threshold": 0.60,
         "hand_contact_band_ratio": 0.02,
         "palm_attract_acceleration": 0.33,
@@ -1664,7 +1760,8 @@ def load_gesture_settings() -> dict:
     }
     ranges = {
         "hand_visual_scale": (0.1, 1.0),
-        "hand_display_fps": (5.0, 30.0),
+        "hand_display_fps": (5.0, 120.0),
+        "hand_capture_fps": (5.0, 120.0),
         "hand_recognition_threshold": (0.30, 0.90),
         "hand_contact_band_ratio": (0.0, 0.9),
         "palm_attract_acceleration": (0.2, 5.0),
@@ -1729,6 +1826,8 @@ def load_gesture_settings() -> dict:
     # three-way option keeps its old flat/skeleton interpretation.
     if legacy_hand_skin_effect and not explicit_hand_render_style:
         values.pop("hand_render_style", None)
+    values["hand_display_fps"] = snap_hand_display_fps(values["hand_display_fps"])
+    values["hand_capture_fps"] = clamp_hand_capture_fps(values["hand_capture_fps"])
     return values
 
 
@@ -2038,24 +2137,16 @@ class _HandVisualMotionFilter:
 
 class Tracker:
     """Low-latency, hand-only MediaPipe tracker. No body-pose model is loaded."""
-    def __init__(self):
-        options = vision.HandLandmarkerOptions(
-            base_options=python.BaseOptions(model_asset_path=str(HAND_MODEL)),
-            running_mode=vision.RunningMode.VIDEO,
-            num_hands=2,
-            # Do not lower MediaPipe's global thresholds to solve the side-on case:
-            # that was allowing background false positives to become phantom hands.
-            # Side-on views are handled by a narrow, high-confidence geometry exception.
-            min_hand_detection_confidence=0.60,
-            min_hand_presence_confidence=0.58,
-            min_tracking_confidence=0.55,
-        )
-        self.hands = vision.HandLandmarker.create_from_options(options)
+    def __init__(self, capture_fps=15):
+        self.capture_fps = clamp_hand_capture_fps(capture_fps)
+        self._capture_requested_at = time.monotonic()
+        # Model creation and camera opening can block for seconds on some systems.
+        # Initialize both in the existing capture worker: the glass UI can show
+        # immediately, while snapshot() safely returns no hands until ready.
+        self.hands = None
         self.camera_index = 0
-        self.cap = self._open_camera(self.camera_index)
-        if self.cap is None:
-            self.hands.close()
-            raise RuntimeError("Could not open camera. Check camera permissions and the camera index.")
+        self.cap = None
+        self.initialization_error = ""
         self._reopen_failures = 0
         self.running = True
         self.hand_tracking_enabled = True
@@ -2080,14 +2171,18 @@ class Tracker:
     CAMERA_RESUME_GAP_SECONDS = 3.0   # one loop pass this long (sleep/resume) -> reopen
     CAMERA_REOPEN_MAX_DELAY = 30.0
 
-    @staticmethod
-    def _open_camera(index):
+    def _open_camera(self, index):
         cap = cv2.VideoCapture(index, cv2.CAP_DSHOW) if sys.platform.startswith("win") else cv2.VideoCapture(index)
         if not cap.isOpened():
             cap.release()
             return None
         cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
         cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 360)
+        # A best-effort request: camera drivers may clamp or ignore the FPS setting.
+        try:
+            cap.set(cv2.CAP_PROP_FPS, float(self.capture_fps))
+        except (ValueError, OSError, cv2.error):
+            pass
         try:
             cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
         except Exception:
@@ -2138,13 +2233,47 @@ class Tracker:
         self._reopen_failures += 1
         return False
 
+    def set_capture_fps(self, value):
+        """Change the MediaPipe cadence live without restarting/freezing the camera."""
+        new_rate = clamp_hand_capture_fps(value)
+        if new_rate != self.capture_fps:
+            self.capture_fps = new_rate
+            self._capture_requested_at = time.monotonic()
+
     def _loop(self):
+        try:
+            import mediapipe as mp
+            from mediapipe.tasks import python as mp_python
+            from mediapipe.tasks.python import vision
+            options = vision.HandLandmarkerOptions(
+                base_options=mp_python.BaseOptions(model_asset_path=str(HAND_MODEL)),
+                running_mode=vision.RunningMode.VIDEO,
+                num_hands=2,
+                # Keep the established thresholds; never trade safety for startup speed.
+                min_hand_detection_confidence=0.60,
+                min_hand_presence_confidence=0.58,
+                min_tracking_confidence=0.55,
+            )
+            landmark_model = vision.HandLandmarker.create_from_options(options)
+            if not self.running:
+                landmark_model.close()
+                return
+            self.hands = landmark_model
+            self.cap = self._open_camera(self.camera_index)
+            if self.cap is None:
+                print("Camera not available at startup; retrying in background.", flush=True)
+        except Exception as exc:
+            self.initialization_error = str(exc)
+            print("Hand tracker could not initialize:", exc, flush=True)
+            return
         last_frame_time = 0.0
         # Inference is the largest ongoing CPU cost. Preserve a responsive active
         # tracking cadence, but avoid processing excess camera frames with no hands.
         # Gesture countdown timing is wall-clock based and still updated by the UI.
-        frame_interval = 1.0 / 15.0
+        # The active target is read each frame, so the settings slider takes
+        # effect immediately. Idle capture stays modest to avoid background load.
         idle_frame_interval = 1.0 / 6.0
+        configured_camera_fps = self.capture_fps
         # Paused hand tracking only needs occasional frames for the optional face welcome.
         paused_frame_interval = 1.0 / 2.0
         idle_after_seconds = 1.0
@@ -2171,12 +2300,21 @@ class Tracker:
             last_wall, last_mono = time.time(), time.monotonic()
 
         while self.running:
-            # Active inference is capped at 15 FPS to reduce sustained CPU load. A much
+            # The user-selected capture rate controls active inference. A much
             # longer pass means
             # the PC slept (the wall clock jumps across a suspend; the monotonic clock may
             # or may not, depending on the OS) or the driver stalled in grab(): either way
             # the old camera handle is not trustworthy any more.
             wall, mono = time.time(), time.monotonic()
+            # Camera driver reconfiguration can block; debounce slider drags
+            # and configure only on this camera worker, not on the GUI thread.
+            if (self.cap is not None and self.capture_fps != configured_camera_fps
+                    and mono - self._capture_requested_at >= 0.35):
+                try:
+                    self.cap.set(cv2.CAP_PROP_FPS, float(self.capture_fps))
+                except (OSError, ValueError, cv2.error):
+                    pass
+                configured_camera_fps = self.capture_fps
             # Not armed until a frame has been processed: the very first pass includes
             # model start-up, which can be slow on a modest machine.
             if gap_check_armed and (wall - last_wall > self.CAMERA_RESUME_GAP_SECONDS or
@@ -2200,7 +2338,7 @@ class Tracker:
                 elif now - last_hand_seen > idle_after_seconds:
                     interval = idle_frame_interval
                 else:
-                    interval = frame_interval
+                    interval = 1.0 / max(1, self.capture_fps)
                 elapsed = now - last_frame_time
                 if elapsed < interval:
                     # Do not busy-spin while waiting for the next inference slot.
@@ -2335,9 +2473,13 @@ class Tracker:
     def close(self):
         self.running = False
         self.thread.join(timeout=1.2)
+        # If a slow driver is still opening, avoid closing resources underneath it.
+        if self.thread.is_alive():
+            return
         if self.cap is not None:
             self.cap.release()
-        self.hands.close()
+        if self.hands is not None:
+            self.hands.close()
 
 
 class SpeechEvents(QObject):
@@ -2380,6 +2522,7 @@ class SearchHandOverlay(QWidget):
         self._windows_virtual_desktop_pin_last_attempt = 0.0
         self._windows_virtual_desktop_pin_warning_reported = False
         self.sync_timer = QTimer(self)
+        self.sync_timer.setTimerType(Qt.PreciseTimer)
         self.sync_timer.setInterval(24)
         self.sync_timer.timeout.connect(self.sync_to_launcher)
         self.sync_timer.start()
@@ -2416,7 +2559,7 @@ class SearchHandOverlay(QWidget):
         )
         # User-configurable hand *display* FPS. This does not change camera
         # inference, the gesture state machine, or pointer/TPI input cadence.
-        hand_frame_ms = max(1, round(1000.0 / max(5, min(30, owner.hand_display_fps))))
+        hand_frame_ms = max(1, round(1000.0 / snap_hand_display_fps(owner.hand_display_fps)))
         wanted_interval = hand_frame_ms if active_visuals else 180
         if self.sync_timer.interval() != wanted_interval:
             self.sync_timer.setInterval(wanted_interval)
@@ -3123,7 +3266,8 @@ class SpatialDesktop(QWidget):
 
         settings = load_gesture_settings()
         self.hand_visual_scale = settings["hand_visual_scale"]
-        self.hand_display_fps = int(min(30, max(5, round(settings.get("hand_display_fps", 15)))))
+        self.hand_display_fps = snap_hand_display_fps(settings.get("hand_display_fps", 30))
+        self.hand_capture_fps = clamp_hand_capture_fps(settings.get("hand_capture_fps", 15))
         self.hand_recognition_threshold = float(settings.get("hand_recognition_threshold", 0.60))
         self.hand_contact_band_ratio = settings.get("hand_contact_band_ratio", 0.02)
         self.palm_attract_acceleration = settings.get("palm_attract_acceleration", 0.33)
@@ -3171,6 +3315,11 @@ class SpatialDesktop(QWidget):
         self.d1_model_dropdown_open = False
         self._d1_server_log_cache_at = 0.0
         self._d1_server_log_cache = []
+        # Log is anchored to its newest entry unless the user scrolls back.
+        # This is intentionally independent of the window/page scroll state.
+        self.d1_log_scroll_lines = 0
+        self._d1_log_visible_count = 1
+        self._d1_log_total_count = 0
         self.custom_gesture_key_capture = None  # gesture row awaiting a physical keyboard shortcut
         self._native_shortcut_capture = None
         self.custom_gesture_triggers = {"left": HoldTrigger(), "right": HoldTrigger(), "overlap": HoldTrigger()}
@@ -3192,6 +3341,7 @@ class SpatialDesktop(QWidget):
         self.swap_drag_scroll_notches = settings.get("swap_drag_scroll_notches", False)
         self.cursor_lock_priority = settings.get("cursor_lock_priority", "right")
         self.ui_preferences = load_ui_preferences()
+        self._d1_runtime_enabled = bool(self.ui_preferences.get("d1_autostart", False))
         self._wake_word_armed_until = 0.0
         self._wake_word_training_dialog = None
         self._wake_word_name_editing = False
@@ -3345,7 +3495,7 @@ class SpatialDesktop(QWidget):
         self.right_click_mode_enabled = False
         self.scroll_mode_enabled = False
 
-        self.tracker = Tracker()
+        self.tracker = Tracker(capture_fps=self.hand_capture_fps)
         self.speech_events = SpeechEvents()
         self.speech_events.final.connect(self.on_speech)
         self.speech_events.partial.connect(self.on_speech_partial)
@@ -3422,6 +3572,9 @@ class SpatialDesktop(QWidget):
         self.hub_visible = True
         self.settings_open = False
         self.settings_page = "interaction"
+        self.search_index = SearchIndex()
+        self.search_index.start()
+        self.search_settings_offset = 0
         # Gesture Map floats above the normal Glass Menu rather than replacing it
         # with a settings page. The previous position is restored on dismissal.
         self.gesture_map_overlay_visible = False
@@ -3680,6 +3833,7 @@ class SpatialDesktop(QWidget):
         except Exception:
             pass
         self.timer = QTimer(self)
+        self.timer.setTimerType(Qt.PreciseTimer)
         self.timer.timeout.connect(self.update_scene)
         self.timer.start(50)
         self.custom_key_capture_poll_timer = QTimer(self)
@@ -3698,6 +3852,7 @@ class SpatialDesktop(QWidget):
         save_gesture_settings({
             "hand_visual_scale": self.hand_visual_scale,
             "hand_display_fps": self.hand_display_fps,
+            "hand_capture_fps": self.hand_capture_fps,
             "hand_recognition_threshold": self.hand_recognition_threshold,
             "hand_contact_band_ratio": self.hand_contact_band_ratio,
             "palm_attract_acceleration": self.palm_attract_acceleration,
@@ -3750,7 +3905,7 @@ class SpatialDesktop(QWidget):
             self.d1_ui_log = []
         stamp = time.strftime("%H:%M:%S")
         self.d1_ui_log.append(f"{stamp}  {message}")
-        self.d1_ui_log = self.d1_ui_log[-80:]
+        self.d1_ui_log = self.d1_ui_log[-1000:]
         self.update()
 
     def _blur_glass_image(self, image, sigma=32.0):
@@ -6283,6 +6438,121 @@ class SpatialDesktop(QWidget):
     SETTINGS_MIN_HEIGHT = 400.0
     SETTINGS_INFO_PAGE_HEIGHT = 500.0
 
+    # ----- Freehand local Search & Indexing settings -------------------------
+    def _search_settings_visible_roots(self):
+        roots = self.search_index.get_scopes()
+        maximum = max(0, (len(roots)-1)//6*6)
+        self.search_settings_offset = min(maximum, max(0, self.search_settings_offset))
+        return roots[self.search_settings_offset:self.search_settings_offset+6]
+
+    def _search_settings_browse(self):
+        # Non-native Qt modal chooser keeps the dialog above the glass overlay,
+        # including Windows systems where native dialogs sometimes open behind it.
+        from PySide6.QtWidgets import QFileDialog
+        dialog = QFileDialog(self, "Add a folder to Freehand search", str(Path.home()))
+        dialog.setFileMode(QFileDialog.Directory)
+        dialog.setOption(QFileDialog.ShowDirsOnly, True)
+        dialog.setOption(QFileDialog.DontUseNativeDialog, True)
+        dialog.setWindowFlag(Qt.WindowStaysOnTopHint, True)
+        if dialog.exec() == QDialog.Accepted:
+            paths = dialog.selectedFiles()
+            if paths:
+                try:
+                    added = self.search_index.add_root(paths[0])
+                    self.search_settings_offset = max(0, (len(self.search_index.get_scopes())-1)//6*6)
+                    self.status = ("Added folder to search index: " if added else "Folder already indexed: ") + paths[0]
+                except (OSError, ValueError) as exc:
+                    self.status = "Cannot index folder: " + str(exc)
+        self.update()
+
+    def _search_settings_click(self, pressed):
+        if pressed("search_add"):
+            self._search_settings_browse()
+        elif pressed("search_auto"):
+            auto = not self.search_index.automatic()
+            self.search_index.set_automatic(auto)
+            self.status = "Automatic indexing " + ("enabled" if auto else "disabled")
+        elif pressed("search_rebuild"):
+            self.search_index.request_scan()
+            self.status = "File index refresh requested"
+        elif pressed("search_prev"):
+            self.search_settings_offset = max(0, self.search_settings_offset-6)
+        elif pressed("search_next"):
+            count = len(self.search_index.get_scopes())
+            self.search_settings_offset = min(max(0, (count-1)//6*6), self.search_settings_offset+6)
+        else:
+            visible = self._search_settings_visible_roots()
+            for i, root in enumerate(visible):
+                try:
+                    if pressed(f"search_toggle_{i}"):
+                        self.search_index.set_enabled(root["path"], not root["enabled"])
+                        self.status = "Updated indexed folder: " + root["path"]
+                        break
+                    if pressed(f"search_remove_{i}"):
+                        if os.path.normcase(root["path"]) == os.path.normcase(str(Path.home())):
+                            self.status = "Home can be switched off, but cannot be removed."
+                        else:
+                            self.search_index.remove_root(root["path"])
+                            self.status = "Removed indexed folder: " + root["path"]
+                        break
+                except (OSError, ValueError) as exc:
+                    self.status = "Index settings: " + str(exc)
+        self.update()
+
+    def _paint_search_settings_page(self, painter, controls, text_rects, scale):
+        def button(key, label, active=False, muted=False):
+            rect = controls[key]
+            fill = QColor(53, 139, 82, 230) if active else QColor(68, 76, 89, 210)
+            if muted:
+                fill = QColor(35, 51, 65, 155)
+            edge = QColor(153, 241, 181, 220) if active else QColor(155, 168, 182, 185)
+            painter.setBrush(QBrush(fill))
+            painter.setPen(QPen(edge, 1.5*scale))
+            painter.drawRoundedRect(rect, 9*scale, 9*scale)
+            painter.setPen(QColor(233, 249, 253) if not muted else QColor(142, 166, 177))
+            self._draw_fitted_button_label(painter, rect, label,
+                                           base_size=max(8, int(9*scale)), min_size=7, inset=7*scale)
+
+        button("search_add", "+ BROWSE / ADD FOLDER")
+        button("search_rebuild", "SCAN / REBUILD INDEX")
+        button("search_auto", "AUTO UPDATE  ·  " + ("ON" if self.search_index.automatic() else "OFF"),
+               active=self.search_index.automatic())
+        count = len(self.search_index.get_scopes())
+        button("search_prev", "◀ PREVIOUS", muted=self.search_settings_offset <= 0)
+        button("search_next", "NEXT ▶", muted=self.search_settings_offset+6 >= count)
+        painter.setPen(QColor(185, 226, 239))
+        painter.setFont(self._ui_font(8, QFont.DemiBold))
+        visible = self._search_settings_visible_roots()
+        for i in range(6):
+            key = f"search_row_{i}"
+            if i >= len(visible):
+                continue
+            root = visible[i]
+            directory = root["path"]
+            home = os.path.normcase(directory) == os.path.normcase(str(Path.home()))
+            rect = controls[key]
+            painter.setBrush(QBrush(QColor(8, 35, 53, 192)))
+            painter.setPen(QPen(QColor(109, 174, 193, 170), 1*scale))
+            painter.drawRoundedRect(rect, 9*scale, 9*scale)
+            painter.setFont(self._ui_font(8, QFont.Normal))
+            painter.setPen(QColor(229, 250, 253))
+            caption = ("HOME  ·  " if home else "FOLDER  ·  ") + directory
+            label = painter.fontMetrics().elidedText(caption, Qt.ElideMiddle, max(20, int(rect.width()-16*scale)))
+            painter.drawText(rect.adjusted(8*scale, 0, -8*scale, 0), Qt.AlignLeft | Qt.AlignVCenter, label)
+            button(f"search_toggle_{i}", "ON" if root["enabled"] else "OFF", active=root["enabled"])
+            button(f"search_remove_{i}", "DEFAULT" if home else "REMOVE", muted=home)
+        st = self.search_index.status()
+        summary = (f"{st['count']:,} indexed items  ·  "
+                   + (f"Scanning {st['scanned']:,}..." if st['scanning'] else "Ready")
+                   + f"  ·  {count} locations")
+        if st['error']:
+            summary += "  ·  " + st['error'][:70]
+        painter.setPen(QColor(189, 233, 239))
+        self._draw_wrapped_fitted_text(painter, text_rects["search_info"],
+                                       summary + "\nLocal only. Subfolders included. Home is indexed by default.",
+                                       base_size=max(8, int(9*scale)), min_size=7,
+                                       align=Qt.AlignLeft | Qt.AlignTop)
+
     def _settings_layout(self, page=None):
         """Logical layout of one Settings page (see the constants above)."""
         page = self.settings_page if page is None else page
@@ -6298,6 +6568,7 @@ class SpatialDesktop(QWidget):
 
         right_h = 0.0
         hand_fps_row_top = None
+        hand_capture_row_top = None
         if page == "interaction":
             stack("scroll_toggle")
             stack("swap_drag_scroll_toggle")
@@ -6316,7 +6587,8 @@ class SpatialDesktop(QWidget):
             # Hand display FPS belongs below the left-side buttons, not among
             # the recognition and appearance sliders on the right.
             hand_fps_row_top = y + 10.0
-            y += 74.0
+            hand_capture_row_top = y + 72.0
+            y += 134.0
         elif page == "tli":
             stack("glow_toggle")
             y += 6.0
@@ -6359,6 +6631,21 @@ class SpatialDesktop(QWidget):
             y += 80.0
             texts["about"] = (L, y, 2*W+(R-(L+W)), 44.0)
             y += 44.0 + gap
+        elif page == "search":
+            # Full-width, paginated root list shared by painting and hit testing.
+            buttons["search_add"] = (L, 0.0, W, 40.0)
+            buttons["search_rebuild"] = (R, 0.0, W, 40.0)
+            buttons["search_auto"] = (L, 50.0, W, 40.0)
+            buttons["search_prev"] = (R, 50.0, 145.0, 40.0)
+            buttons["search_next"] = (R+155.0, 50.0, 145.0, 40.0)
+            for i in range(6):
+                row_y = 108.0+i*44.0
+                buttons[f"search_row_{i}"] = (L, row_y, 420.0, 37.0)
+                buttons[f"search_toggle_{i}"] = (L+428.0, row_y, 100.0, 37.0)
+                buttons[f"search_remove_{i}"] = (L+536.0, row_y, 104.0, 37.0)
+            texts["search_info"] = (L, 387.0, 640.0, 44.0)
+            y = 440.0
+            right_h = y
         elif page == "virtual":
             stack("virtual_scene_switch")
             stack("virtual_grid_toggle")
@@ -6374,11 +6661,20 @@ class SpatialDesktop(QWidget):
             buttons["d1_stop"] = (L+half+gap, y, half, 42.0)
             y += 42.0 + gap
             stack("d1_retry", h=42.0)
+            # Keep the engine page height unchanged: both functions share a row.
+            buttons["d1_autostart"] = (L, y, half, 36.0)
+            buttons["d1_export_log"] = (L+half+gap, y, half, 36.0)
+            y += 36.0+7.0
             texts["state"] = (L, y+5.0, W, 59.0)
             texts["about"] = (L, y+68.0, W, 77.0)
             y += 150.0
-            texts["log"] = (R, 0.0, W, 310.0)
-            right_h = 310.0
+            # Keep the log level with the model selector and down near Back.
+            texts["log"] = (R, 0.0, W, 344.0)
+            right_h = 344.0
+            # The top-right scroll arrows are part of the ordinary menu hit map:
+            # they work with fingertip/pinch selection even on mouse-transparent HUDs.
+            buttons["d1_log_up"] = (R+W-62.0, 3.0, 25.0, 20.0)
+            buttons["d1_log_down"] = (R+W-32.0, 3.0, 25.0, 20.0)
         elif page == "gestures":
             y = 394.0  # see _custom_gesture_layout
         left_h = max(0.0, y - gap)
@@ -6387,10 +6683,10 @@ class SpatialDesktop(QWidget):
         right_index = 0
         for row in self._settings_slider_rows(page):
             name = row[0]
-            if page == "hands" and name == "hand_display_fps":
+            if page == "hands" and name in ("hand_display_fps", "hand_capture_fps"):
                 # Reuse the same draw/hover/drag code as every other slider,
                 # with its own left-column coordinates and button-safe spacing.
-                row_top = hand_fps_row_top
+                row_top = hand_fps_row_top if name == "hand_display_fps" else hand_capture_row_top
                 track_left, track_right = L+12.0, L+W-12.0
                 label_x = L
             else:
@@ -6465,13 +6761,13 @@ class SpatialDesktop(QWidget):
         tab_height = 40.0*scale
         # Reserve more room for ENGINE and VIRTUAL without extending the strip
         # beyond the panel; labels have their own fitted text rectangles.
-        widths = [78.0, 51.0, 42.0, 53.0, 69.0, 47.0, 68.0, 54.0, 76.0, 47.0]
-        total = sum(widths)*scale + tab_gap*9.0
+        widths = [74.0, 49.0, 42.0, 53.0, 66.0, 46.0, 65.0, 48.0, 69.0, 62.0, 47.0]
+        total = sum(widths)*scale + tab_gap*(len(widths)-1)
         left = cx-total*0.5
         _panel_width, panel_height = self._menu_panel_dimensions()
         y = cy-(panel_height*0.5-25.0)*scale
         # Keep UPDATE as the final tab at the far right of the strip.
-        names = ("interaction", "hands", "tli", "notifications", "gestures", "voice", "d1", "sounds", "virtual", "update")
+        names = ("interaction", "hands", "tli", "notifications", "gestures", "voice", "d1", "sounds", "virtual", "search", "update")
         rects = {}
         x = left
         for name, width in zip(names, widths):
@@ -6519,13 +6815,76 @@ class SpatialDesktop(QWidget):
             with path.open("rb") as handle:
                 handle.seek(0, os.SEEK_END)
                 size = handle.tell()
-                handle.seek(max(0, size-10000))
-                chunk = handle.read(10000).decode("utf-8", errors="replace")
-            lines = [line.strip()[:170] for line in chunk.splitlines() if line.strip()]
-            self._d1_server_log_cache = lines[-14:]
+                start = max(0, size-131072)
+                handle.seek(start)
+                chunk = handle.read(131072).decode("utf-8", errors="replace")
+            if start > 0:
+                # The first line may be a truncated fragment from the seek.
+                chunk = chunk.partition("\n")[2]
+            lines = [line.rstrip()[:500] for line in chunk.splitlines() if line.strip()]
+            self._d1_server_log_cache = lines[-450:]
         except OSError:
             self._d1_server_log_cache = []
         return self._d1_server_log_cache
+
+    def _d1_log_lines(self):
+        """One bounded UI-visible history; full server output is kept for export."""
+        return (list(self.d1_ui_log) +
+                ["──────── llama-server.log ────────"] +
+                (list(self._d1_server_log_tail()) or
+                 ["Server diagnostics appear here after startup."]))
+
+    def _scroll_d1_log(self, lines):
+        """Positive lines browse older entries; negative lines return to live."""
+        maximum = max(0, len(self._d1_log_lines()) - max(1, self._d1_log_visible_count))
+        self.d1_log_scroll_lines = max(0, min(maximum, self.d1_log_scroll_lines+int(lines)))
+        self.update()
+
+    def _export_d1_log(self):
+        """Export UI events and the complete server log without a modal OS dialog.
+
+        Native file dialogs can hide behind Freehand's topmost glass UI, so a
+        one-click export to the user's Downloads folder is more dependable.
+        """
+        folder = Path.home() / "Downloads"
+        if not folder.is_dir():
+            folder = Path.home() / "Documents"
+        if not folder.is_dir():
+            folder = Path.home()
+        stamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+        destination = folder / f"Freehand_D1_Engine_{stamp}.log"
+        temporary = destination.with_suffix(".log.part")
+        server_log = ROOT / "logs" / "llama-server.log"
+        try:
+            info = d1_status()
+            with temporary.open("x", encoding="utf-8", errors="replace") as stream:
+                stream.write("Freehand D1 Engine Diagnostic Log\n")
+                stream.write("Exported: " + datetime.now().astimezone().isoformat(timespec="seconds") + "\n")
+                stream.write("Selected model: " + str(selected_d1_model()) + "\n")
+                stream.write("Backend: " + str(info.get("backend") or "unknown") + "\n")
+                stream.write("Ready: " + str(bool(info.get("ready"))) + "\n")
+                stream.write("Error: " + str(info.get("error") or "none") + "\n")
+                stream.write("\n--- Freehand Engine Events ---\n")
+                for line in self.d1_ui_log:
+                    stream.write(str(line) + "\n")
+                stream.write("\n--- Complete llama-server.log ---\n")
+                if server_log.is_file():
+                    with server_log.open("r", encoding="utf-8", errors="replace") as source:
+                        shutil.copyfileobj(source, stream, length=64*1024)
+                else:
+                    stream.write("Server log has not been created.\n")
+            os.replace(temporary, destination)
+        except (OSError, ValueError) as exc:
+            try:
+                temporary.unlink(missing_ok=True)
+            except OSError:
+                pass
+            self.status = f"Could not export D1 Engine log: {exc}"
+            self._log_d1_ui(self.status)
+            return False
+        self.status = f"Engine log exported: {destination}"
+        self._log_d1_ui(self.status)
+        return True
 
     def _sound_dropdown_layout(self, cx, cy, scale):
         # Persistent list in the right column, rather than a popup over the rows.
@@ -6802,6 +7161,8 @@ class SpatialDesktop(QWidget):
         def worker():
             try:
                 backup_root = install_update(source_root, ROOT)
+                if sys.platform.startswith("linux"):
+                    repair_linux_app_shortcut(ROOT)
                 self.update_check_signals.action_finished.emit(
                     f"Update installed successfully.\nRestart Spatial Desktop to run the new version.\nBackup: {backup_root}", "installed")
             except Exception as exc:
@@ -7029,7 +7390,8 @@ class SpatialDesktop(QWidget):
             ]
         if page == "hands":
             return [
-                ("hand_display_fps", self.hand_display_fps, 5.0, 30.0, "HAND DISPLAY FPS"),
+                ("hand_display_fps", self.hand_display_fps, 30.0, 120.0, "HAND DISPLAY FPS"),
+                ("hand_capture_fps", self.hand_capture_fps, 5.0, 120.0, "HAND CAPTURE FPS"),
                 ("hand_scale", self.hand_visual_scale, 0.1, 1.0, "HAND SCALE"),
                 ("hand_recognition_threshold", self.hand_recognition_threshold, 0.30, 0.90, "HAND RECOGNITION THRESHOLD"),
                 ("finger_thickness", self.finger_thickness, 0.8, 10.0, "FINGER THICKNESS"),
@@ -8623,10 +8985,13 @@ class SpatialDesktop(QWidget):
         if name == "ui_font_scale":
             value /= 100.0
         if name == "hand_display_fps":
-            value = float(round(value))
+            value = float(snap_hand_display_fps(value))
+        elif name == "hand_capture_fps":
+            value = float(clamp_hand_capture_fps(value))
         attributes = {
             "hand_scale": ("hand_visual_scale", 0.005),
             "hand_display_fps": ("hand_display_fps", 0.5),
+            "hand_capture_fps": ("hand_capture_fps", 0.5),
             "hand_recognition_threshold": ("hand_recognition_threshold", 0.01),
             "sensitivity": ("hand_tracking_sensitivity", 0.01),
             "scroll_acceleration": ("scroll_acceleration", 0.01),
@@ -8667,7 +9032,9 @@ class SpatialDesktop(QWidget):
             attr, threshold = attributes[name]
             old_value = float(getattr(self, attr))
             if abs(value-old_value) >= threshold:
-                setattr(self, attr, int(value) if name == "hand_display_fps" else value)
+                setattr(self, attr, int(value) if name in ("hand_display_fps", "hand_capture_fps") else value)
+                if name == "hand_capture_fps":
+                    self.tracker.set_capture_fps(int(value))
                 if name == "default_gesture_hold_seconds":
                     self.menu_pinch_hold_seconds = value
                     self.peace_toggle_hold_seconds = value
@@ -8683,6 +9050,10 @@ class SpatialDesktop(QWidget):
                     self.update()
                 else:
                     self.schedule_gesture_settings_save()
+        if name == "hand_display_fps":
+            ratio = (snap_hand_display_fps(value)-minimum)/max(1.0, maximum-minimum)
+        elif name == "hand_capture_fps":
+            ratio = (clamp_hand_capture_fps(value)-minimum)/max(1.0, maximum-minimum)
         return QPointF(left+ratio*(right-left), track_y)
 
     def _cycle_hand_colour(self, side):
@@ -9036,19 +9407,37 @@ class SpatialDesktop(QWidget):
                         self._start_update_check()
                 return
 
+            if self.settings_page == "search":
+                self._search_settings_click(pressed)
+                return
             if self.settings_page == "d1":
-                if pressed("d1_model"):
+                if pressed("d1_log_up"):
+                    self._scroll_d1_log(6)
+                elif pressed("d1_log_down"):
+                    self._scroll_d1_log(-6)
+                elif pressed("d1_export_log"):
+                    self._export_d1_log()
+                elif pressed("d1_autostart"):
+                    wanted = not bool(self.ui_preferences.get("d1_autostart", False))
+                    self.ui_preferences["d1_autostart"] = wanted
+                    save_ui_preferences(self.ui_preferences)
+                    self.status = "D1 autostart " + ("enabled" if wanted else "disabled") + " for next launch"
+                    self._log_d1_ui(self.status)
+                elif pressed("d1_model"):
                     self.d1_model_dropdown_open = not self.d1_model_dropdown_open
                     self.update()
                 elif pressed("d1_start"):
+                    self._d1_runtime_enabled = True
                     start_d1_server()
                     self.status = "Starting local d1 runtime."
                     self._log_d1_ui("Start / ensure running requested")
                 elif pressed("d1_stop"):
+                    self._d1_runtime_enabled = False
                     stop_d1_server()
                     self.status = "Local d1 runtime stopped."
                     self._log_d1_ui("Stop local server requested")
                 elif pressed("d1_retry"):
+                    self._d1_runtime_enabled = True
                     start_d1_loading()
                     self.status = "Checking d1 model and runtime; download/start requested."
                     self._log_d1_ui("Download / retry / start requested")
@@ -11283,7 +11672,7 @@ try {
                            "open pictures folder", "open videos", "open music folder",
                            "open file explorer", "open explorer", "open files", "open file browser")
         pc_action = None
-        if d1_first:
+        if d1_first and self._d1_runtime_enabled:
             try:
                 pc_action = classify_voice_command(text, aliases_for_help())
             except Exception:
@@ -11318,10 +11707,12 @@ try {
             return
         # d1 interprets less exact natural phrasing; its output is restricted to
         # supported action IDs and falls through on uncertainty.
-        try:
-            pc_action = classify_voice_command(text, aliases_for_help())
-        except Exception:
-            pc_action = None
+        pc_action = None
+        if self._d1_runtime_enabled:
+            try:
+                pc_action = classify_voice_command(text, aliases_for_help())
+            except Exception:
+                pc_action = None
         if pc_action in {"new_folder", "create_new_text_file", "create_new_powerpoint"} and not has_explicit_create_prefix(text):
             # Do not let a fuzzy classifier turn a selected item named "new folder 2"
             # (or a truncated STT phrase "new folder") into a file-creation action.
@@ -11396,7 +11787,8 @@ try {
             # Other questions may use a compatible local chat API, when present;
             # unsupported-model errors are explained rather than called network failures.
             question_start = re.match(r"^(what|why|how|who|when|where|which|can you|could you|do you|is it|are you|tell me|explain|define)\b", low)
-            if question_start and not self.focus_dictation_enabled and not (dialog is not None and dialog.isVisible()):
+            if (question_start and self._d1_runtime_enabled and not self.focus_dictation_enabled
+                    and not (dialog is not None and dialog.isVisible())):
                 self.status = "Thinking…"
                 self._ask_d1_general_question(text)
             else:
@@ -12686,7 +13078,7 @@ try {
 
     @staticmethod
     def _settings_slider_value_text(name, value):
-        if name == "hand_display_fps":
+        if name in ("hand_display_fps", "hand_capture_fps"):
             return f"{int(round(value))} FPS"
         if name == "smoothing":
             return f"{value:.2f}"
@@ -12733,6 +13125,13 @@ try {
             painter.drawLine(QPointF(left, yy), QPointF(right, yy))
             painter.setPen(QPen(QColor(125, 245, 250, 245), 4*scale, Qt.SolidLine, Qt.RoundCap))
             painter.drawLine(QPointF(left, yy), QPointF(right, yy))
+            if name == "hand_display_fps":
+                # Fixed visible stop marks make the four selectable frame rates clear.
+                painter.setPen(QPen(QColor(195, 245, 250, 225), 2.0*scale))
+                for fps in HAND_DISPLAY_FPS_CHOICES:
+                    mark_ratio = (fps-minimum)/max(1e-6, maximum-minimum)
+                    mark_x = left+mark_ratio*(right-left)
+                    painter.drawLine(QPointF(mark_x, yy-6*scale), QPointF(mark_x, yy+6*scale))
             ratio = min(1.0, max(0.0, (value-minimum)/max(1e-6, maximum-minimum)))
             painter.setBrush(QBrush(QColor(80, 255, 150, 230)))
             painter.setPen(QPen(QColor(220, 255, 245), 2*scale))
@@ -13183,7 +13582,7 @@ try {
         # 0.64 versus the previous 0.72 uses ~21% fewer offscreen pixels per
         # actual pose render (without reducing hand or cursor coordinate scale).
         render_scale = 0.64
-        render_interval = 1.0 / max(5, min(30, self.hand_display_fps))
+        render_interval = 1.0 / snap_hand_display_fps(self.hand_display_fps)
         cache = self._hand_mesh_frame_cache.get(model_side)
         render_now = (cache is None or colour != cache["colour"])
         if not render_now and now-cache["rendered_at"] >= render_interval:
@@ -14574,7 +14973,7 @@ try {
         else:
             # Honour the existing hand-display FPS setting (including 30 FPS),
             # without tying gesture inference or wheel injection to paint timing.
-            minimum_interval = 1.0 / max(5, min(30, int(self.hand_display_fps)))
+            minimum_interval = 1.0 / snap_hand_display_fps(self.hand_display_fps)
         if elapsed < minimum_interval:
             return
         self._last_scene_repaint = now
@@ -14584,19 +14983,17 @@ try {
         """Keep gestures responsive while limiting full-screen painting/inference work."""
         garden_visible = (self.desktop_mode == "virtual" and
                           getattr(self, "virtual_garden_mode", False))
+        active_frame_ms = max(1, round(1000.0 / snap_hand_display_fps(self.hand_display_fps)))
         if getattr(self, "_scene_transition", None) is not None:
-            # A scene slide stays fluid even when Glass Menu is visible. Cached scene
-            # images are moved rather than repainting both worlds at 30 FPS.
-            desired_ms = 33
+            # Keep scene slides fluent without forcing 120 FPS when the UI is idle.
+            desired_ms = active_frame_ms if hand_present else 33
         elif self.menu_open and self.hub_visible:
-            # Pause expensive background animation when reading a glass settings page.
-            desired_ms = 50 if hand_present else 100
+            # High FPS only costs CPU while somebody is interacting with the menu.
+            desired_ms = active_frame_ms if hand_present else 100
         elif garden_visible:
-            # The animated garden used to force 60 FPS even with no hands.
-            # 30 FPS during interaction, 15 FPS while idle preserves gentle motion.
-            desired_ms = 33 if hand_present else 66
+            desired_ms = active_frame_ms if hand_present else 66
         else:
-            desired_ms = 50 if hand_present else 100
+            desired_ms = active_frame_ms if hand_present else 100
         timer = getattr(self, "timer", None)
         if timer is not None and timer.interval() != desired_ms:
             timer.setInterval(desired_ms)
@@ -16465,6 +16862,7 @@ try {
         self._request_scene_repaint(now)
 
     def closeEvent(self, event):
+        self.search_index.close()
         if self._wake_word_save_timer.isActive():
             self._wake_word_save_timer.stop()
             self._save_wake_word_preferences()
@@ -16727,6 +17125,21 @@ try {
         parts.append(name)
         return "+".join(parts)
 
+    def wheelEvent(self, event):
+        """Scroll the Engine log without scrolling the OS window behind it."""
+        if (self.menu_open and self.settings_open and self.settings_page == "d1"):
+            position = event.position()
+            rect = self._settings_text_rects(page="d1").get("log")
+            if rect is not None and rect.contains(position):
+                ticks = event.angleDelta().y()/120.0
+                if not ticks and not event.pixelDelta().isNull():
+                    ticks = event.pixelDelta().y()/40.0
+                if ticks:
+                    self._scroll_d1_log(round(ticks*3) or (1 if ticks > 0 else -1))
+                    event.accept()
+                    return
+        super().wheelEvent(event)
+
     def keyPressEvent(self, event):
         capture_index = self.custom_gesture_key_capture
         if capture_index is not None:
@@ -16750,6 +17163,11 @@ try {
                 return
             event.accept()
             return
+        if self.menu_open and self.settings_open and self.settings_page == "d1":
+            if event.key() in (Qt.Key_PageUp, Qt.Key_PageDown):
+                self._scroll_d1_log(12 if event.key() == Qt.Key_PageUp else -12)
+                event.accept()
+                return
         if event.key() == Qt.Key_Space and event.modifiers() & Qt.ControlModifier:
             if self.search_dialog is not None and self.search_dialog.isVisible():
                 self.search_dialog.close()
@@ -17056,7 +17474,7 @@ try {
 
                 tab_labels = {"interaction": "INTERACTION", "hands": "HANDS", "tli": "TPI",
                               "notifications": "NOTIFY", "gestures": "GESTURES", "voice": "VOICE",
-                              "d1": "ENGINE", "update": "UPDATE", "virtual": "VIRTUAL", "sounds": "SOUNDS"}
+                              "d1": "ENGINE", "update": "UPDATE", "virtual": "VIRTUAL", "sounds": "SOUNDS", "search": "SEARCH"}
                 info_pages = ("gesture_map", "speech_commands")
                 if self.settings_page not in info_pages:
                     for page_name, tab in self._settings_tab_rects(cx, cy, scale).items():
@@ -17180,7 +17598,7 @@ try {
                     self._paint_reference_columns(painter, columns, cx, cy, scale)
 
                 elif self.settings_page in ("interaction", "hands", "tli", "gestures",
-                                            "notifications", "voice", "update", "d1", "virtual", "sounds"):
+                                            "notifications", "voice", "update", "d1", "virtual", "sounds", "search"):
                     # Every control below is placed by _settings_layout(), the same
                     # geometry used for click hit-testing and hover/press feedback.
                     controls = self._settings_control_rects(cx, cy, scale)
@@ -17490,6 +17908,8 @@ try {
                                                        base_size=max(6, int(7*scale)), min_size=6,
                                                        align=Qt.AlignHCenter | Qt.AlignTop)
 
+                    elif self.settings_page == "search":
+                        self._paint_search_settings_page(painter, controls, text_rects, scale)
                     elif self.settings_page == "d1":
                         info = d1_status()
                         model_key = selected_d1_model()
@@ -17497,6 +17917,8 @@ try {
                         runtime_button = controls["d1_start"]
                         stop_button = controls["d1_stop"]
                         retry_button = controls["d1_retry"]
+                        export_button = controls["d1_export_log"]
+                        autostart_button = controls["d1_autostart"]
                         running = bool(info.get("ready") or info.get("loading"))
                         model_active = bool(info.get("model_exists"))
                         retry_active = bool(info.get("error") or info.get("downloading") or not model_active)
@@ -17505,6 +17927,8 @@ try {
                             (runtime_button, running),
                             (stop_button, running),
                             (retry_button, retry_active),
+                            (export_button, False),
+                            (autostart_button, bool(self.ui_preferences.get("d1_autostart", False))),
                         )
                         for rect, active in button_states:
                             fill = QColor(48, 132, 76, 230) if active else QColor(72, 78, 88, 210)
@@ -17519,6 +17943,10 @@ try {
                         self._draw_fitted_button_label(painter, runtime_button, "START / ENSURE RUNNING", base_size=label_size, min_size=6, inset=8*scale)
                         self._draw_fitted_button_label(painter, stop_button, "STOP LOCAL SERVER", base_size=label_size, min_size=6, inset=8*scale)
                         self._draw_fitted_button_label(painter, retry_button, "DOWNLOAD / RETRY / START", base_size=label_size, min_size=6, inset=10*scale)
+                        self._draw_fitted_button_label(painter, export_button, "EXPORT ENGINE LOG", base_size=label_size, min_size=6, inset=8*scale)
+                        self._draw_fitted_button_label(painter, autostart_button,
+                                                       "AUTO START: " + ("ON" if self.ui_preferences.get("d1_autostart", False) else "OFF"),
+                                                       base_size=label_size, min_size=6, inset=8*scale)
                         painter.setPen(QColor(185, 225, 232))
                         if info.get("downloading"):
                             state = "DOWNLOADING MODEL FILES…"
@@ -17538,6 +17966,7 @@ try {
                         self._draw_wrapped_fitted_text(painter, text_rects["state"], state,
                                                        base_size=max(7, int(8*scale)), min_size=6)
                         self._draw_wrapped_fitted_text(painter, text_rects["about"],
+                                                       "D1 is disabled at launch by default; enable AUTO START or press START. "
                                                        "D1 handles desktop-command decisions via llama.cpp /v1/systemone. "
                                                        "Open-ended voice conversations need a generative chat model. "
                                                        "The larger D1 model downloads only if selected.",
@@ -17564,25 +17993,59 @@ try {
                                 self._log_d1_ui("Model files available; server stopped")
                             else:
                                 self._log_d1_ui("Model files missing; use Download / Retry / Start")
+                        # Draw only the visible lines. The scroll offset is measured
+                        # from the newest line (0 follows live output); wheel, arrows
+                        # and pinch controls all share this state.
+                        log_lines = self._d1_log_lines()
+                        painter.setFont(self._ui_font(7, QFont.Normal))
+                        fm = painter.fontMetrics()
+                        line_height = max(11.0*scale, float(fm.height())+2.0*scale)
+                        text_area = log_rect.adjusted(9.0*scale, 27.0*scale,
+                                                      -19.0*scale, -8.0*scale)
+                        visible = max(1, int(text_area.height()//line_height))
+                        self._d1_log_visible_count = visible
+                        self._d1_log_total_count = len(log_lines)
+                        maximum = max(0, len(log_lines)-visible)
+                        self.d1_log_scroll_lines = min(maximum, max(0, self.d1_log_scroll_lines))
+                        end_line = max(0, len(log_lines)-self.d1_log_scroll_lines)
+                        first_line = max(0, end_line-visible)
+                        painter.save()
+                        painter.setClipRect(text_area)
+                        painter.setPen(QColor(190, 222, 230))
+                        baseline = text_area.top()+float(fm.ascent())
+                        for index in range(first_line, end_line):
+                            display = fm.elidedText(log_lines[index], Qt.ElideRight,
+                                                    max(12, int(text_area.width())))
+                            painter.drawText(QPointF(text_area.left(), baseline), display)
+                            baseline += line_height
+                        painter.restore()
                         painter.setPen(QColor(185, 225, 232))
                         painter.setFont(self._ui_font(7, QFont.DemiBold))
-                        painter.drawText(log_rect.adjusted(9*scale, 4*scale, -9*scale, -4*scale),
+                        painter.drawText(log_rect.adjusted(9*scale, 3*scale, -72*scale, -4*scale),
                                          Qt.AlignLeft | Qt.AlignTop, "ENGINE LOG")
-                        server_lines = self._d1_server_log_tail()
-                        # Show recent events followed by the actual llama-server output.
-                        # Keep lines bounded for fast, predictable painting.
-                        log_lines = self.d1_ui_log[-6:]
-                        if server_lines:
-                            log_lines += ["── llama-server.log ──"] + server_lines[-13:]
-                        else:
-                            log_lines += ["Server diagnostics appear here after startup."]
-                        log_text = "\n".join(log_lines)
-                        painter.save()
-                        painter.setClipRect(log_rect.adjusted(2*scale, 20*scale, -2*scale, -2*scale))
-                        painter.setFont(self._ui_font(7, QFont.Normal))
-                        painter.drawText(log_rect.adjusted(9*scale, 22*scale, -9*scale, -5*scale),
-                                         Qt.AlignLeft | Qt.AlignTop | Qt.TextWordWrap, log_text)
-                        painter.restore()
+                        # Two small arrows make it scrollable with hand input even
+                        # when the operating system owns the mouse wheel.
+                        for name, glyph in (("d1_log_up", "▲"), ("d1_log_down", "▼")):
+                            button = controls[name]
+                            painter.setBrush(QBrush(QColor(18, 52, 73, 220)))
+                            painter.setPen(QPen(QColor(105, 191, 207, 185), 1*scale))
+                            painter.drawRoundedRect(button, 4*scale, 4*scale)
+                            painter.setPen(QColor(229, 248, 250))
+                            painter.drawText(button, Qt.AlignCenter, glyph)
+                        # Scrollbar illustrates position and remaining history.
+                        track = QRectF(log_rect.right()-12*scale,
+                                       text_area.top(), 5*scale, text_area.height())
+                        painter.setPen(Qt.NoPen)
+                        painter.setBrush(QBrush(QColor(47, 78, 96, 180)))
+                        painter.drawRoundedRect(track, 2.5*scale, 2.5*scale)
+                        if len(log_lines) > visible:
+                            ratio = visible/len(log_lines)
+                            thumb_h = max(17.0*scale, track.height()*ratio)
+                            amount = 1.0 - self.d1_log_scroll_lines/max(1, maximum)
+                            thumb_y = track.top() + (track.height()-thumb_h)*amount
+                            painter.setBrush(QBrush(QColor(116, 216, 234, 230)))
+                            painter.drawRoundedRect(QRectF(track.x(), thumb_y, track.width(), thumb_h),
+                                                    2.5*scale, 2.5*scale)
 
                     if self.settings_page == "gestures" and self.custom_gesture_dropdown is not None:
                         # Painted after the sliders so the open list sits on top of them.
@@ -18164,14 +18627,20 @@ def main():
     QTimer.singleShot(0, window._sync_linux_fullscreen_geometry)
     QTimer.singleShot(250, window._sync_linux_fullscreen_geometry)
     window.apply_desktop_mode()
+    # Starting llama.cpp may involve process cleanup/model probing. Do it after
+    # the first paint so a slow local engine cannot hold up the desktop overlay.
+    def _boot_engine():
+        try:
+            start_d1_loading(fresh=True)
+        except Exception as exc:
+            print("Local D1 startup failed:", exc, flush=True)
+    if window.ui_preferences.get("d1_autostart", False):
+        QTimer.singleShot(750, lambda: threading.Thread(
+            target=_boot_engine, name="Freehand-D1-startup", daemon=True).start())
+    if sys.platform.startswith("linux"):
+        QTimer.singleShot(0, repair_linux_app_shortcut)
     sys.exit(app.exec())
 
 
 if __name__ == "__main__":
-    try:
-        # On each fresh app launch, clean up a leftover app-managed llama-server
-        # before requesting a new runtime. Ordinary retries do not force a restart.
-        start_d1_loading(fresh=True)
-    except Exception:
-        pass
     main()

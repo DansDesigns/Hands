@@ -75,23 +75,6 @@ else
 fi
 VPY="$APP_DIR/.venv/bin/python"
 
-echo '[3b/9] Installing Freehand Search and Indexing modules...'
-# Do not silently proceed if the bundle is missing. User data lives outside APP_DIR
-# and must not be overwritten on upgrades.
-for addon in freehand_search_index.py apply_freehand_search_settings.py; do
-    if [ ! -f "$APP_DIR/$addon" ]; then
-        echo "ERROR: Missing bundled Search and Indexing module: $addon" >&2
-        echo 'Extract the entire installer package beside main.py before installing.' >&2
-        exit 1
-    fi
-done
-if [ ! -f "$APP_DIR/main.py" ]; then
-    echo 'ERROR: main.py must be beside install_linux.sh.' >&2
-    exit 1
-fi
-"$VPY" -u "$APP_DIR/apply_freehand_search_settings.py" --main "$APP_DIR/main.py"
-"$VPY" -c 'from freehand_search_index import SearchIndex; print("Search indexer module available")'
-
 echo '[4/9] Installing Spatial Desktop and local document-search dependencies...'
 if ! "$VPY" -c 'import pip; print("Using pip", pip.__version__)'; then
     "$VPY" -m ensurepip
@@ -101,13 +84,6 @@ echo '[4b] Installing the optional 3D hand renderer (moderngl / OpenGL)...'
 if ! "$VPY" -u -m pip install -r "$APP_DIR/requirements-3d.txt"; then
     echo 'WARNING: 3D hand rendering could not be installed. The Skeleton and Flat hand styles still work.' >&2
     echo "Retry later with: $VPY -m pip install -r $APP_DIR/requirements-3d.txt" >&2
-fi
-
-echo '[4c/9] Enabling optional local music metadata support (Mutagen)...'
-if ! "$VPY" -c 'import mutagen' >/dev/null 2>&1; then
-    if ! "$VPY" -m pip install mutagen; then
-        echo 'WARNING: Filename indexing works, but embedded audio tags may not be available.' >&2
-    fi
 fi
 
 echo '[5/9] Installing optional offline StreamTTS runtime...'
@@ -176,8 +152,9 @@ else
     echo 'Linux multitouch permission configured. New group membership may require sign-out/sign-in.'
 fi
 
-echo '[9/9] Assigning the bundled Freehand launcher icon and creating the desktop entry...'
-# Use the image that ships beside this installer. Installation must not depend on a network fetch.
+echo '[9/9] Creating/updating Freehand application-menu shortcut automatically...'
+# Use the same entry name as Freehand's built-in updater. Do not create a
+# separate repair file, or another application-menu entry on each update.
 ICON_PATH="$APP_DIR/Freehand_logo_small.png"
 ICON_DESKTOP_ENTRY=""
 if [ -s "$ICON_PATH" ]; then
@@ -186,24 +163,37 @@ else
     echo "WARNING: $ICON_PATH is missing; the launcher will use the desktop default icon." >&2
 fi
 
-# ZIP extraction can lose Unix executable bits, so restore them before creating
-# a desktop entry which invokes the files.
+# ZIP extraction can lose executable bits. Bash is specified explicitly by
+# the desktop entry, so a non-executable run_linux.sh is never a launch blocker.
 chmod +x "$APP_DIR/run_linux.sh"
 
 APPS_DIR="${XDG_DATA_HOME:-$HOME/.local/share}/applications"
 mkdir -p "$APPS_DIR"
+# Directly execute the known-working launcher through Bash (not a login shell).
+# TryExec checks a real executable on all target Linux machines, not a path
+# that may have been extracted without its executable bit.
 cat > "$APPS_DIR/spatial-desktop-prototype.desktop" <<DESKTOP
 [Desktop Entry]
 Type=Application
 Name=Freehand: Spatial Computing
 Comment=Hands-free spatial computing and gesture control
-Exec="$APP_DIR/run_linux.sh"
-TryExec="$APP_DIR/run_linux.sh"
+Exec=/bin/bash "$APP_DIR/run_linux.sh"
+TryExec=/bin/bash
+Path=$APP_DIR
 $ICON_DESKTOP_ENTRY
-Terminal=true
-Categories=Utility;
+Terminal=false
+StartupNotify=false
+Categories=Utility;Accessibility;
 DESKTOP
-chmod +x "$APPS_DIR/spatial-desktop-prototype.desktop"
+chmod 0644 "$APPS_DIR/spatial-desktop-prototype.desktop"
+# Tidy superseded Freehand shortcuts from older releases without touching
+# other applications or user-customized launchers.
+for legacy in freehand.desktop freehand-spatial-computing.desktop spatial-desktop.desktop spatial_desktop.desktop; do
+    stale="$APPS_DIR/$legacy"
+    if [ -f "$stale" ] && grep -Fq 'Name=Freehand: Spatial Computing' "$stale" && grep -Fq 'run_linux.sh' "$stale"; then
+        rm -f "$stale"
+    fi
+done
 if command -v update-desktop-database >/dev/null 2>&1; then
     update-desktop-database "$APPS_DIR" >/dev/null 2>&1 || true
 fi
@@ -213,9 +203,8 @@ echo '============================================================'
 echo 'INSTALLATION COMPLETE'
 echo "Launcher: $APPS_DIR/spatial-desktop-prototype.desktop"
 echo 'Find Freehand: Spatial Computing in your app launcher.'
-echo 'Search and Indexing installed: home indexed by default; add folders in Glass Settings -> SEARCH.'
-echo 'The index refreshes in the background at startup; existing indexed-folder settings are preserved.'
 echo 'Local search uses SQLite and remains available without d1. d1 is an optional local decision model.'
+echo 'D1 remains off at runtime by default; turn it on in Settings -> Engine when required.'
 echo 'StreamTTS runs offline when its runtime and voice files are installed.'
 echo 'Face Welcome is optional and local-only; enroll a user through Settings to enable it.'
 echo '============================================================'
