@@ -161,6 +161,14 @@ from hand_calibration import (
 import cv2
 import numpy as np
 
+# Camera resize/color-conversion involves tiny frames; OpenCV thread spawning
+# costs more than it saves on modest dual/quad-core machines. TFLite still uses
+# its own delegate and retains its normal inference implementation.
+try:
+    cv2.setNumThreads(1)
+except (AttributeError, cv2.error):
+    pass
+
 # MediaPipe's native model runtime is imported only by the tracker worker.
 # Loading it at module import used to delay the first visible Qt window.
 
@@ -1570,6 +1578,18 @@ def snap_hand_display_fps(value, default=30):
     return min(HAND_DISPLAY_FPS_CHOICES, key=lambda choice: (abs(choice - fps), choice))
 
 
+def effective_hand_visual_fps(display_fps, capture_fps):
+    """Avoid painting duplicate camera poses at 90/120 Hz.
+
+    The visual setting remains a *ceiling*: high-rate cameras can still reach
+    high-rate visual updates, while ordinary 15/30 FPS cameras avoid redrawing
+    full-screen transparent windows eight times for the same hand pose.
+    Reserve 30 Hz for progressing gesture rings and UI hover feedback.
+    """
+    return min(snap_hand_display_fps(display_fps),
+               max(30, clamp_hand_capture_fps(capture_fps)))
+
+
 def save_gesture_settings(values: dict) -> None:
     """Persist settings used by the shape-and-timing hand input system."""
     def clamped(key, low, high, default):
@@ -2555,11 +2575,16 @@ class SearchHandOverlay(QWidget):
             any(owner.peace_hold_started.get(side) is not None for side in ("left", "right")) or
             any(owner.menu_pinch_started.get(side) is not None for side in ("left", "right")) or
             bool(getattr(owner, "custom_gesture_rings", {})) or
-            any(owner.fist_action_menu_open.get(side, False) for side in ("left", "right"))
+            any(owner.fist_action_menu_open.get(side, False) for side in ("left", "right")) or
+            any(bool(owner.gesture_timer_fade.get(side)) for side in ("left", "right")) or
+            any(time.monotonic() - float(anim.get("started_at", 0.0)) <
+                float(anim.get("duration", 0.2)) + 0.05
+                for anim in owner.pinch_menu_animation.values())
         )
         # User-configurable hand *display* FPS. This does not change camera
         # inference, the gesture state machine, or pointer/TPI input cadence.
-        hand_frame_ms = max(1, round(1000.0 / snap_hand_display_fps(owner.hand_display_fps)))
+        hand_frame_ms = max(1, round(1000.0 / effective_hand_visual_fps(
+            owner.hand_display_fps, owner.hand_capture_fps)))
         wanted_interval = hand_frame_ms if active_visuals else 180
         if self.sync_timer.interval() != wanted_interval:
             self.sync_timer.setInterval(wanted_interval)
@@ -2638,7 +2663,45 @@ class SearchHandOverlay(QWidget):
                 self._last_native_raise = now
             except Exception:
                 pass
-        self.update()
+        # Refresh the costly transparent hand layer only when its content
+        # changes. Hands arrive independently at the camera rate; repeated Qt
+        # timers with identical landmarks must not repaint an entire desktop.
+        tracker = getattr(owner, "tracker", None)
+        tracker_frame = getattr(tracker, "frame_id", -1)
+        def cursor_key(side):
+            cursor = owner.side_cursor_positions.get(side)
+            if cursor is None:
+                return None
+            return (round(cursor.x(), 1), round(cursor.y(), 1))
+        signature = (tracker_frame, cursor_key("left"), cursor_key("right"),
+                     tuple(bool(owner.gesture_tracking_enabled.get(side, True))
+                           for side in ("left", "right")),
+                     tuple(bool(owner.fist_action_menu_open.get(side, False))
+                           for side in ("left", "right")),
+                     bool(search_visible), bool(windows_global_layer),
+                     getattr(owner, "hand_render_style", None),
+                     float(getattr(owner, "hand_transparency", 75.0)),
+                     bool(getattr(owner, "floating_clipboard_visible", False)),
+                     tuple(side in owner.active_push_sides for side in ("left", "right")))
+        animated = bool(
+            any(owner.peace_hold_started.get(side) is not None
+                for side in ("left", "right")) or
+            any(owner.menu_pinch_started.get(side) is not None
+                for side in ("left", "right")) or
+            any(now - float(anim.get("started_at", 0.0)) <
+                float(anim.get("duration", 0.2)) + 0.05
+                for anim in owner.pinch_menu_animation.values()) or
+            bool(getattr(owner, "custom_gesture_rings", {})) or
+            any(now < float((owner.gesture_timer_fade.get(side) or {}).get("started_at", 0)) + 0.4
+                for side in ("left", "right")) or
+            now < owner.click_flash_until or
+            bool(getattr(owner, "floating_clipboard_visible", False))
+        )
+        if (signature != getattr(self, "_last_painted_hand_signature", None)
+                or animated or getattr(self, "_last_painted_hand_at", 0) == 0):
+            self._last_painted_hand_signature = signature
+            self._last_painted_hand_at = now
+            self.update()
 
     def paintEvent(self, event):
         """Paint one frame; the painter is always released, even if drawing fails.
@@ -3282,6 +3345,10 @@ class SpatialDesktop(QWidget):
                                   ("flat" if self.hand_skin_effect_enabled else "skeleton"))
         self._hand_mesh_renderer = None
         self._hand_mesh_frame_cache = {}
+        # Stable landmarks and finger-tuck filtering only need to run ONCE per
+        # actual MediaPipe sample, not every independent Qt animation tick.
+        self._last_stabilised_tracker_frame = -1
+        self._stabilised_hand_cache = {}
         self._hand_mesh_notice_shown = False
         self.skin_use_skeleton_color = bool(settings.get("skin_use_skeleton_color", False))
         self.hand_transparency = float(settings.get("hand_transparency", 75.0))
@@ -9587,6 +9654,16 @@ class SpatialDesktop(QWidget):
         qt_rect = screen.geometry()
         if not sys.platform.startswith("linux"):
             return qt_rect
+        # This mapping is called for every joint of both hands, often dozens
+        # of times per GUI frame. Querying XDisplayWidth/Height on EVERY point
+        # caused thousands of avoidable X11 calls while hands were visible.
+        # A short cache preserves live resolution/panel changes (and invalidates
+        # immediately if Qt reports a different geometry).
+        now = time.monotonic()
+        cached = getattr(self, "_linux_screen_geometry_cache", None)
+        if (cached is not None and now - cached[0] < 0.25 and
+                qt_rect == cached[1]):
+            return QRect(cached[2])
         context = self._linux_x11_screen_context()
         if context is None:
             self._linux_native_pointer_warp_compatible = False
@@ -9602,7 +9679,9 @@ class SpatialDesktop(QWidget):
         resolved, native_compatible = resolve_fullscreen_bounds(
             qt_bounds, (context["width"], context["height"]))
         self._linux_native_pointer_warp_compatible = bool(native_compatible)
-        return QRect(*resolved)
+        result = QRect(*resolved)
+        self._linux_screen_geometry_cache = (now, QRect(qt_rect), QRect(result))
+        return result
 
     def _virtual_point_to_global(self, point):
         """Convert a screen-local virtual-hand point into desktop-global coordinates."""
@@ -13582,7 +13661,12 @@ try {
         # 0.64 versus the previous 0.72 uses ~21% fewer offscreen pixels per
         # actual pose render (without reducing hand or cursor coordinate scale).
         render_scale = 0.64
-        render_interval = 1.0 / snap_hand_display_fps(self.hand_display_fps)
+        # Full GL rasterisation and GPU/CPU readback are much costlier than
+        # translating the cached bitmap. A 120 Hz display can still move the
+        # image at 120 Hz, but re-rig the 3D mesh only for useful new poses.
+        mesh_fps = min(30, snap_hand_display_fps(self.hand_display_fps),
+                       clamp_hand_capture_fps(self.hand_capture_fps))
+        render_interval = 1.0 / max(5, mesh_fps)
         cache = self._hand_mesh_frame_cache.get(model_side)
         render_now = (cache is None or colour != cache["colour"])
         if not render_now and now-cache["rendered_at"] >= render_interval:
@@ -14955,9 +15039,9 @@ try {
         return True
 
     def _request_scene_repaint(self, now):
-        # The camera delivers at most 15 new pose frames per second. Painting the
-        # whole fullscreen overlay at 20-30 FPS adds little responsiveness but
-        # redraws large translucent/antialiased regions, especially in Garden.
+        # Camera and GUI rates are independent. Don't redraw a fullscreen
+        # translucent window repeatedly for the same MediaPipe pose, especially
+        # when the display target is much higher than actual capture FPS.
         # Keep the gesture/update timer running independently at its original rate.
         elapsed = now - getattr(self, "_last_scene_repaint", 0.0)
         if self._scene_is_idle(now):
@@ -14973,7 +15057,15 @@ try {
         else:
             # Honour the existing hand-display FPS setting (including 30 FPS),
             # without tying gesture inference or wheel injection to paint timing.
-            minimum_interval = 1.0 / snap_hand_display_fps(self.hand_display_fps)
+            # The Windows hand layer moves independently. Its fullscreen HUD
+            # does not need 90/120 redraws a second for the same menu/indicators.
+            ui_fps = effective_hand_visual_fps(self.hand_display_fps,
+                                               self.hand_capture_fps)
+            if (sys.platform.startswith("win") and self.desktop_mode == "os" and
+                    getattr(self, "search_hand_overlay", None) is not None and
+                    getattr(self.search_hand_overlay, "_global_hand_layer_active", False)):
+                ui_fps = min(30, ui_fps)
+            minimum_interval = 1.0 / ui_fps
         if elapsed < minimum_interval:
             return
         self._last_scene_repaint = now
@@ -14983,7 +15075,8 @@ try {
         """Keep gestures responsive while limiting full-screen painting/inference work."""
         garden_visible = (self.desktop_mode == "virtual" and
                           getattr(self, "virtual_garden_mode", False))
-        active_frame_ms = max(1, round(1000.0 / snap_hand_display_fps(self.hand_display_fps)))
+        active_frame_ms = max(1, round(1000.0 / effective_hand_visual_fps(
+            self.hand_display_fps, self.hand_capture_fps)))
         if getattr(self, "_scene_transition", None) is not None:
             # Keep scene slides fluent without forcing 120 FPS when the UI is idle.
             desired_ms = active_frame_ms if hand_present else 33
@@ -15246,6 +15339,12 @@ try {
             self._stop_inactive_timer_during_sounds()
             return
         detected_hands, _frame_id = self.tracker.snapshot()
+        # The Qt animation clock and the camera are independent. Stabilising
+        # 21 joints twice for an unchanged sample spends CPU without providing
+        # additional information, and repeated filters can distort the pose.
+        if _frame_id != self._last_stabilised_tracker_frame:
+            self._stabilised_hand_cache.clear()
+            self._last_stabilised_tracker_frame = _frame_id
         hands_by_side = {}
         for label, landmarks, score in detected_hands:
             if len(landmarks) < 21 or score < self.hand_recognition_threshold:
@@ -15315,10 +15414,15 @@ try {
             self.hand_draw_offset[side] = (dx, dy)
             # Stabilise the drawn shape, not the camera data used for gestures,
             # cursor tracking or the existing two-hand contact calibration.
-            stable_visual = self._hand_visual_motion_filter.update(side, self.hand_positions[side], now)
-            self.hand_stable_positions[side] = stable_visual
-            self.hand_display_positions[side] = (
-                self.hand_positions[side], self._hand_tucker.update(side, stable_visual, now))
+            stable_pair = self._stabilised_hand_cache.get(side)
+            if stable_pair is None:
+                stable_visual = self._hand_visual_motion_filter.update(
+                    side, self.hand_positions[side], now)
+                tucked_visual = self._hand_tucker.update(side, stable_visual, now)
+                stable_pair = (stable_visual, tucked_visual)
+                self._stabilised_hand_cache[side] = stable_pair
+            self.hand_stable_positions[side] = stable_pair[0]
+            self.hand_display_positions[side] = (self.hand_positions[side], stable_pair[1])
             cursor_points[side] = QPointF(cursor)
             # All interaction code and rendering now consume the same scaled TLI.
             self.side_cursor_positions[side] = QPointF(cursor)
