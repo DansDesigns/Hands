@@ -90,11 +90,21 @@ if __name__ == "__main__" and sys.platform == "win32":
 # launcher script: no additional requirements and no window-flashing restart.
 _FREEHAND_BOOT_APP = None
 _FREEHAND_BOOT_SPLASH = None
+_FREEHAND_SPLASH_EXIT_ANIMATION = None
+_FREEHAND_SPLASH_SHOWN_AT = 0.0
+_FREEHAND_SPLASH_MIN_VISIBLE_SECONDS = 2.0
+
+# Keep the supplied Freehand_logo.png completely unchanged. These durations
+# animate only the native splash window's alpha, not the source image.
+_FREEHAND_SPLASH_FADE_IN_MS = 480
+_FREEHAND_SPLASH_FADE_OUT_MS = 460
 
 
 def _show_freehand_startup_splash():
-    global _FREEHAND_BOOT_APP, _FREEHAND_BOOT_SPLASH
-    from PySide6.QtCore import Qt as _Qt
+    global _FREEHAND_BOOT_APP, _FREEHAND_BOOT_SPLASH, _FREEHAND_SPLASH_SHOWN_AT
+    from PySide6.QtCore import (Qt as _Qt, QPropertyAnimation as _QPropertyAnimation,
+                                QEasingCurve as _QEasingCurve, QEventLoop as _QEventLoop,
+                                QTimer as _QTimer)
     from PySide6.QtGui import QPixmap as _QPixmap
     from PySide6.QtWidgets import QApplication as _QApplication, QSplashScreen as _QSplashScreen
 
@@ -127,11 +137,30 @@ def _show_freehand_startup_splash():
         screen_rect = screen.availableGeometry()
         splash.move(screen_rect.center().x() - splash.width() // 2,
                     screen_rect.center().y() - splash.height() // 2)
+    # Start transparent before mapping the window, preventing a single-frame
+    # flash of the full-opacity image on Qt/Windows. The picture itself is never
+    # transformed, recoloured, regenerated or rewritten.
+    splash.setWindowOpacity(0.0)
     _FREEHAND_BOOT_SPLASH = splash
     splash.show()
     splash.raise_()
-    # Actually display the PNG before the blocking first-run model download,
-    # model imports or the fullscreen glass-menu constructor start.
+    _FREEHAND_SPLASH_SHOWN_AT = time.monotonic()
+
+    fade_in = _QPropertyAnimation(splash, b"windowOpacity", splash)
+    fade_in.setDuration(_FREEHAND_SPLASH_FADE_IN_MS)
+    fade_in.setStartValue(0.0)
+    fade_in.setEndValue(1.0)
+    fade_in.setEasingCurve(_QEasingCurve.OutCubic)
+    # Startup immediately imports CPU-heavy modules and may synchronously
+    # download the vision model before QApplication.exec() begins. A normal
+    # asynchronous animation would freeze on the first transparent frame.
+    # Run this short nested Qt loop first so the fade is genuinely visible.
+    fade_loop = _QEventLoop()
+    fade_in.finished.connect(fade_loop.quit)
+    _QTimer.singleShot(_FREEHAND_SPLASH_FADE_IN_MS + 250, fade_loop.quit)
+    fade_in.start()
+    fade_loop.exec()
+    splash.setWindowOpacity(1.0)
     app.processEvents()
 
 
@@ -205,6 +234,187 @@ from tpi_screen_calibration import (
     map_point as map_tpi_screen_point,
 )
 from updater import VERSION_FILE, compare_versions, read_version, fetch_remote_version, download_update, install_update
+
+# The source-tree updater copies Python files in place. A Windows distribution
+# build has its Python code embedded in a running .exe: those files are locked,
+# and updating loose .py files would NOT update the packaged program. Packaged
+# builds therefore use the matching release installer and an external handoff.
+# No separate user-facing updater/repair file is needed.
+def _freehand_is_packaged_windows() -> bool:
+    if sys.platform != "win32":
+        return False
+    if getattr(sys, "frozen", False) or "__compiled__" in globals():
+        return True
+    exe = Path(sys.executable).name.casefold()
+    return exe.endswith('.exe') and exe not in ('python.exe', 'pythonw.exe', 'py.exe', 'pyw.exe')
+
+
+def _freehand_windows_release_repo() -> str:
+    # The distributor can override this at build time or in the environment if
+    # they publish installers to a different official releases repository.
+    repo = os.environ.get("FREEHAND_UPDATE_REPOSITORY", "DansDesigns/Hands").strip()
+    if not re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", repo):
+        raise ValueError("FREEHAND_UPDATE_REPOSITORY must be GitHub owner/repository")
+    return repo
+
+
+def _freehand_select_windows_installer(assets, arch=None):
+    """Pick a real Windows *installer*, never a Python ZIP or bare EXE.
+
+    A portable executable cannot install itself over its running process and
+    might lack DLLs/assets. If no clear setup asset exists, fail safely.
+    """
+    arch = (arch or os.environ.get('PROCESSOR_ARCHITECTURE') or 'AMD64').casefold()
+    want_arm = 'arm' in arch
+    want_x86 = arch in ('x86', 'i386', 'i686')
+    candidates = []
+    for asset in assets:
+        name = str(asset.get('name', '')).casefold()
+        if not name.endswith('.exe') or not any(x in name for x in ('setup', 'installer', 'install-')):
+            continue
+        if not any(x in name for x in ('freehand', 'spatial', 'hands')):
+            continue
+        if any(x in name for x in ('linux', 'darwin', 'macos', 'android')):
+            continue
+        arm = any(x in name for x in ('arm64', 'aarch64'))
+        x86 = any(x in name for x in ('win32', '-x86', '_x86', 'i386'))
+        if arm != want_arm and (arm or want_arm):
+            continue
+        if x86 != want_x86 and (x86 or want_x86):
+            continue
+        url = str(asset.get('browser_download_url') or '')
+        if not url.startswith('https://github.com/') or '/releases/download/' not in url:
+            continue
+        score = (4 if 'setup' in name else 2) + (2 if 'windows' in name or 'win-' in name else 0)
+        if want_arm and arm or want_x86 and x86 or not want_arm and not want_x86 and any(x in name for x in ('x64', 'amd64', 'win64')):
+            score += 3
+        candidates.append((score, name, asset))
+    if not candidates:
+        return None
+    return sorted(candidates, key=lambda entry: (-entry[0], entry[1]))[0][2]
+
+
+def _freehand_download_windows_installer(version, progress_callback=None) -> Path:
+    """Download the builder-produced installer from this exact tagged release.
+
+    PyInstaller source archives are never used for a frozen app. Match the
+    version, architecture and GitHub release asset before enabling INSTALL.
+    """
+    from urllib.error import HTTPError
+    version = str(version).strip().removeprefix('v')
+    if not re.fullmatch(r'[0-9]+(?:\.[0-9]+){1,3}(?:[-+][A-Za-z0-9.-]+)?', version):
+        raise ValueError('Invalid release version from the update server')
+    repo = _freehand_windows_release_repo()
+    metadata = None
+    for tag in ('v' + version, version):
+        url = 'https://api.github.com/repos/' + repo + '/releases/tags/' + tag
+        request = urllib.request.Request(url, headers={
+            'User-Agent': 'Freehand-Windows-Updater',
+            'Accept': 'application/vnd.github+json',
+            'X-GitHub-Api-Version': '2022-11-28'})
+        try:
+            with urllib.request.urlopen(request, timeout=25) as response:
+                metadata = json.load(response)
+            break
+        except HTTPError as exc:
+            if exc.code != 404:
+                raise
+    if metadata is None:
+        raise RuntimeError(f'No packaged Windows release v{version} exists in {repo}. '
+                           'Publish the distribution builder installer to GitHub Releases; '
+                           'a source ZIP cannot update the installed Freehand.exe.')
+    if metadata.get('draft') or metadata.get('prerelease'):
+        raise RuntimeError('The matching packaged release is not published as a stable release.')
+    asset = _freehand_select_windows_installer(metadata.get('assets') or [])
+    if asset is None:
+        raise RuntimeError(f'Release v{version} has no Windows setup/installer .exe. '
+                           'Upload the distribution-builder setup EXE alongside the release.')
+    expected_size = int(asset.get('size') or 0)
+    if not 100_000 <= expected_size <= 2 * 1024**3:
+        raise RuntimeError('Windows installer asset has an invalid size.')
+    digest = str(asset.get('digest') or '').strip().casefold()
+    if digest and not re.fullmatch(r'sha256:[0-9a-f]{64}', digest):
+        raise RuntimeError('Release asset has an unsupported checksum.')
+    destination = Path(tempfile.mkdtemp(prefix='Freehand-Windows-Setup-')) / str(asset['name'])
+    temp_file = destination.with_suffix('.partial')
+    request = urllib.request.Request(asset['browser_download_url'], headers={
+        'User-Agent': 'Freehand-Windows-Updater', 'Accept': 'application/octet-stream'})
+    written = 0
+    hasher = hashlib.sha256()
+    try:
+        with urllib.request.urlopen(request, timeout=60) as response, temp_file.open('wb') as output:
+            while chunk := response.read(1024 * 1024):
+                written += len(chunk)
+                if written > expected_size or written > 2 * 1024**3:
+                    raise RuntimeError('Setup download exceeds the published file size')
+                output.write(chunk)
+                hasher.update(chunk)
+                if progress_callback is not None:
+                    progress_callback(written, expected_size)
+        if written != expected_size:
+            raise RuntimeError('The Windows setup download is incomplete')
+        if digest and hasher.hexdigest() != digest.removeprefix('sha256:'):
+            raise RuntimeError('The downloaded Windows installer failed SHA256 verification')
+        # No permanent helper files or changes to the running install.
+        os.replace(temp_file, destination)
+        return destination
+    except BaseException:
+        temp_file.unlink(missing_ok=True)
+        shutil.rmtree(destination.parent, ignore_errors=True)
+        raise
+
+
+def _freehand_launch_windows_setup_handoff(setup: Path, exe: Path) -> None:
+    """Start a detached Windows helper, which waits for this PID to exit.
+
+    The helper lives only as a PowerShell command line; it is NOT placed in the
+    installation folder. The installer owns updating DLLs/EXE and any elevation
+    request. On successful completion, Freehand is relaunched automatically.
+    """
+    if not _freehand_is_packaged_windows():
+        raise RuntimeError('Windows setup handoff is only supported in the packaged application.')
+    setup = Path(setup).resolve()
+    exe = Path(exe).resolve()
+    if not setup.is_file() or setup.suffix.lower() != '.exe':
+        raise FileNotFoundError(f'Staged Windows setup not found: {setup}')
+    if not exe.is_file() or exe.suffix.lower() != '.exe':
+        raise FileNotFoundError(f'Packaged Freehand executable not found: {exe}')
+    # Embed arguments with ConvertFrom-Json instead of shell string quoting.
+    payload = json.dumps({'parent_pid': os.getpid(), 'installer': str(setup),
+                          'application': str(exe), 'directory': str(exe.parent)})
+    script = r"""$ErrorActionPreference = 'Stop'
+$job = @'
+""" + payload + r"""
+'@ | ConvertFrom-Json
+$log = Join-Path $env:TEMP 'Freehand-Windows-Update.log'
+try {
+    try { Wait-Process -Id ([int]$job.parent_pid) -Timeout 120 -ErrorAction SilentlyContinue } catch {}
+    if (Get-Process -Id ([int]$job.parent_pid) -ErrorAction SilentlyContinue) {
+        throw 'Freehand is still running; the installed EXE is locked.'
+    }
+    Start-Sleep -Milliseconds 500
+    # Run the actual distribution builder installer, not a ZIP of Python files.
+    # Let its embedded manifest/installer request permissions if needed.
+    $result = Start-Process -FilePath $job.installer -Wait -PassThru
+    if ($result.ExitCode -notin @(0, 3010)) {
+        throw ('Installer exited with code ' + $result.ExitCode)
+    }
+    if (Test-Path -LiteralPath $job.application) {
+        Start-Process -FilePath $job.application -WorkingDirectory $job.directory
+    }
+} catch {
+    try { Add-Content -LiteralPath $log -Value (($_ | Out-String).Trim()) } catch {}
+}
+"""
+    encoded = base64.b64encode(script.encode('utf-16le')).decode('ascii')
+    subprocess.Popen(['powershell.exe', '-NoProfile', '-NonInteractive',
+                      '-ExecutionPolicy', 'Bypass', '-WindowStyle', 'Hidden',
+                      '-EncodedCommand', encoded],
+                     cwd=str(setup.parent), close_fds=True,
+                     creationflags=(getattr(subprocess, 'DETACHED_PROCESS', 0x00000008) |
+                                    getattr(subprocess, 'CREATE_NEW_PROCESS_GROUP', 0x00000200) |
+                                    getattr(subprocess, 'CREATE_NO_WINDOW', 0x08000000)))
+
 from windows_virtual_desktop import pin_window_on_all_virtual_desktops
 from hand_calibration import (
     load_hand_calibration, save_hand_calibration, palm_measurements,
@@ -4126,6 +4336,10 @@ class SpatialDesktop(QWidget):
         self._onboarding_practice_progress = 0.0
         self._onboarding_last_practice_at = 0.0
         self._onboarding_practice_cooldown_until = 0.0
+        self._onboarding_window_demo = None
+        self._onboarding_window_message = ""
+        self._onboarding_window_release_since = None
+        self._onboarding_secret_unlocked_until = 0.0
         self._onboarding_button_pinch_previous = {"left": False, "right": False}
         self._onboarding_button_pinch_latched = {"left": False, "right": False}
         self._scene_arrow_pinch_previous = {"left": False, "right": False}
@@ -4329,6 +4543,7 @@ class SpatialDesktop(QWidget):
         self.update_progress_total = 0
         self.update_available = False
         self.update_download_path = None
+        self.update_remote_version = None
         self.update_action_running = False
         self.update_action_mode = ""
         self.update_installed = False
@@ -4344,8 +4559,21 @@ class SpatialDesktop(QWidget):
         self.target_depth = 0.0
         self.canvas_offset = QPointF(0.0, 0.0)
         self.menu_transition_started = 0.0
-        self.menu_transition_duration = 0.22
+        # The glass panel has an independent, reversible alpha transition.
+        # Never animate the fullscreen overlay's windowOpacity: that would also
+        # hide the tracked hands, cursors and virtual desktop.
+        self.menu_transition_duration = 0.46
         self.menu_input_block_until = 0.0
+        self._glass_fade_started_at = time.monotonic()
+        self._glass_fade_from = 0.0
+        self._glass_fade_to = 1.0
+        self._glass_startup_released = (_FREEHAND_BOOT_SPLASH is None)
+        # Notifications start alongside the first glass-menu reveal, not during
+        # the two-second branded splash. This animation is startup-only: later
+        # glass-menu toggles NEVER dim the existing notification layer.
+        self._startup_notification_fade_started_at = None
+        self._glass_deferred_reset_settings = False
+        self._glass_fade_serial = 0
         # Settings-page transitions keep the glass panel mounted while its shape
         # gently flexes and the page contents cross-fade.
         self.settings_page_transition_started = 0.0
@@ -5831,17 +6059,16 @@ class SpatialDesktop(QWidget):
     # not by pressing Next. The chapter/XP HUD is only a view of this state machine.
     ONBOARDING_LESSONS = (
         ("hello", "AWAKEN YOUR HANDS", "Show your open RIGHT hand to the camera. Hold steady to power up."),
+        ("sundial", "LIGHT UP THE SKY", "Aim at the sundial and make one quick thumb-index pinch to light the sky."),
         ("ball", "CATCH THE COMET", "Pinch the glowing ball, carry it, then open your fingers to drop it."),
-        ("sundial", "LIGHT UP THE SKY", "Aim at the stone sundial and make a quick thumb-index pinch."),
         ("space", "LAUNCH INTO SPACE", "Make a RIGHT fist, then pull DOWN. Watch the lift meter."),
         ("constellation", "CONNECT THE STARS", "Pinch a bright star, trace to another and release to save."),
         ("returned", "RETURN TO EARTH", "Make a RIGHT fist and pull UP to bring the Garden back."),
         ("peace_disabled", "STEALTH MODE", "Hold an index-and-middle-finger V sign to detach one hand."),
         ("peace_enabled", "RESTORE YOUR POWER", "Hold the SAME V sign on that hand until tracking resumes."),
         ("pinch_menu", "SUMMON THE PINCH MENU", "Pinch thumb and index in empty space, then KEEP HOLDING."),
-        ("right_click", "SECRET ACTION", "Hold LEFT fist as modifier, then quick pinch RIGHT and release."),
-        ("fist_scroll", "SCROLL SURFER", "Make a RIGHT fist and move UP or DOWN to charge the meter."),
-        ("two_fists", "WINDOW MOVER", "Keep LEFT fist steady; with RIGHT fist move sideways."),
+        ("right_click", "SECRET ACTION", "Hold your LEFT fist, aim RIGHT at the glowing secret lock and quick-pinch to unlock it."),
+        ("two_fists", "WINDOW MOVER", "Put LEFT fist in the square; grab the practice window with RIGHT fist, drag it to the target, then release."),
         ("glass_menu", "OPEN THE PORTAL", "Open both hands; bring their coloured cursor rings together."),
     )
     ONBOARDING_TIPS = {
@@ -5854,25 +6081,25 @@ class SpatialDesktop(QWidget):
         "peace_disabled": "Raise only index and middle fingers in a V; tuck the others. Hold until the built-in circular timer finishes.",
         "peace_enabled": "Use the same hand you disabled. Its V sign still works even when other gestures are detached.",
         "pinch_menu": "Make fingertip CONTACT and stay still: first the protection buffer passes, then the timer circle fills. A quick pinch is a click.",
-        "right_click": "LEFT hand makes a full fist and stays held. With RIGHT, pinch and release quickly to get contextual actions.",
-        "fist_scroll": "A real closed fist has a tucked thumb. Keep LEFT hand open; move RIGHT fist vertically, not sideways.",
-        "two_fists": "Close both hands. Hold LEFT hand nearly stationary while moving RIGHT sideways, like picking up a window.",
+        "right_click": "Hold LEFT as a full fist. Bring the RIGHT pointer over the glowing secret lock, touch thumb to index briefly, then release. The lock must light up.",
+        "two_fists": "Place the LEFT fist inside its blue square, then close the RIGHT fist on the floating practice window. Drag it to the green target and OPEN RIGHT to drop it. LEFT stays in its square.",
         "glass_menu": "Keep both hands OPEN. Overlap the red and blue pointer circles and hold until the activation ring completes.",
     }
     ONBOARDING_GESTURE_NAMES = {
         "hello": "OPEN PALM", "ball": "PINCH + DRAG", "sundial": "QUICK PINCH",
         "space": "RIGHT FIST", "constellation": "PINCH + DRAW", "returned": "RIGHT FIST",
         "peace_disabled": "PEACE SIGN", "peace_enabled": "PEACE SIGN",
-        "pinch_menu": "HOLD PINCH", "right_click": "LEFT + RIGHT",
-        "fist_scroll": "FIST SCROLL", "two_fists": "TWO FISTS", "glass_menu": "TWO OPEN HANDS",
+        "pinch_menu": "HOLD PINCH", "right_click": "LEFT FIST + RIGHT PINCH",
+        "two_fists": "TWO FISTS", "glass_menu": "TWO OPEN HANDS",
     }
     # Supplied artwork uses the original filenames, kept under the existing
     # gestures image tree. Multiple play-based lessons teach the same gesture.
-    # The welcome lesson uses the open-hand portion of Picture6 (no menu label).
+    # Picture9 is the user's specified open-hand artwork. It is optional until
+    # the supplied file is installed; never substitute or redraw another image.
     ONBOARDING_GESTURE_ART = {
-        "hello": "Picture6.png",       # open-hand illustration only, cropped
-        "ball": "Picture2.png",        # pinch and drag
+        "hello": "Picture9.png",       # user-provided introduction illustration
         "sundial": "Picture1.png",     # quick pinch / tap
+        "ball": "Picture2.png",        # pinch and drag
         "space": "Picture3.png",       # fist scroll/navigation
         "constellation": "Picture2.png",# pinch and draw
         "returned": "Picture3.png",    # inverse fist navigation
@@ -5880,7 +6107,6 @@ class SpatialDesktop(QWidget):
         "peace_enabled": "Picture8.png",
         "pinch_menu": "Picture7.png",
         "right_click": "Picture4.png",
-        "fist_scroll": "Picture3.png",
         "two_fists": "Picture5.png",
         "glass_menu": "Picture6.png",
     }
@@ -5912,6 +6138,9 @@ class SpatialDesktop(QWidget):
         self._onboarding_enabled = False
         self._onboarding_practice_anchor = None
         self._onboarding_practice_progress = 0.0
+        self._onboarding_window_demo = None
+        self._onboarding_window_message = ""
+        self._onboarding_window_release_since = None
         self._onboarding_disabled_side = None
         self._onboarding_button_pinch_latched = {"left": False, "right": False}
         self._onboarding_celebrate_until = (time.monotonic()+10.0 if show_celebration else 0.0)
@@ -5930,6 +6159,9 @@ class SpatialDesktop(QWidget):
         self._scene_tutorial_steps.add(step)
         self._onboarding_practice_anchor = None
         self._onboarding_practice_progress = 0.0
+        self._onboarding_window_demo = None
+        self._onboarding_window_message = ""
+        self._onboarding_window_release_since = None
         self._onboarding_hello_started = None
         self._onboarding_level_started = time.monotonic()
         self._onboarding_show_hint_until = 0.0
@@ -5962,6 +6194,10 @@ class SpatialDesktop(QWidget):
         self._onboarding_practice_progress = 0.0
         self._onboarding_last_practice_at = 0.0
         self._onboarding_practice_cooldown_until = 0.0
+        self._onboarding_window_demo = None
+        self._onboarding_window_message = ""
+        self._onboarding_window_release_since = None
+        self._onboarding_secret_unlocked_until = 0.0
         self._virtual_scene_grip_anchor = None
         self._virtual_scene_grip_latched = False
         self._virtual_scene_grip_active = False
@@ -6207,92 +6443,144 @@ class SpatialDesktop(QWidget):
                 self._virtual_scene_grip_anchor = None
         return True
 
+    def _onboarding_secret_target(self):
+        """Screen-space unlock target; visually anchored in the Garden scene."""
+        w, h = float(self.width()), float(self.height())
+        size = min(154.0, max(100.0, w*.125))
+        return QRectF(w*.70, h*.58, size, min(120.0, max(84.0, h*.15)))
+
+    def _onboarding_window_layout(self):
+        """Static left-fist square, movable right-fist window and docking target."""
+        w, h = float(self.width()), float(self.height())
+        box = min(132.0, max(84.0, min(w*.11, h*.17)))
+        window_w = min(202.0, max(120.0, w*.16))
+        window_h = min(134.0, max(92.0, h*.16))
+        return (QRectF(w*.12, h*.58, box, box),
+                QRectF(w*.43, h*.59, window_w, window_h),
+                QRectF(w*.76, h*.57, window_w+12, window_h+12))
+
+    def _onboarding_window_rect(self):
+        _left, source, _target = self._onboarding_window_layout()
+        state = self._onboarding_window_demo
+        if state is None:
+            return source
+        return source.translated(state["offset"])
+
+    def _onboarding_handle_window_frame(self, side, cursor, hands_by_side, now):
+        """Teach real two-fist clutch + drag + deliberate drop of a visible window.
+
+        The left fist must stay inside its own square and the right fist must
+        start on the movable practice window; neither mere sideways motion nor
+        placing an already-open hand in the target completes this quest.
+        """
+        left_zone, source, destination = self._onboarding_window_layout()
+        left = hands_by_side.get("left")
+        right = hands_by_side.get("right")
+        left_point = self.side_cursor_positions.get("left")
+        right_point = self.side_cursor_positions.get("right")
+        left_fist = bool(left and is_fist_or_grip_pose(left[0]) and
+                         self.gesture_tracking_enabled.get("left", True))
+        right_fist = bool(right and is_fist_or_grip_pose(right[0]) and
+                          self.gesture_tracking_enabled.get("right", True))
+        state = self._onboarding_window_demo
+        if state is None:
+            if left_fist and right_fist and left_point is not None and right_point is not None:
+                if left_zone.adjusted(-18, -18, 18, 18).contains(left_point) and source.adjusted(-18, -18, 18, 18).contains(right_point):
+                    self._onboarding_window_demo = {"left": QPointF(left_point),
+                                                    "right": QPointF(right_point),
+                                                    "offset": QPointF(0, 0),
+                                                    "ready": False,
+                                                    "last": now}
+                    self._onboarding_window_release_since = None
+                    self._onboarding_window_message = "GRABBED! Keep LEFT in its square; move RIGHT to the green target."
+                    self._onboarding_practice_progress = 0.12
+                elif not left_zone.adjusted(-18, -18, 18, 18).contains(left_point):
+                    self._onboarding_window_message = "Move your LEFT fist inside the blue square first."
+                else:
+                    self._onboarding_window_message = "Place your RIGHT fist on the practice window."
+            return True
+        # Keep state across a brief confidence dip, without inheriting it after
+        # either hand disappears or the left clutch leaves its square.
+        if not left_fist or left_point is None or not left_zone.adjusted(-22, -22, 22, 22).contains(left_point):
+            if now-state["last"] > 0.22:
+                self._onboarding_window_demo = None
+                self._onboarding_practice_progress = 0.0
+                self._onboarding_window_release_since = None
+                self._onboarding_window_message = "LEFT clutch released. Place both fists on their targets to try again."
+            return True
+        if right_point is None:
+            if now-state["last"] > 0.35:
+                self._onboarding_window_demo = None
+                self._onboarding_practice_progress = 0.0
+            return True
+        if right_fist:
+            self._onboarding_window_release_since = None
+            state["last"] = now
+            right_origin = state["right"]
+            dx = right_point.x()-right_origin.x()
+            dy = right_point.y()-right_origin.y()
+            # Restrict only the DEMO object, not the virtual hand itself.
+            leftbound = -source.left()+8
+            rightbound = self.width()-source.right()-8
+            topbound = -source.top()+self.height()*.42
+            bottombound = self.height()-source.bottom()-8
+            dx = max(leftbound, min(rightbound, dx))
+            dy = max(topbound, min(bottombound, dy))
+            state["offset"] = QPointF(dx, dy)
+            moved = source.translated(state["offset"])
+            state["ready"] = destination.adjusted(0, 0, 0, 0).contains(moved.center())
+            target_c = destination.center()
+            remaining = math.hypot(moved.center().x()-target_c.x(), moved.center().y()-target_c.y())
+            initial = max(80.0, math.hypot(source.center().x()-target_c.x(), source.center().y()-target_c.y()))
+            self._onboarding_practice_progress = min(.94, max(.12, 1.0-remaining/initial))
+            self._onboarding_window_message = ("IN TARGET! Open your RIGHT fist to drop the window." if state["ready"]
+                                              else "Window moving — keep LEFT anchored, drag RIGHT to the green square.")
+            return True
+        # The right hand must visibly open to drop at the destination. Requiring
+        # two frames of open pose avoids accidental completion on finger rotation.
+        if right is not None and is_fully_open_hand_pose(right[0]):
+            if self._onboarding_window_release_since is None:
+                self._onboarding_window_release_since = now
+            if now-self._onboarding_window_release_since >= 0.12:
+                if state["ready"]:
+                    self._onboarding_practice_progress = 1.0
+                    self._onboarding_complete_step("two_fists")
+                else:
+                    self._onboarding_window_demo = None
+                    self._onboarding_practice_progress = 0.0
+                    self._onboarding_window_message = "Not in the dock yet. Grab and try again!"
+                return True
+        elif now-state["last"] > 0.35:
+            self._onboarding_window_demo = None
+            self._onboarding_practice_progress = 0.0
+            self._onboarding_window_release_since = None
+        return True
+
     def _onboarding_practice_fist_frame(self, side, cursor, landmarks, hands_by_side, now,
                                         edge_tolerant=False):
-        """Capture fist exercises ONLY in the Garden tutorial, never scroll OS windows."""
+        """Consume the interactive two-fist window-mover quest in the Garden."""
         if not self._onboarding_in_garden():
             return False
         stage = self._onboarding_stage()
-        if stage is None:
+        if stage is None or stage[0] != "two_fists":
             return False
-        key = stage[0]
-        if key not in ("fist_scroll", "two_fists") and now >= self._onboarding_practice_cooldown_until:
-            return False
-        fist = (self._virtual_scene_grip_is_held(landmarks, now, edge_tolerant)
-                if side == "right" else
-                is_fist_or_grip_pose(landmarks, edge_tolerant=edge_tolerant))
-        if now < self._onboarding_practice_cooldown_until:
-            if fist:
-                self._reset_fist_gesture(side)
-                self._clear_menu_pinch_sequence(side)
-                return True
-            return False
-        if key not in ("fist_scroll", "two_fists"):
-            return False
-        if now-self._onboarding_last_practice_at > 0.5:
-            # A missing hand or a long processing stall should never finish a
-            # lesson from an old anchor when tracking resumes.
-            self._onboarding_practice_anchor = None
-            self._onboarding_practice_progress = 0.0
-        self._onboarding_last_practice_at = now
-        if not fist:
-            if side == "right":
-                self._onboarding_practice_anchor = None
-                self._onboarding_practice_progress = 0.0
-            return False
-        self._clear_menu_pinch_sequence(side)
-        self._reset_fist_gesture(side)
-        if key == "fist_scroll":
-            if side != "right" or ("left" in hands_by_side and
-                    is_fist_or_grip_pose(hands_by_side["left"][0])):
-                return True
-            if self._onboarding_practice_anchor is None:
-                self._onboarding_practice_anchor = ("scroll", QPointF(cursor))
-            kind, anchor = self._onboarding_practice_anchor
-            if kind != "scroll":
-                self._onboarding_practice_anchor = ("scroll", QPointF(cursor))
-                anchor = QPointF(cursor)
-            distance = abs(cursor.y()-anchor.y())
-            self._onboarding_practice_progress = min(1.0, distance / max(72.0, self.height()*0.09))
-            if self._onboarding_practice_progress >= 1.0:
-                self._onboarding_practice_cooldown_until = now+0.9
-                self._onboarding_complete_step("fist_scroll")
+        # Call once, on the RIGHT hand's pass. Its state machine checks BOTH
+        # tracked hands and permits opening RIGHT to drop the practice window.
+        if side == "right":
+            self._onboarding_handle_window_frame(side, cursor, hands_by_side, now)
+        # Both sides belong to this non-modal tutorial; don't interpret a fist
+        # as a virtual scene scroll or separate modifier/window manipulation.
+        if is_fist_or_grip_pose(landmarks, edge_tolerant=edge_tolerant) or self._onboarding_window_demo:
+            self._clear_menu_pinch_sequence(side)
+            self._reset_fist_gesture(side)
             return True
-        # Two fists: the left anchors the clutch, the right does the moving.
-        left_entry, right_entry = hands_by_side.get("left"), hands_by_side.get("right")
-        if left_entry is None or right_entry is None or not (
-                self.gesture_tracking_enabled.get("left", True) and
-                self.gesture_tracking_enabled.get("right", True) and
-                is_fist_or_grip_pose(left_entry[0]) and
-                is_fist_or_grip_pose(right_entry[0])):
-            self._onboarding_practice_anchor = None
-            self._onboarding_practice_progress = 0.0
-            return True
-        left_point = self.side_cursor_positions.get("left")
-        right_point = self.side_cursor_positions.get("right")
-        if left_point is None or right_point is None:
-            return True
-        if self._onboarding_practice_anchor is None or self._onboarding_practice_anchor[0] != "window":
-            self._onboarding_practice_anchor = ("window", QPointF(left_point), QPointF(right_point))
-        _, origin_left, origin_right = self._onboarding_practice_anchor
-        if math.hypot(left_point.x()-origin_left.x(), left_point.y()-origin_left.y()) > 55.0:
-            self._onboarding_practice_anchor = ("window", QPointF(left_point), QPointF(right_point))
-            self._onboarding_practice_progress = 0.0
-            return True
-        right_distance = math.hypot(right_point.x()-origin_right.x(), right_point.y()-origin_right.y())
-        self._onboarding_practice_progress = min(1.0, right_distance/max(70.0, self.width()*0.045))
-        if self._onboarding_practice_progress >= 1.0:
-            self._onboarding_practice_cooldown_until = now+0.9
-            self._onboarding_complete_step("two_fists")
-        return True
+        return False
 
     def _onboarding_paint_guide_icon(self, painter, rect, key, accent):
         """Display supplied lesson artwork, not generated stick-hand drawings.
 
         File names and transparency remain unchanged. Decode once per image,
-        then cache scaled QPixmaps for the current lesson/display size. Cropping
-        the welcome illustration removes the Glass Menu text during the initial
-        hand-detection quest, without changing Picture6.png on disk.
+        then cache scaled QPixmaps for the current lesson/display size.
         """
         name = self.ONBOARDING_GESTURE_ART.get(key)
         if not name:
@@ -6308,9 +6596,7 @@ class SpatialDesktop(QWidget):
         cache_key = (key, name, round(rect.width()), round(rect.height()))
         image = self._onboarding_guide_scaled.get(cache_key)
         if image is None:
-            src = (source.copy(0, 0, source.width(), round(source.height()*0.63))
-                   if key == "hello" else source)
-            image = src.scaled(max(1, round(rect.width())),
+            image = source.scaled(max(1, round(rect.width())),
                                max(1, round(rect.height())),
                                Qt.KeepAspectRatio, Qt.SmoothTransformation)
             self._onboarding_guide_scaled[cache_key] = image
@@ -6324,7 +6610,79 @@ class SpatialDesktop(QWidget):
         try:
             painter.setRenderHint(QPainter.Antialiasing, True)
             pulse = (1.0+0.065*math.sin(now*4.3))
-            if scene == "garden" and key in ("ball", "sundial"):
+            if scene == "garden" and now < self._onboarding_secret_unlocked_until:
+                # Show a real visible effect when the hidden action succeeds,
+                # including during the celebration for the following lesson.
+                vault = self._onboarding_secret_target()
+                painter.setPen(QPen(QColor(255, 216, 104, 248), 4))
+                painter.setBrush(QColor(70, 188, 124, 210))
+                painter.drawRoundedRect(vault, 20, 20)
+                painter.setPen(QColor(255, 255, 207))
+                painter.setFont(self._ui_font(12, QFont.Bold))
+                painter.drawText(vault, Qt.AlignCenter, "UNLOCKED!\n+100 XP")
+            if scene == "garden" and key == "right_click":
+                vault = self._onboarding_secret_target()
+                painter.setPen(QPen(QColor(110, 231, 249, 218), 4))
+                painter.setBrush(QColor(10, 66, 91, 207))
+                painter.drawRoundedRect(vault, 18, 18)
+                lock = QRectF(vault.center().x()-23, vault.center().y()-20, 46, 46)
+                painter.setPen(QPen(QColor(248, 222, 135, 244), 4))
+                painter.setBrush(QColor(248, 204, 96, 124))
+                painter.drawRoundedRect(lock, 9, 9)
+                painter.setPen(QColor(255, 255, 229))
+                painter.setFont(self._ui_font(10, QFont.Bold))
+                painter.drawText(QRectF(vault.x()-42, vault.y()-34, vault.width()+84, 27),
+                                 Qt.AlignCenter, "SECRET LOCK")
+                painter.setFont(self._ui_font(8, QFont.DemiBold))
+                painter.drawText(QRectF(vault.x()-35, vault.bottom()+5, vault.width()+70, 35),
+                                 Qt.AlignCenter, "LEFT FIST + RIGHT PINCH")
+                if self.left_click_modifier_active:
+                    painter.setPen(QPen(QColor(126, 255, 166, 242), 4, Qt.DashLine))
+                    painter.setBrush(Qt.NoBrush)
+                    painter.drawRoundedRect(vault.adjusted(-8, -8, 8, 8), 22, 22)
+            elif scene == "garden" and key == "two_fists":
+                left_zone, source, destination = self._onboarding_window_layout()
+                demo = self._onboarding_window_rect()
+                left_entry = self.side_cursor_positions.get("left")
+                left_held = self._onboarding_window_demo is not None
+                left_inside = bool(left_entry is not None and left_zone.adjusted(-18,-18,18,18).contains(left_entry))
+                # Explicit square target for the LEFT fist, in addition to the
+                # right-side window and destination.
+                painter.setPen(QPen(QColor(105, 241, 255, 250) if left_inside else
+                                    QColor(76, 178, 247, 207), 4, Qt.DashLine))
+                painter.setBrush(QColor(20, 100, 175, 94))
+                painter.drawRoundedRect(left_zone, 13, 13)
+                painter.setPen(QColor(235, 255, 255))
+                painter.setFont(self._ui_font(9, QFont.Bold))
+                painter.drawText(left_zone, Qt.AlignCenter | Qt.TextWordWrap, "LEFT\nFIST\nHOLD")
+                painter.setPen(QPen(QColor(102, 253, 161, 232), 4, Qt.DashLine))
+                painter.setBrush(QColor(38, 172, 112, 52))
+                painter.drawRoundedRect(destination, 15, 15)
+                painter.setFont(self._ui_font(9, QFont.DemiBold))
+                painter.setPen(QColor(234, 255, 237))
+                painter.drawText(QRectF(destination.left(), destination.bottom()+8,
+                                        destination.width(), 25), Qt.AlignCenter, "DROP WINDOW HERE")
+                # A real draggable practice window: its position follows RIGHT
+                # fist movement, and becomes green when docked.
+                ready = bool(self._onboarding_window_demo and self._onboarding_window_demo.get("ready"))
+                painter.setPen(QPen(QColor(122, 250, 170) if ready else QColor(115, 222, 255), 2.5))
+                painter.setBrush(QColor(12, 36, 66, 221))
+                painter.drawRoundedRect(demo, 14, 14)
+                bar = QRectF(demo.x()+2, demo.y()+2, demo.width()-4, min(32.,demo.height()*.30))
+                painter.setPen(Qt.NoPen)
+                painter.setBrush(QColor(58, 141, 195, 245) if not ready else QColor(48, 162, 104, 241))
+                painter.drawRoundedRect(bar, 11, 11)
+                painter.setPen(QColor(246, 255, 255))
+                painter.setFont(self._ui_font(9, QFont.DemiBold))
+                painter.drawText(bar, Qt.AlignCenter, "PRACTICE WINDOW")
+                painter.setFont(self._ui_font(12, QFont.Bold))
+                painter.drawText(QRectF(demo.x(), bar.bottom()+12, demo.width(), 40),
+                                 Qt.AlignCenter, "DRAG ME!" if not ready else "RELEASE!")
+                if not left_held:
+                    painter.setPen(QPen(QColor(161, 246, 255, 170), 3))
+                    painter.drawLine(source.center()+QPointF(source.width()*.65,0),
+                                     destination.center()-QPointF(destination.width()*.55,0))
+            elif scene == "garden" and key in ("ball", "sundial"):
                 if key == "ball":
                     x, y = self._garden_props["ball"]["x"]*width, self._garden_props["ball"]["y"]*height
                     radius = max(35.0, height*.053)
@@ -6355,15 +6713,6 @@ class SpatialDesktop(QWidget):
                 painter.drawLine(QPointF(cx, cy-direction*75), QPointF(cx, cy+direction*68))
                 painter.drawLine(QPointF(cx-17, cy+direction*48), QPointF(cx, cy+direction*69))
                 painter.drawLine(QPointF(cx+17, cy+direction*48), QPointF(cx, cy+direction*69))
-            elif scene == "garden" and key in ("fist_scroll", "two_fists"):
-                # A lightweight training meter with a moving highlighted endpoint.
-                cx, cy = width*.80, height*.63
-                painter.setPen(QPen(QColor(accent.red(), accent.green(),accent.blue(),135), 4))
-                painter.setBrush(Qt.NoBrush)
-                painter.drawRoundedRect(QRectF(cx-65,cy-80,130,160),18,18)
-                painter.setPen(QColor(238, 251, 255, 220))
-                painter.setFont(self._ui_font(9, QFont.DemiBold))
-                painter.drawText(QRectF(cx-100,cy+86,200,30),Qt.AlignCenter,"PRACTICE ZONE")
         finally:
             painter.restore()
 
@@ -6408,8 +6757,10 @@ class SpatialDesktop(QWidget):
             description = "GREAT CATCH! Keep pinching as you carry the ball. Open your fingers to drop it."
         elif key in ("space", "returned") and self._onboarding_practice_progress > .18:
             description = f"THRUST {round(self._onboarding_practice_progress*100)}% — KEEP PULLING WITH YOUR FIST!"
-        elif key in ("fist_scroll", "two_fists") and self._onboarding_practice_progress > .15:
-            description = f"NICE CONTROL! {round(self._onboarding_practice_progress*100)}% — keep moving."
+        elif key == "two_fists" and self._onboarding_window_message:
+            description = self._onboarding_window_message
+        elif key == "right_click" and self.left_click_modifier_active:
+            description = "LEFT fist registered! Move the RIGHT circle to the secret lock, then QUICK pinch and release."
         elif key == "constellation" and any(self.space_drawing_by_side.values()):
             description = "STAR CAPTURED! Stay pinched and connect more stars, then release."
         completed = len(self._scene_tutorial_steps)
@@ -6454,7 +6805,7 @@ class SpatialDesktop(QWidget):
             painter.drawText(QRectF(banner.x()+18, banner.bottom()-35,
                                     max(90.0, art_width), 23),
                              Qt.AlignVCenter | Qt.AlignLeft, self.ONBOARDING_GESTURE_NAMES[key])
-            if key in ("hello", "ball", "space", "returned", "fist_scroll", "two_fists"):
+            if key in ("hello", "ball", "space", "returned", "two_fists"):
                 track = QRectF(text_x, banner.bottom()-24,
                               max(20.0, min(text_width*.32, 170.0)), 7)
                 painter.setPen(Qt.NoPen)
@@ -7340,62 +7691,33 @@ class SpatialDesktop(QWidget):
         painter.restore()
 
     def _capture_glass_backdrop(self):
-        """Capture the desktop without our overlay, then cache its blurred pixels for glass panels."""
-        if self.desktop_mode != "os" or self._capturing_glass_backdrop:
-            return
-        screen = QApplication.primaryScreen()
-        if screen is None:
-            return
-        was_visible = self.isVisible()
-        was_fullscreen = self.isFullScreen()
-        hand_overlay = getattr(self, "search_hand_overlay", None)
-        hand_overlay_was_visible = bool(hand_overlay is not None and hand_overlay.isVisible())
-        hand_overlay_timer = getattr(hand_overlay, "sync_timer", None) if hand_overlay is not None else None
-        hand_overlay_timer_was_active = bool(hand_overlay_timer is not None and hand_overlay_timer.isActive())
-        self._capturing_glass_backdrop = True
-        try:
-            if hand_overlay_timer_was_active:
-                hand_overlay_timer.stop()
-            if hand_overlay_was_visible:
-                hand_overlay.hide()
-            if was_visible:
-                self.hide()
-                QApplication.processEvents()
-            captured = screen.grabWindow(0)
-            image = captured.toImage()
-            if image.isNull():
-                return
-            if image.size() != self.size():
-                image = image.scaled(self.size(), Qt.IgnoreAspectRatio, Qt.SmoothTransformation)
-            blurred = self._blur_glass_image(image, sigma=40.0)
-            if blurred is not None and not blurred.isNull():
-                self._glass_backdrop_image = blurred
-        except Exception as exc:
-            print("Could not capture glass backdrop:", exc)
-        finally:
-            if was_visible:
-                if was_fullscreen:
-                    self.showFullScreen()
-                else:
-                    self.show()
-                self.raise_()
-                self.apply_desktop_mode()
-            if hand_overlay_was_visible and hand_overlay is not None:
-                hand_overlay.show()
-                hand_overlay.sync_to_launcher()
-            if hand_overlay_timer_was_active and hand_overlay_timer is not None:
-                hand_overlay_timer.start()
-            self._capturing_glass_backdrop = False
-            self.update()
+        """Legacy no-op: never hide live overlays for a desktop screenshot.
+
+        The opening gesture must always leave the hand layer, HUD, notifications,
+        cursor and pinch-menu visuals on screen. Live Win32/Qt window captures
+        used to synchronously hide/show everything and stall the GUI thread.
+        """
+        return
 
     def _paint_frosted_backdrop(self, painter, rect, radius, opacity=0.15):
         """Draw only the blurred image inside a rounded glass panel's bounds."""
         image = self._glass_backdrop_image if self.desktop_mode == "os" else self._virtual_glass_backdrop()
-        # Opening the floating Pinch Menu must be immediate. If the desktop snapshot has not
-        # been captured yet, draw the pre-blurred virtual backdrop rather than blocking the
-        # UI thread for a screen capture/blur at the end of the gesture timer.
-        if image is None or image.isNull():
-            image = self._virtual_glass_backdrop()
+        if (image is None or image.isNull()) and self.desktop_mode == "os":
+            # This is purely composited paint; unlike grabbing the Windows
+            # desktop, it never unmaps a Freehand window or blocks the gesture.
+            # The dark glass panel and glow are drawn on top as before.
+            path = QPainterPath()
+            path.addRoundedRect(rect, radius, radius)
+            painter.save()
+            painter.setClipPath(path)
+            tint = QLinearGradient(rect.topLeft(), rect.bottomRight())
+            tint.setColorAt(0.0, QColor(38, 87, 108, 165))
+            tint.setColorAt(0.56, QColor(19, 50, 74, 155))
+            tint.setColorAt(1.0, QColor(8, 26, 47, 165))
+            painter.setOpacity(painter.opacity()*min(1.0, max(0.0, float(opacity))))
+            painter.fillRect(rect, tint)
+            painter.restore()
+            return
         if image is None or image.isNull():
             return
         path = QPainterPath()
@@ -8029,19 +8351,101 @@ class SpatialDesktop(QWidget):
         self.status = "Glass menu " + ("shown" if visible else "hidden")
         self.update()
 
-    def _begin_menu_transition(self, now=None):
-        now = time.monotonic() if now is None else now
+    def _glass_menu_opacity_at(self, now=None):
+        """Reversible alpha for the *painted menu only*, never the hand overlay.
+
+        During the initial boot the splash holds this at zero until Freehand's
+        first glass-menu frame is prepared AND the two-second minimum has passed.
+        """
+        if not getattr(self, "_glass_startup_released", True):
+            return 0.0
+        now = time.monotonic() if now is None else float(now)
+        duration = max(0.001, float(self.menu_transition_duration))
+        t = min(1.0, max(0.0, (now - self._glass_fade_started_at) / duration))
+        t = t*t*(3.0 - 2.0*t)
+        return max(0.0, min(1.0, self._glass_fade_from +
+                             (self._glass_fade_to - self._glass_fade_from)*t))
+
+    def _startup_notification_opacity_at(self, now=None):
+        """Fade the *notification artwork* in with the very first glass reveal.
+
+        Completely independent of ordinary open/close transitions so persistent
+        left/right state bars, Heard, STT and wake badges remain visible while a
+        Pinch Menu or two-TPI overlap opens the glass again later.
+        """
+        if not getattr(self, "_glass_startup_released", True):
+            return 0.0
+        started = getattr(self, "_startup_notification_fade_started_at", None)
+        if started is None:
+            return 1.0  # App launched without a splash; don't hide notifications.
+        now = time.monotonic() if now is None else float(now)
+        duration = max(0.001, float(self.menu_transition_duration))
+        t = min(1.0, max(0.0, (now - started) / duration))
+        return t*t*(3.0-2.0*t)
+
+    def _begin_menu_transition(self, now=None, visible=True):
+        now = time.monotonic() if now is None else float(now)
+        # Begin at the currently visible opacity, including on a rapid reversal.
+        current_alpha = self._glass_menu_opacity_at(now)
+        self._glass_fade_from = current_alpha
+        self._glass_fade_to = 1.0 if visible else 0.0
+        self._glass_fade_started_at = now
         self.menu_transition_started = now
         self.menu_input_block_until = max(self.menu_input_block_until,
                                           now + self.menu_transition_duration)
         self.update()
 
+    def _release_startup_glass_menu(self):
+        """First reveal: start fading glass IN as the ready splash fades OUT."""
+        if self._glass_startup_released:
+            return
+        self._glass_startup_released = True
+        now = time.monotonic()
+        self._glass_fade_from = 0.0
+        self._glass_fade_to = 1.0 if self.menu_open and self.hub_visible else 0.0
+        self._glass_fade_started_at = now
+        # The first glass panel and every notification card share the same
+        # animation timestamp and easing; they appear together under the logo.
+        self._startup_notification_fade_started_at = now
+        self.menu_transition_started = now
+        self.menu_input_block_until = max(self.menu_input_block_until,
+                                          now + self.menu_transition_duration)
+        self.update()
+
+    def _finish_glass_menu_close(self, serial):
+        """Complete deferred Settings cleanup only after the fade-out finishes."""
+        if serial != self._glass_fade_serial or self.menu_open or self.hub_visible:
+            return
+        if self._glass_deferred_reset_settings:
+            self.settings_open = False
+            self._glass_deferred_reset_settings = False
+        self.update()
+
     def _set_menu_open(self, visible, now=None, reset_settings=False):
         visible = bool(visible)
         changed = (self.menu_open != visible or self.hub_visible != visible)
+        if not changed:
+            if reset_settings and not visible:
+                self.settings_open = False
+            return False
+        # Start animation while the old panel and its Settings contents exist;
+        # clearing Settings immediately used to make a closing Settings page
+        # flash back to the home tiles for one frame before disappearing.
+        self._begin_menu_transition(now, visible=visible)
         self.menu_open = visible
         self.hub_visible = visible
-        if not visible:
+        self._glass_fade_serial += 1
+        if visible:
+            if self._glass_deferred_reset_settings:
+                self.settings_open = False
+                self._glass_deferred_reset_settings = False
+            # DO NOT capture/blur a desktop screenshot here. The old synchronous
+            # routine hid BOTH fullscreen HUD and hand windows before grabbing
+            # pixels, causing 0.5-1s of total visual disappearance after the
+            # Pinch Menu or two-TPI gesture. It also consumed most of the glass
+            # animation before the first new frame could be painted. Use the
+            # lightweight frosted-panel fallback in _paint_frosted_backdrop.
+        else:
             self._hide_gesture_map_overlay()
             self.custom_gesture_dropdown = None
             self.sound_dropdown_key = None
@@ -8049,25 +8453,28 @@ class SpatialDesktop(QWidget):
                 self._cancel_custom_gesture_key_capture("Shortcut capture cancelled because the menu closed.")
             else:
                 self._stop_native_custom_key_capture()
-            # The search launcher is a companion to the glass menu. Never leave it
-            # floating over the desktop after a gesture closes the glass menu.
             search_dialog = getattr(self, "search_dialog", None)
             if search_dialog is not None and search_dialog.isVisible():
                 search_dialog.close()
-        if reset_settings:
-            self.settings_open = False
-        if changed:
-            play_ui_sound(self.ui_preferences.get("sound_glass_toggle", "None"))
-            if visible and self.desktop_mode == "os":
-                self._capture_glass_backdrop()
-            self._begin_menu_transition(now)
-        return changed
+            # Keep the outgoing settings page painted until the fade reaches 0.
+            self._glass_deferred_reset_settings = bool(reset_settings)
+            QTimer.singleShot(int(self.menu_transition_duration*1000)+30,
+                              lambda token=self._glass_fade_serial:
+                              self._finish_glass_menu_close(token))
+        play_ui_sound(self.ui_preferences.get("sound_glass_toggle", "None"))
+        self.update()
+        return True
 
     def _restart_spatial_desktop(self):
         """Launch a fresh instance, then close this instance."""
         try:
-            command = [sys.executable, *sys.argv]
-            options = {"cwd": str(ROOT), "close_fds": True}
+            # sys.argv[0] can be a relative .exe, a PyInstaller bootloader
+            # argument, or an internal script. Frozen apps restart by their
+            # installed executable alone, without appending argv twice.
+            command = ([sys.executable] if _freehand_is_packaged_windows()
+                       else [sys.executable, *sys.argv])
+            options = {"cwd": str(Path(sys.executable).parent if _freehand_is_packaged_windows() else ROOT),
+                       "close_fds": True}
             if os.name == "nt":
                 options["creationflags"] = (getattr(subprocess, "DETACHED_PROCESS", 0x00000008)
                                              | getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0x00000200))
@@ -8090,6 +8497,7 @@ class SpatialDesktop(QWidget):
         self.update_check_running = True
         self.update_available = False
         self.update_download_path = None
+        self.update_remote_version = None
         self.update_progress_current = 0
         self.update_progress_total = 0
         self.update_status = "Checking GitHub for a newer version…"
@@ -8124,6 +8532,7 @@ class SpatialDesktop(QWidget):
         if remote_version:
             try:
                 self.update_available = compare_versions(remote_version, read_version(VERSION_FILE)) > 0
+                self.update_remote_version = remote_version if self.update_available else None
             except Exception:
                 self.update_available = False
         self.status = message.replace("\n", " · ")
@@ -8153,17 +8562,29 @@ class SpatialDesktop(QWidget):
 
         def worker():
             try:
-                source_root = download_update(progress_callback=lambda current, total:
-                    self.update_check_signals.progress.emit(int(current), int(total)))
-                staged_version = read_version(Path(source_root) / "version.txt")
-                current_version = read_version(VERSION_FILE)
-                if compare_versions(staged_version, current_version) <= 0:
-                    raise ValueError(f"Downloaded version v{staged_version} is not newer than installed v{current_version}")
-                self.update_check_signals.action_finished.emit(
-                    f"Update v{staged_version} downloaded and verified.", str(source_root))
+                progress = lambda current, total: self.update_check_signals.progress.emit(
+                    int(current), int(total))
+                if _freehand_is_packaged_windows():
+                    # Source archives cannot replace a frozen .exe. Download a
+                    # matching distribution-builder setup for this exact version.
+                    version = self.update_remote_version
+                    if not version:
+                        raise RuntimeError('No verified update version was selected.')
+                    source_root = _freehand_download_windows_installer(version, progress)
+                    self.update_check_signals.action_finished.emit(
+                        f"Windows installer v{version} downloaded. Select INSTALL to close Freehand, run setup, and relaunch.",
+                        str(source_root))
+                else:
+                    source_root = download_update(progress_callback=progress)
+                    staged_version = read_version(Path(source_root) / "version.txt")
+                    current_version = read_version(VERSION_FILE)
+                    if compare_versions(staged_version, current_version) <= 0:
+                        raise ValueError(f"Downloaded version v{staged_version} is not newer than installed v{current_version}")
+                    self.update_check_signals.action_finished.emit(
+                        f"Update v{staged_version} downloaded and verified.", str(source_root))
             except Exception as exc:
                 self.update_check_signals.action_finished.emit(
-                    f"Update download failed. Check your connection and try again. {str(exc)[:120]}", "")
+                    f"Update download failed. {str(exc)[:230]}", "")
 
         threading.Thread(target=worker, name="SpatialDesktopUpdateDownload", daemon=True).start()
 
@@ -8172,6 +8593,21 @@ class SpatialDesktop(QWidget):
             return
         self.update_action_running = True
         self.update_action_mode = "install"
+        if _freehand_is_packaged_windows():
+            # Never write into a running PyInstaller/Nuitka installation.
+            # Source ZIPs contain Python code, not a replacement Freehand.exe.
+            setup = Path(self.update_download_path)
+            if not setup.is_file() or setup.suffix.lower() != '.exe':
+                self.update_action_running = False
+                self.update_action_mode = ''
+                self.update_status = ('Packaged Windows builds require a distribution-builder '
+                                      'setup EXE. A Python source update cannot update this installation.')
+                self.status = self.update_status
+                self.update()
+                return
+            self.update_status = 'Ready to close Freehand and launch the packaged Windows installer…'
+            self.update_check_signals.action_finished.emit(self.update_status, 'handoff')
+            return
         self.update_status = "Installing update and backing up replaced files…"
         self.status = self.update_status
         self.update()
@@ -8190,12 +8626,36 @@ class SpatialDesktop(QWidget):
 
         threading.Thread(target=worker, name="SpatialDesktopUpdateInstall", daemon=True).start()
 
+    def _handoff_windows_packaged_update(self):
+        """Spawn detached updater first, then close normally to release EXE locks."""
+        try:
+            _freehand_launch_windows_setup_handoff(Path(self.update_download_path),
+                                                    Path(sys.executable))
+        except Exception as exc:
+            self.update_action_running = False
+            self.update_action_mode = ''
+            self.update_status = f'Could not launch Windows update handoff: {str(exc)[:180]}'
+            self.status = self.update_status
+            self.update()
+            return
+        self.status = 'Closing Freehand so the Windows installer can update locked files…'
+        self.update_status = self.status
+        self.close()  # closeEvent cleans up tracker, STT, TTS, search, D1, and locks.
+
     def _on_update_action_finished(self, message, result):
         finished_mode = self.update_action_mode
         self.update_action_running = False
         self.update_action_mode = ""
         self.update_status = message
-        if result == "installed":
+        if result == 'handoff':
+            # Prevent a second gesture/click from spawning another installer
+            # during the brief handoff to the external process.
+            self.update_action_running = True
+            self.update_action_mode = 'install'
+            # GUI thread only. Packaged installer must begin AFTER closeEvent;
+            # the detached helper waits for our PID to exit before installing.
+            QTimer.singleShot(100, self._handoff_windows_packaged_update)
+        elif result == "installed":
             self.update_download_path = None
             self.update_available = False
             self.update_installed = True
@@ -16041,10 +16501,21 @@ try {
         """Right-click natively in OS mode or open the virtual 3D context menu."""
         if point is None:
             return
-        # Recognition already succeeded using the existing modifier handler.
-        # Complete the lesson before displaying the normal virtual context menu.
-        if self._onboarding_in_garden():
-            self._onboarding_complete_step("right_click")
+        # Secret-action lesson: actually unlock the glowing Garden vault with
+        # the real LEFT fist + RIGHT quick-pinch modifier, at the target.
+        # Outside this special lesson, preserve existing context-menu behaviour.
+        if (self._onboarding_in_garden() and
+                (self._onboarding_stage() or (None,))[0] == "right_click"):
+            target = self._onboarding_secret_target()
+            if target.adjusted(-15, -15, 15, 15).contains(point):
+                self._onboarding_secret_unlocked_until = now+3.5
+                self.status = "SECRET UNLOCKED! Your two-hand modifier opened the vault."
+                self._onboarding_complete_step("right_click")
+            else:
+                self.status = "Aim the RIGHT circle over the glowing secret lock, keep LEFT fist closed, then quick pinch RIGHT."
+                self._onboarding_show_hint_until = now+4.0
+            self.update()
+            return
         point = QPointF(point)
         if self.desktop_mode != "os":
             anchor = QPointF(min(max(18.0, point.x()), self.width()-18.0),
@@ -16940,8 +17411,11 @@ try {
             self.active_push_sides = set()
             self.pointer_side = None
             menu_state = bool(self.menu_open and self.hub_visible)
-            if self._applied_desktop_mode != self.desktop_mode or getattr(self, "_applied_menu_state", None) != menu_state:
+            if self._applied_desktop_mode != self.desktop_mode:
                 self.apply_desktop_mode()
+            else:
+                # A glass-menu fade does not change the native OS input layer.
+                self._applied_menu_state = menu_state
             self.depth += (self.target_depth-self.depth)*0.16
             self._adjust_scene_timer_cadence(False, now)
             self._request_scene_repaint(now)
@@ -16984,8 +17458,13 @@ try {
             return
 
         menu_state = bool(self.menu_open and self.hub_visible)
-        if self._applied_desktop_mode != self.desktop_mode or getattr(self, "_applied_menu_state", None) != menu_state:
+        if self._applied_desktop_mode != self.desktop_mode:
             self.apply_desktop_mode()
+        else:
+            # Menu visibility affects only QPainter output. Reapplying
+            # Get/SetWindowLongPtr and HWND_TOPMOST here makes the entire
+            # translucent Freehand window briefly disappear/recreate on Windows.
+            self._applied_menu_state = menu_state
 
         self.hand_positions = {"left": [], "right": []}
         self.hand_stable_positions = {"left": None, "right": None}
@@ -19053,9 +19532,11 @@ try {
 
         cx, cy = self.hub_pos.x()*width, self.hub_pos.y()*height
         scale = self.menu_ui_scale()
-        if self.menu_open and self.hub_visible:
-            fade = min(1.0, max(0.0, (now-self.menu_transition_started)/self.menu_transition_duration))
-            fade = fade*fade*(3-2*fade)
+        glass_alpha = self._glass_menu_opacity_at(now)
+        glass_painting = ((self.menu_open and self.hub_visible) or
+                          (self._glass_fade_to == 0.0 and glass_alpha > 0.001))
+        if glass_painting:
+            fade = glass_alpha
             painter.save()
             painter.setOpacity(fade)
             panel_width, panel_height = self._menu_panel_dimensions()
@@ -19691,7 +20172,9 @@ try {
                                                        base_size=max(7, int(8*scale)), min_size=6,
                                                        align=Qt.AlignHCenter | Qt.AlignTop)
                         self._draw_wrapped_fitted_text(painter, text_rects["about"],
-                                                       "Checks GitHub version.txt, downloads a newer release, then lets you install it while preserving settings and calibration. Restart after installation.",
+                                                       ("Packaged Windows builds use a matching GitHub Release installer. INSTALL closes Freehand, runs setup, and relaunches when complete. "
+                                                        if _freehand_is_packaged_windows() else
+                                                        "Checks GitHub version.txt, downloads a newer source update, and installs it while preserving settings and calibration."),
                                                        base_size=max(6, int(7*scale)), min_size=6,
                                                        align=Qt.AlignHCenter | Qt.AlignTop)
 
@@ -19842,9 +20325,13 @@ try {
                     if self.settings_page == "d1" and self.d1_model_dropdown_open:
                         self._paint_d1_model_dropdown(painter, cx, cy, scale)
             painter.restore()
-            # Keep the two gesture reference images over the menu background,
-            # but under the hand cursor/TLI overlay which is painted afterward.
-            self._paint_gesture_map_overlay(painter)
+            # Fade the gesture-map sheet together with the glass panel, not at
+            # full opacity while the menu is still emerging.
+            if fade > 0.001:
+                painter.save()
+                painter.setOpacity(fade)
+                self._paint_gesture_map_overlay(painter)
+                painter.restore()
 
         # When move mode is engaged, animate waves and sparkles from the TLI/hand anchor.
         # This is the only window-drag feedback: the old outline around the grabbed
@@ -19990,6 +20477,8 @@ try {
 
 
         if self.menu_open and self.hub_visible:
+            painter.save()
+            painter.setOpacity(painter.opacity()*self._startup_notification_opacity_at(now))
             # Keep the normal gesture legend visible while the glass menu is open,
             # including on Settings pages. Share the notification stack with the
             # optional modifier banner so the two messages never overlap.
@@ -20005,6 +20494,7 @@ try {
             painter.drawText(
                 gesture_legend, Qt.AlignCenter,
                 "LEFT HAND FIST: MODIFIER  ·  LEFT OR RIGHT HAND PINCH: CLICK  ·  GRAB & DRAG: SCROLL PAGE")
+            painter.restore()
 
         if self.voice_selection_mode is not None and self.voice_lasso_start is not None:
             end_global = self._current_tli_global_position()
@@ -20165,6 +20655,11 @@ try {
             painter.drawEllipse(point, 2.3, 2.3)
             painter.restore()
 
+        # Start the notifications with the initial glass-menu crossfade only.
+        # Keep this painter group separate from the hand/TLI, scrolling ruler,
+        # floating clipboard and all later glass-menu toggles.
+        painter.save()
+        painter.setOpacity(painter.opacity()*self._startup_notification_opacity_at(now))
         # Small persistent on-state badges for dictation and speech recognition.
         # Their screen anchors are independently configurable on the Notifications page.
         search_dictation_active = bool(self.search_dialog is not None and
@@ -20324,6 +20819,7 @@ try {
             painter.setFont(self._ui_font(10, QFont.DemiBold))
             painter.drawText(pause_rect, Qt.AlignCenter, "HAND TRACKING PAUSED  ·  SAY 'RESUME TRACKING'")
             painter.restore()
+        painter.restore()  # End the startup-only notification alpha group.
 
         if self.desktop_mode == "virtual":
             painter.setPen(QColor(150, 190, 205, 190))
@@ -20332,7 +20828,10 @@ try {
         # Apply the same responsive cyan hover treatment used by the glass-menu tiles
         # to every Settings navigation tab, Back button, and page button. Outline-only
         # painting keeps labels and the existing button hit targets unchanged.
-        if getattr(self, "menu_open", False) and getattr(self, "settings_open", False):
+        if (getattr(self, "menu_open", False) and getattr(self, "settings_open", False)
+                and glass_alpha > 0.001):
+            painter.save()
+            painter.setOpacity(glass_alpha)
             scale = self.menu_ui_scale()
             # The glass panel can be moved, so feedback geometry must use the same
             # hub anchor as the actual controls rather than the screen centre.
@@ -20355,11 +20854,13 @@ try {
                     painter.setPen(QPen(QColor(220, 255, 255, 250), 2.0*scale))
                     painter.setBrush(Qt.NoBrush)
                     painter.drawRoundedRect(rect, 10*scale, 10*scale)
+            painter.restore()
 
         # Brief cyan pressed glow for every custom-painted glass-menu/settings button.
         pressed_point = getattr(self, "_glass_pressed_point", None)
         pressed_age = now - float(getattr(self, "_glass_pressed_at", 0.0))
-        if pressed_point is not None and 0.0 <= pressed_age < 0.30 and self.menu_open and self.hub_visible:
+        if (pressed_point is not None and 0.0 <= pressed_age < 0.30
+                and self.menu_open and self.hub_visible and glass_alpha > 0.001):
             # Match pressed feedback to the live menu position, including when
             # the user has dragged the glass panel away from screen centre.
             pcx, pcy = self.hub_pos.x()*self.width(), self.hub_pos.y()*self.height()
@@ -20391,6 +20892,7 @@ try {
             if pressed_rect is not None:
                 fade_alpha = int(235 * (1.0 - pressed_age/0.30))
                 painter.save()
+                painter.setOpacity(glass_alpha)
                 painter.setPen(QPen(QColor(190, 255, 255, fade_alpha), 2.5*pscale))
                 painter.setBrush(QBrush(QColor(90, 235, 255, int(45*(1.0-pressed_age/0.30)))))
                 painter.drawRoundedRect(pressed_rect.adjusted(1.5*pscale, 1.5*pscale, -1.5*pscale, -1.5*pscale),
@@ -20423,17 +20925,38 @@ def main():
     window.apply_desktop_mode()
 
     def _dismiss_splash_after_glass_ready():
-        global _FREEHAND_BOOT_SPLASH
+        global _FREEHAND_BOOT_SPLASH, _FREEHAND_SPLASH_EXIT_ANIMATION
         splash = _FREEHAND_BOOT_SPLASH
-        if splash is None:
+        if splash is None or _FREEHAND_SPLASH_EXIT_ANIMATION is not None:
             return
         if (window.isVisible() and window.menu_open and window.hub_visible
-                and getattr(window, "_startup_glass_frame_painted", False)):
-            # Avoid QSplashScreen.finish(): it can activate the mouse-transparent
-            # OS overlay and steal focus from the user's real desktop.
-            splash.close()
-            splash.deleteLater()
-            _FREEHAND_BOOT_SPLASH = None
+                and getattr(window, "_startup_glass_frame_painted", False)
+                and time.monotonic() - _FREEHAND_SPLASH_SHOWN_AT >=
+                    _FREEHAND_SPLASH_MIN_VISIBLE_SECONDS):
+            # The rendered glass is ready *before* revealing it; synchronise
+            # both opacity transitions within the same GUI event-loop turn.
+            window._release_startup_glass_menu()
+            # A nonblocking fade lets Freehand continue rendering behind the
+            # logo. Only close once opacity reaches zero; never use finish(),
+            # which can unexpectedly focus the mouse-transparent OS overlay.
+            from PySide6.QtCore import QPropertyAnimation, QEasingCurve
+            animation = QPropertyAnimation(splash, b"windowOpacity", splash)
+            _FREEHAND_SPLASH_EXIT_ANIMATION = animation  # Keep the wrapper alive.
+            animation.setDuration(_FREEHAND_SPLASH_FADE_OUT_MS)
+            animation.setStartValue(splash.windowOpacity())
+            animation.setEndValue(0.0)
+            animation.setEasingCurve(QEasingCurve.InOutCubic)
+
+            def _close_faded_splash():
+                global _FREEHAND_BOOT_SPLASH, _FREEHAND_SPLASH_EXIT_ANIMATION
+                if _FREEHAND_BOOT_SPLASH is splash:
+                    splash.close()
+                    splash.deleteLater()
+                    _FREEHAND_BOOT_SPLASH = None
+                _FREEHAND_SPLASH_EXIT_ANIMATION = None
+
+            animation.finished.connect(_close_faded_splash)
+            animation.start()
         else:
             QTimer.singleShot(50, _dismiss_splash_after_glass_ready)
 
