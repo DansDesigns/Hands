@@ -84,6 +84,60 @@ def _configure_windows_console_on_startup() -> None:
 if __name__ == "__main__" and sys.platform == "win32":
     _configure_windows_console_on_startup()
 
+# Show the branded splash BEFORE importing the heavy camera, speech and scene
+# modules. The same QApplication will later run the real Freehand event loop.
+# This is deliberately a static Qt splash, not a separate Python process or
+# launcher script: no additional requirements and no window-flashing restart.
+_FREEHAND_BOOT_APP = None
+_FREEHAND_BOOT_SPLASH = None
+
+
+def _show_freehand_startup_splash():
+    global _FREEHAND_BOOT_APP, _FREEHAND_BOOT_SPLASH
+    from PySide6.QtCore import Qt as _Qt
+    from PySide6.QtGui import QPixmap as _QPixmap
+    from PySide6.QtWidgets import QApplication as _QApplication, QSplashScreen as _QSplashScreen
+
+    app = _QApplication.instance()
+    if app is None:
+        app = _QApplication(sys.argv)
+    app.setQuitOnLastWindowClosed(False)
+    _FREEHAND_BOOT_APP = app
+
+    logo = Path(__file__).resolve().parent / "Freehand_logo.png"
+    if not logo.is_file():
+        return
+    pixmap = _QPixmap(str(logo))
+    if pixmap.isNull():
+        print("Could not load startup splash:", logo, flush=True)
+        return
+    screen = _QApplication.primaryScreen()
+    if screen is not None:
+        available = screen.availableGeometry()
+        max_width = max(280, min(760, int(available.width() * 0.62)))
+        max_height = max(180, min(480, int(available.height() * 0.60)))
+        pixmap = pixmap.scaled(max_width, max_height, _Qt.KeepAspectRatio,
+                               _Qt.SmoothTransformation)
+    splash = _QSplashScreen(pixmap)
+    splash.setWindowFlags(splash.windowFlags() |
+                          _Qt.FramelessWindowHint | _Qt.WindowStaysOnTopHint)
+    splash.setAttribute(_Qt.WA_TransparentForMouseEvents, True)
+    splash.setAttribute(_Qt.WA_ShowWithoutActivating, True)
+    if screen is not None:
+        screen_rect = screen.availableGeometry()
+        splash.move(screen_rect.center().x() - splash.width() // 2,
+                    screen_rect.center().y() - splash.height() // 2)
+    _FREEHAND_BOOT_SPLASH = splash
+    splash.show()
+    splash.raise_()
+    # Actually display the PNG before the blocking first-run model download,
+    # model imports or the fullscreen glass-menu constructor start.
+    app.processEvents()
+
+
+if __name__ == "__main__":
+    _show_freehand_startup_splash()
+
 from linux_screen_geometry import resolve_fullscreen_bounds
 from garden_weather import fetch_live_weather, calculate_solar_state, weather_kind, WEATHER_REFRESH_SECONDS
 
@@ -1949,6 +2003,9 @@ def load_ui_preferences() -> dict:
         "debug_console": False,
         "start_on_login": False,
         "d1_autostart": False,
+        # None retains the historical default for users who have never switched.
+        # os/virtual always records the user's most recently selected mode.
+        "last_desktop_mode": None,
         "wake_word_name": "",
         "wake_word_trained": False,
         "wake_word_listening": False,
@@ -1973,6 +2030,9 @@ def load_ui_preferences() -> dict:
                     pass
             elif key in ("show_gesture_disabled_indicator", "garden_onboarding_completed", "debug_console", "start_on_login", "wake_word_trained", "wake_word_listening", "d1_autostart"):
                 if isinstance(value, bool):
+                    result[key] = value
+            elif key == "last_desktop_mode":
+                if value in ("os", "virtual"):
                     result[key] = value
             elif key == "garden_onboarding_progress":
                 if isinstance(value, list):
@@ -2006,6 +2066,9 @@ def save_ui_preferences(values: dict) -> None:
                 pass
         elif key in ("show_gesture_disabled_indicator", "garden_onboarding_completed", "debug_console", "start_on_login", "wake_word_trained", "wake_word_listening", "d1_autostart"):
             if isinstance(value, bool):
+                current[key] = value
+        elif key == "last_desktop_mode":
+            if value in ("os", "virtual"):
                 current[key] = value
         elif key == "garden_onboarding_progress":
             if isinstance(value, list):
@@ -4013,9 +4076,13 @@ class SpatialDesktop(QWidget):
         self.virtual_desktop_data = load_virtual_desktop_data()
         virtual_bg = self.virtual_desktop_data["background"]
         self.virtual_grid_enabled = bool(virtual_bg["grid_enabled"])
-        # Always open the Virtual Desktop in Garden for the play-based tutorial.
-        # The other scenes remain selectable normally once the app is running.
-        self.virtual_scene = "garden"
+        # Preserve the last selected virtual scene on subsequent sessions.
+        # New users still start their unfinished play-based tutorial in Garden.
+        self.virtual_scene = (virtual_bg.get("scene", "garden")
+                              if self.ui_preferences.get("garden_onboarding_completed", False)
+                              else "garden")
+        if self.virtual_scene not in VIRTUAL_SCENES:
+            self.virtual_scene = "garden"
         self.virtual_garden_mode = self.virtual_scene == "garden"
         self.virtual_space_mode = self.virtual_scene == "space"
         self.space_constellations = list(self.virtual_desktop_data.get("constellations", []))
@@ -4050,6 +4117,10 @@ class SpatialDesktop(QWidget):
         self._onboarding_show_hint_until = 0.0
         self._onboarding_hello_started = None
         self._onboarding_guide_last_pose = None
+        # Load only the active lesson illustration, then cache its scaled image.
+        # Never decode or smooth-scale large PNGs during each camera repaint.
+        self._onboarding_guide_pixmaps = {}
+        self._onboarding_guide_scaled = {}
         self._onboarding_disabled_side = None
         self._onboarding_practice_anchor = None
         self._onboarding_practice_progress = 0.0
@@ -4226,8 +4297,12 @@ class SpatialDesktop(QWidget):
         self._clipboard_capture_suppression_until = 0.0
         self.status = f"Ready — offline Vosk STT · Kokoro TTS: {self.tts.status}"
 
-        self.desktop_mode = ("os" if self.ui_preferences.get("garden_onboarding_completed", False)
-                             else "virtual")  # After onboarding, start in OS Desktop.
+        saved_desktop_mode = self.ui_preferences.get("last_desktop_mode")
+        self.desktop_mode = (saved_desktop_mode if saved_desktop_mode in ("os", "virtual")
+                             else "os" if self.ui_preferences.get("garden_onboarding_completed", False)
+                             else "virtual")
+        # New installation: Garden onboarding. Returning users: the last OS or
+        # Virtual Desktop mode they actually used when Freehand closed.
         self._applied_desktop_mode = None
         self._applied_menu_state = None
         self._last_native_topmost_reassert = 0.0
@@ -5791,6 +5866,24 @@ class SpatialDesktop(QWidget):
         "pinch_menu": "HOLD PINCH", "right_click": "LEFT + RIGHT",
         "fist_scroll": "FIST SCROLL", "two_fists": "TWO FISTS", "glass_menu": "TWO OPEN HANDS",
     }
+    # Supplied artwork uses the original filenames, kept under the existing
+    # gestures image tree. Multiple play-based lessons teach the same gesture.
+    # The welcome lesson uses the open-hand portion of Picture6 (no menu label).
+    ONBOARDING_GESTURE_ART = {
+        "hello": "Picture6.png",       # open-hand illustration only, cropped
+        "ball": "Picture2.png",        # pinch and drag
+        "sundial": "Picture1.png",     # quick pinch / tap
+        "space": "Picture3.png",       # fist scroll/navigation
+        "constellation": "Picture2.png",# pinch and draw
+        "returned": "Picture3.png",    # inverse fist navigation
+        "peace_disabled": "Picture8.png",
+        "peace_enabled": "Picture8.png",
+        "pinch_menu": "Picture7.png",
+        "right_click": "Picture4.png",
+        "fist_scroll": "Picture3.png",
+        "two_fists": "Picture5.png",
+        "glass_menu": "Picture6.png",
+    }
 
     def _onboarding_chapter(self, step):
         if step in ("hello", "ball", "sundial"):
@@ -5905,9 +5998,12 @@ class SpatialDesktop(QWidget):
     def _onboarding_controls(self, width=None, height=None):
         width = float(self.width() if width is None else width)
         height = float(self.height() if height is None else height)
-        banner_w = min(690.0, max(220.0, width-28.0))
-        banner_h = 178.0 if height > 500 else 144.0
-        banner = QRectF((width-banner_w)*0.5, min(68.0, max(14.0, height*0.065)), banner_w, banner_h)
+        # Images contain instructional words and need a legible presentation
+        # area, not the previous 64px pictogram. Keep the card non-modal and at
+        # the top of Garden/Space so the ball and other game props stay usable.
+        banner_w = min(860.0, max(220.0, width-28.0))
+        banner_h = 244.0 if height >= 660 else (210.0 if height >= 500 else 156.0)
+        banner = QRectF((width-banner_w)*0.5, min(62.0, max(8.0, height*0.055)), banner_w, banner_h)
         chip = QRectF(16.0, 96.0, min(154.0, max(90.0, width-32.0)), 34.0)
         if chip.right()+9 > banner.left() and chip.intersects(banner):
             chip.moveTop(8.0)
@@ -6190,38 +6286,37 @@ class SpatialDesktop(QWidget):
             self._onboarding_complete_step("two_fists")
         return True
 
-    def _onboarding_paint_guide_icon(self, painter, cx, cy, key, accent):
-        """Tiny pose pictogram painted with cheap Qt primitives; no texture files."""
-        painter.save()
-        try:
-            painter.setRenderHint(QPainter.Antialiasing, True)
-            painter.setPen(QPen(accent, 4.0, Qt.SolidLine, Qt.RoundCap, Qt.RoundJoin))
-            kind = ("open" if key in ("hello", "glass_menu") else
-                    "peace" if key.startswith("peace") else
-                    "fist" if key in ("space", "returned", "fist_scroll", "two_fists", "right_click") else
-                    "pinch")
-            if kind == "open":
-                for dx, dy in ((-21, -23), (-10, -32), (2, -34), (14, -25), (25, -12)):
-                    painter.drawLine(QPointF(cx+dx*0.35, cy+8), QPointF(cx+dx, cy+dy))
-                painter.drawEllipse(QRectF(cx-15, cy+1, 30, 25))
-            elif kind == "peace":
-                painter.drawLine(QPointF(cx-2, cy+23), QPointF(cx-19, cy-32))
-                painter.drawLine(QPointF(cx+5, cy+19), QPointF(cx+17, cy-35))
-                painter.drawEllipse(QRectF(cx-17, cy+7, 33, 24))
-            elif kind == "fist":
-                painter.drawRoundedRect(QRectF(cx-24, cy-12, 48, 40), 12, 12)
-                for dx in (-13, 0, 13):
-                    painter.drawLine(QPointF(cx+dx, cy-11), QPointF(cx+dx, cy+1))
-            else:
-                painter.drawLine(QPointF(cx-23, cy+17), QPointF(cx-3, cy-6))
-                painter.drawLine(QPointF(cx+23, cy+17), QPointF(cx+4, cy-8))
-                painter.drawEllipse(QPointF(cx, cy-5), 7.0, 7.0)
-                painter.drawArc(QRectF(cx-28, cy-33, 56, 56), 20*16, 140*16)
-            painter.setPen(Qt.NoPen)
-            painter.setBrush(QColor(250, 255, 255, 235))
-            painter.drawEllipse(QPointF(cx, cy-5), 3.0, 3.0)
-        finally:
-            painter.restore()
+    def _onboarding_paint_guide_icon(self, painter, rect, key, accent):
+        """Display supplied lesson artwork, not generated stick-hand drawings.
+
+        File names and transparency remain unchanged. Decode once per image,
+        then cache scaled QPixmaps for the current lesson/display size. Cropping
+        the welcome illustration removes the Glass Menu text during the initial
+        hand-detection quest, without changing Picture6.png on disk.
+        """
+        name = self.ONBOARDING_GESTURE_ART.get(key)
+        if not name:
+            return
+        if name not in self._onboarding_guide_pixmaps:
+            path = ROOT / "images" / "gestures" / "onboarding" / name
+            self._onboarding_guide_pixmaps[name] = QPixmap(str(path))
+        source = self._onboarding_guide_pixmaps[name]
+        if source.isNull():
+            # Avoid drawing a misleading substitute gesture when an asset has
+            # not been installed. The lesson title and instructions still work.
+            return
+        cache_key = (key, name, round(rect.width()), round(rect.height()))
+        image = self._onboarding_guide_scaled.get(cache_key)
+        if image is None:
+            src = (source.copy(0, 0, source.width(), round(source.height()*0.63))
+                   if key == "hello" else source)
+            image = src.scaled(max(1, round(rect.width())),
+                               max(1, round(rect.height())),
+                               Qt.KeepAspectRatio, Qt.SmoothTransformation)
+            self._onboarding_guide_scaled[cache_key] = image
+        x = rect.x() + (rect.width() - image.width())*.5
+        y = rect.y() + (rect.height() - image.height())*.5
+        painter.drawPixmap(QPointF(x, y), image)
 
     def _onboarding_paint_world_cues(self, painter, width, height, scene, key, now, accent):
         """Point to existing gameplay objects without intercepting gesture input."""
@@ -6320,7 +6415,12 @@ class SpatialDesktop(QWidget):
         completed = len(self._scene_tutorial_steps)
         total = len(self.ONBOARDING_LESSONS)
         banner = controls["banner"]
-        small = banner.width() < 490 or banner.height() < 160
+        small = banner.width() < 680 or banner.height() < 215
+        art_width = min(310.0, max(94.0, banner.width()*0.36))
+        art_rect = QRectF(banner.x()+13.0, banner.y()+39.0,
+                          art_width, max(66.0, banner.height()-84.0))
+        text_x = art_rect.right()+17.0
+        text_width = max(70.0, banner.right()-text_x-18.0)
         painter.save()
         try:
             painter.setRenderHint(QPainter.Antialiasing, True)
@@ -6339,21 +6439,24 @@ class SpatialDesktop(QWidget):
             painter.setPen(QColor(255, 224, 139, 245))
             painter.drawText(QRectF(banner.right()-242, banner.y()+13, 142, 20),
                              Qt.AlignVCenter | Qt.AlignRight, f"{self._onboarding_points()} XP")
-            self._onboarding_paint_guide_icon(painter, banner.x()+59, banner.y()+97 if not small else banner.y()+80, key, accent)
+            self._onboarding_paint_guide_icon(painter, art_rect, key, accent)
             painter.setPen(QColor(255,255,255))
-            painter.setFont(self._ui_font(13 if not small else 10, QFont.Bold))
-            painter.drawText(QRectF(banner.x()+108, banner.y()+46, banner.width()-130, 30),
+            painter.setFont(self._ui_font(12 if not small else 9, QFont.Bold))
+            painter.drawText(QRectF(text_x, banner.y()+46, text_width, 34),
                              Qt.AlignVCenter | Qt.AlignLeft, title)
             painter.setPen(QColor(225, 243, 254, 242))
-            painter.setFont(self._ui_font(9 if not small else 8))
-            painter.drawText(QRectF(banner.x()+111, banner.y()+77, banner.width()-134, 48 if not small else 34),
+            painter.setFont(self._ui_font(9 if not small else 7))
+            painter.drawText(QRectF(text_x, banner.y()+85, text_width,
+                                    max(40.0, banner.height()-131.0)),
                              Qt.AlignLeft | Qt.AlignTop | Qt.TextWordWrap, description)
             painter.setPen(accent)
-            painter.setFont(self._ui_font(8, QFont.DemiBold))
-            painter.drawText(QRectF(banner.x()+17, banner.bottom()-34, min(275.,banner.width()*.48), 23),
+            painter.setFont(self._ui_font(8 if not small else 7, QFont.DemiBold))
+            painter.drawText(QRectF(banner.x()+18, banner.bottom()-35,
+                                    max(90.0, art_width), 23),
                              Qt.AlignVCenter | Qt.AlignLeft, self.ONBOARDING_GESTURE_NAMES[key])
             if key in ("hello", "ball", "space", "returned", "fist_scroll", "two_fists"):
-                track = QRectF(banner.x()+185, banner.bottom()-26, max(20.0,banner.width()*.25), 7)
+                track = QRectF(text_x, banner.bottom()-24,
+                              max(20.0, min(text_width*.32, 170.0)), 7)
                 painter.setPen(Qt.NoPen)
                 painter.setBrush(QColor(90, 145, 175, 94))
                 painter.drawRoundedRect(track,4,4)
@@ -13230,6 +13333,9 @@ try {
 
     def apply_desktop_mode(self):
         """Configure a fullscreen overlay; OS mode passes physical mouse input through."""
+        if self.ui_preferences.get("last_desktop_mode") != self.desktop_mode:
+            self.ui_preferences["last_desktop_mode"] = self.desktop_mode
+            save_ui_preferences(self.ui_preferences)
         self._end_two_hand_touch()
         self._applied_desktop_mode = self.desktop_mode
         self._applied_menu_state = bool(self.menu_open and self.hub_visible)
@@ -18524,6 +18630,11 @@ try {
         self._request_scene_repaint(now)
 
     def closeEvent(self, event):
+        # Preserve the last active desktop mode even if the user closes Freehand
+        # without switching modes or immediately after completing onboarding.
+        if self.ui_preferences.get("last_desktop_mode") != self.desktop_mode:
+            self.ui_preferences["last_desktop_mode"] = self.desktop_mode
+            save_ui_preferences(self.ui_preferences)
         self.search_index.close()
         if self._wake_word_save_timer.isActive():
             self._wake_word_save_timer.stop()
@@ -20287,11 +20398,16 @@ try {
                 painter.restore()
 
         painter.end()
+        if self.menu_open and self.hub_visible:
+            self._startup_glass_frame_painted = True
 
 
 def main():
+    app = QApplication.instance() or QApplication(sys.argv)
+    app.setQuitOnLastWindowClosed(False)
+    # The splash is already visible, even if downloading initial camera models
+    # blocks the GUI thread before the main fullscreen overlay is constructed.
     ensure_models()
-    app = QApplication(sys.argv)
     # Shared tactile pressed feedback for every native button in the application.
     app.setStyleSheet("QPushButton:pressed, QToolButton:pressed { background-color: rgba(75, 205, 235, 210); border: 2px solid #b9f5ff; padding-top: 2px; padding-left: 2px; }")
     # The main overlay uses Qt.Tool and the search launcher is a child QDialog;
@@ -20305,6 +20421,23 @@ def main():
     QTimer.singleShot(0, window._sync_linux_fullscreen_geometry)
     QTimer.singleShot(250, window._sync_linux_fullscreen_geometry)
     window.apply_desktop_mode()
+
+    def _dismiss_splash_after_glass_ready():
+        global _FREEHAND_BOOT_SPLASH
+        splash = _FREEHAND_BOOT_SPLASH
+        if splash is None:
+            return
+        if (window.isVisible() and window.menu_open and window.hub_visible
+                and getattr(window, "_startup_glass_frame_painted", False)):
+            # Avoid QSplashScreen.finish(): it can activate the mouse-transparent
+            # OS overlay and steal focus from the user's real desktop.
+            splash.close()
+            splash.deleteLater()
+            _FREEHAND_BOOT_SPLASH = None
+        else:
+            QTimer.singleShot(50, _dismiss_splash_after_glass_ready)
+
+    QTimer.singleShot(50, _dismiss_splash_after_glass_ready)
     # Starting llama.cpp may involve process cleanup/model probing. Do it after
     # the first paint so a slow local engine cannot hold up the desktop overlay.
     def _boot_engine():
