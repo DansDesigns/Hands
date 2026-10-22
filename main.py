@@ -2096,20 +2096,24 @@ def _set_start_on_login(enabled, app_root=ROOT):
                 config_dir = Path.home() / ".config"
             target = config_dir / "autostart" / "freehand-spatial-computing.desktop"
             if enabled:
-                launcher = app_root / "run_linux.sh"
-                if not launcher.is_file():
-                    return False, "Missing run_linux.sh; run the Linux installer first"
+                appimage = _freehand_running_appimage()
+                launcher = appimage if appimage is not None else app_root / "run_linux.sh"
+                if not launcher.is_file() or (appimage is None and
+                        (os.environ.get("APPDIR") or getattr(sys, "frozen", False))):
+                    return False, "No permanent Freehand launcher was found"
                 # Desktop Entry Exec accepts a double-quoted executable path; these
                 # are the special characters that need escaping inside the quotes.
                 quoted = str(launcher)
                 for old, new in (("\\", "\\\\"), ('"', '\\"'), ("$", "\\$"), ("`", "\\`")):
                     quoted = quoted.replace(old, new)
                 target.parent.mkdir(parents=True, exist_ok=True)
+                command = (f'"{quoted}"' if appimage is not None
+                           else f'/bin/bash "{quoted}"')
                 content = ("[Desktop Entry]\n"
                            "Type=Application\n"
                            "Name=Freehand: Spatial Computing\n"
-                           f'Exec=/bin/bash "{quoted}"\n'
-                           f'Path={app_root}\n'
+                           f'Exec={command}\n'
+                           f'Path={appimage.parent if appimage is not None else app_root}\n'
                            "Terminal=false\n"
                            "X-GNOME-Autostart-enabled=true\n"
                            "Categories=Utility;\n")
@@ -2129,6 +2133,154 @@ def _set_start_on_login(enabled, app_root=ROOT):
     return False, "Start on Login is supported on Windows and Linux"
 
 
+def _freehand_running_appimage():
+    """Return the permanent on-disk AppImage, never its temporary AppDir.
+
+    AppImage v1/v2 expose APPIMAGE as the original absolute executable path;
+    APPDIR, ROOT and PyInstaller's _MEIPASS describe ephemeral mount content.
+    """
+    if not sys.platform.startswith("linux"):
+        return None
+    raw = os.environ.get("APPIMAGE", "").strip()
+    if not raw:
+        return None
+    try:
+        path = Path(raw).expanduser().absolute()
+        if path.is_file() and path.name.casefold().endswith(".appimage"):
+            return path
+    except (OSError, ValueError):
+        pass
+    return None
+
+
+def _repair_linux_appimage_shortcut(appimage, app_root):
+    """Point existing application-menu entries at the installed AppImage.
+
+    Never reference /tmp/.mount_* or a run_linux.sh inside the AppImage.
+    Respect desktop file IDs (pinned/taskbar shortcuts), preserve metadata and
+    edit only the primary [Desktop Entry] section, not its optional Actions.
+    """
+    import re as _re
+    applications = (Path(os.environ.get("XDG_DATA_HOME") or
+                         Path.home() / ".local/share") / "applications")
+    applications.mkdir(parents=True, exist_ok=True)
+
+    def escaped(value):
+        value = str(value)
+        for old, new in (("\\", "\\\\"), ('"', '\\"'), ("$", "\\$"), ("`", "\\`")):
+            value = value.replace(old, new)
+        return '"' + value + '"'
+
+    # This is a byte-for-byte copy of the user's icon, not a new or modified
+    # illustration. Icons inside read-only ephemeral AppDirs disappear at exit.
+    icon = None
+    for rel in ("Freehand_logo_small.png", "assets/icons/freehand.png",
+                "assets/icons/icon.png", "Freehand_logo.png", "freehand.png"):
+        source = Path(app_root) / rel
+        if not source.is_file():
+            continue
+        try:
+            destination = (Path(os.environ.get("XDG_DATA_HOME") or
+                                Path.home() / ".local/share") /
+                           "icons" / "freehand-appimage.png")
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            if (not destination.exists() or
+                    source.stat().st_size != destination.stat().st_size):
+                temporary = destination.with_suffix(".png.tmp")
+                try:
+                    shutil.copyfile(source, temporary)
+                    os.replace(temporary, destination)
+                finally:
+                    temporary.unlink(missing_ok=True)
+            icon = str(destination)
+            break
+        except OSError:
+            continue
+
+    # Locate the *actual* menu entry, including a system-wide entry installed
+    # by the distribution builder. An identically named user entry overrides
+    # the system one without elevated privileges.
+    def is_freehand(text):
+        main_section = text.split("\n[", 1)[0]
+        return bool(_re.search(r'(?im)^Name\s*=\s*(?:Freehand|Spatial Desktop)(?:\b|:)',
+                               main_section))
+
+    targets = []
+    search_roots = (applications, Path("/usr/share/applications"),
+                    Path("/usr/local/share/applications"))
+    seen_names = set()
+    for folder in search_roots:
+        try:
+            files = sorted(folder.glob("*.desktop"))
+        except OSError:
+            continue
+        for candidate in files:
+            if candidate.name in seen_names:
+                continue
+            try:
+                existing = candidate.read_text(encoding="utf-8")
+            except (OSError, UnicodeError):
+                continue
+            if is_freehand(existing):
+                seen_names.add(candidate.name)
+                targets.append((applications / candidate.name, existing))
+    if not targets:
+        targets.append((applications / "spatial-desktop-prototype.desktop", ""))
+
+    command = escaped(appimage)
+    for target, existing in targets:
+        if existing.strip():
+            # Only rewrite the desktop entry, never [Desktop Action ...] keys.
+            match = _re.search(r'(?m)^\[Desktop Entry\]\s*$', existing)
+            if not match:
+                continue
+            start = match.end()
+            next_section = _re.search(r'(?m)^\[', existing[start:])
+            end = start + next_section.start() if next_section else len(existing)
+            section = existing[start:end]
+            for key, value in (("Exec", command), ("TryExec", str(appimage)),
+                               ("Path", str(appimage.parent)), ("Terminal", "false")):
+                pattern = rf'(?m)^{key}\s*=.*$'
+                if _re.search(pattern, section):
+                    section = _re.sub(pattern, lambda _m, k=key, v=value: f'{k}={v}',
+                                      section, count=1)
+                else:
+                    section += f'{key}={value}\n'
+            if icon:
+                pattern = r'(?m)^Icon\s*=.*$'
+                if _re.search(pattern, section):
+                    # Leave stable themed icons alone; replace temporary mount
+                    # references since those become invalid after exit.
+                    icon_line = _re.search(pattern, section).group(0)
+                    if any(x in icon_line for x in ('/.mount_', '/tmp/', '/var/tmp/')):
+                        section = _re.sub(pattern, lambda _m: f'Icon={icon}', section,
+                                          count=1)
+                else:
+                    section += f'Icon={icon}\n'
+            content = existing[:start] + section + existing[end:]
+        else:
+            content = ("[Desktop Entry]\nType=Application\n"
+                       "Name=Freehand: Spatial Computing\n"
+                       "Comment=Hand tracking and voice-driven spatial desktop\n"
+                       f"Exec={command}\nTryExec={appimage}\n"
+                       f"Path={appimage.parent}\nTerminal=false\n"
+                       "StartupNotify=false\nCategories=Utility;Accessibility;\n"
+                       + (f"Icon={icon}\n" if icon else ""))
+        try:
+            if not target.exists() or target.read_text(encoding="utf-8") != content:
+                temporary = target.with_suffix(target.suffix + ".tmp")
+                try:
+                    temporary.write_text(content, encoding="utf-8")
+                    os.chmod(temporary, 0o644)
+                    os.replace(temporary, target)
+                finally:
+                    temporary.unlink(missing_ok=True)
+        except OSError as exc:
+            print(f"Could not repair AppImage shortcut {target}: {exc}", flush=True)
+            return False
+    return True
+
+
 def repair_linux_app_shortcut(app_root=ROOT):
     """Repair the installed application-menu entry using a known-working script.
 
@@ -2139,6 +2291,14 @@ def repair_linux_app_shortcut(app_root=ROOT):
     if not sys.platform.startswith("linux"):
         return False
     app_root = Path(app_root).resolve()
+    appimage = _freehand_running_appimage()
+    if appimage is not None:
+        return _repair_linux_appimage_shortcut(appimage, app_root)
+    # A bundled application may have run_linux.sh inside /tmp/.mount_* or
+    # _MEIPASS. Neither is a valid permanent desktop-menu target. When the
+    # AppImage runtime has not exported APPIMAGE, leave launcher metadata alone.
+    if os.environ.get("APPDIR") or getattr(sys, "frozen", False):
+        return False
     launcher = app_root / "run_linux.sh"
     if not launcher.is_file():
         return False  # Do not write a shortcut that cannot launch the app.
