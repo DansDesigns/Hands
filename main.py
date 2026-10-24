@@ -204,7 +204,6 @@ from gesture_rules import (
     thumb_axis_is_vertical_up,
     opposite_diagonal_corner_assignment,
 )
-from voice_services import Speech, KokoroTTS
 from hand_occlusion import TuckSmoother
 from hand_contact import contact_offsets as hand_contact_offsets
 from custom_gestures import (
@@ -215,15 +214,6 @@ from custom_gestures import (
     load_custom_gestures, save_custom_gestures, pyautogui_key_combo, display_key_combo,
     WindowsShortcutCapture, X11ShortcutCapture,
 )
-from voice_pc_commands import match_pc_command, aliases_for_help, parse_navigation_command, is_navigation_intent, has_explicit_create_prefix
-from voice_assistant_commands import live_answer, file_query
-from d1_decision import (classify_voice_command, start_loading as start_d1_loading,
-                         selected_model as selected_d1_model, select_model as select_d1_model,
-                         status as d1_status, MODELS as D1_MODELS, stop_server as stop_d1_server,
-                         start_loading as start_d1_server)
-from search_launcher import SearchLauncherDialog
-from freehand_search_index import SearchIndex
-from face_welcome import FaceWelcomeService
 from tli_calibration import encode_relative_tli, resolve_relative_tli, mean_relative_tli
 from tpi_screen_calibration import (
     TARGET_COUNT as TPI_CALIBRATION_TARGET_COUNT, TARGET_NAMES as TPI_CALIBRATION_TARGET_NAMES,
@@ -441,7 +431,7 @@ from PySide6.QtGui import QPainter, QColor, QPen, QBrush, QFont, QFontMetricsF, 
 from PySide6.QtCore import QUrl
 from PySide6.QtWidgets import (QApplication, QWidget, QMessageBox, QInputDialog,
                                QLineEdit, QDialog, QCheckBox, QLabel, QPushButton,
-                               QVBoxLayout, QHBoxLayout)
+                               QVBoxLayout, QHBoxLayout, QFileDialog)
 
 from user_paths import user_data_dir, user_file
 
@@ -636,75 +626,198 @@ def available_ui_sounds():
     except OSError:
         return []
 
+class _FreehandWindowsUISoundEngine:
+    """Keep short UI clips open in one non-blocking Windows MCI worker.
+
+    Previously every click created a thread and reopened/decoded an MP3 before
+    starting playback, making button feedback audibly late. The shared worker
+    opens the default clips during the splash and reuses their MCI devices.
+    It never calls winmm on the Qt painting/gesture thread.
+    """
+
+    def __init__(self, mci=None, *, autostart=True):
+        self._mci = mci if mci is not None else ctypes.windll.winmm.mciSendStringW
+        self._commands = queue.PriorityQueue()
+        self._serial = 0
+        self._submit_lock = threading.Lock()
+        self._channels = {}  # worker-owned: Path -> [{"alias", "timer"}, ...]
+        self._timer_channels = {}  # worker-owned: alias -> (channel, cancellation event)
+        self._alias_serial = 0
+        self._stopping = False
+        self._thread = threading.Thread(target=self._run, name="FreehandUISounds", daemon=True)
+        if autostart:
+            self._thread.start()
+
+    def _submit(self, priority, action, path=None, stop_event=None):
+        with self._submit_lock:
+            if self._stopping:
+                return
+            self._serial += 1
+            self._commands.put_nowait((priority, self._serial, action, path, stop_event))
+
+    def prewarm(self, filenames):
+        """Queue file opens in the background; the UI and webcam never wait."""
+        folder = (ROOT / "assets" / "sounds").resolve()
+        for name in dict.fromkeys(str(n) for n in filenames if n and n != "None"):
+            path = (folder / name).resolve()
+            if (path.parent == folder and path.is_file()
+                    and path.suffix.lower() in {".mp3", ".wav"}):
+                self._submit(2, "warm", path)
+
+    def play(self, path, stop_event=None):
+        if stop_event is None or not stop_event.is_set():
+            # Playback takes priority over background warm-up requests.
+            self._submit(0, "play", path, stop_event)
+
+    def _mci_call(self, command):
+        try:
+            return self._mci(command, None, 0, None)
+        except (OSError, AttributeError, ValueError):
+            return -1
+
+    def _open_channel(self, path):
+        self._alias_serial += 1
+        alias = f"freehand_ui_{self._alias_serial:x}"
+        media_type = "mpegvideo" if path.suffix.lower() == ".mp3" else "waveaudio"
+        if self._mci_call(f'open "{path}" type {media_type} alias {alias}') != 0:
+            return None
+        channel = {"alias": alias, "timer": None}
+        self._channels.setdefault(path, []).append(channel)
+        return channel
+
+    def _select_channel(self, path):
+        # Timed gesture sounds have independent channels so stopping one hand's
+        # hold cannot stop the other hand's simultaneous timer sound.
+        for channel in self._channels.get(path, ()):
+            if channel["timer"] is None:
+                return channel
+        return self._open_channel(path)
+
+    def _play_channel(self, channel):
+        alias = channel["alias"]
+        # Play from 0 restarts without re-opening the decoder. Some MCI codecs
+        # don't support 'from' during playback, so retain the seek fallback.
+        if self._mci_call(f"play {alias} from 0") == 0:
+            return True
+        self._mci_call(f"stop {alias}")
+        self._mci_call(f"seek {alias} to start")
+        return self._mci_call(f"play {alias}") == 0
+
+    def _poll_cancellations(self):
+        for alias, (channel, event) in tuple(self._timer_channels.items()):
+            if event.is_set():
+                self._mci_call(f"stop {alias}")
+                channel["timer"] = None
+                del self._timer_channels[alias]
+
+    def _run(self):
+        while not self._stopping:
+            self._poll_cancellations()
+            try:
+                _priority, _serial, action, path, stop_event = self._commands.get(timeout=0.025)
+            except queue.Empty:
+                continue
+            if action == "quit":
+                break
+            if stop_event is not None and stop_event.is_set():
+                continue
+            if action == "warm":
+                if not self._channels.get(path):
+                    self._open_channel(path)
+            elif action == "play":
+                channel = self._select_channel(path)
+                if channel is None:
+                    continue
+                if stop_event is not None:
+                    channel["timer"] = stop_event
+                    self._timer_channels[channel["alias"]] = (channel, stop_event)
+                if not self._play_channel(channel) and stop_event is not None:
+                    channel["timer"] = None
+                    self._timer_channels.pop(channel["alias"], None)
+                self._poll_cancellations()
+        # Close cached devices only during shutdown, not after every click.
+        for group in self._channels.values():
+            for channel in group:
+                self._mci_call(f'close {channel["alias"]}')
+
+    def close(self):
+        with self._submit_lock:
+            self._stopping = True
+            self._serial += 1
+            self._commands.put_nowait((0, self._serial, "quit", None, None))
+        # Daemon worker can finish its MCI shutdown without blocking the UI.
+
+
+_FREEHAND_UI_SOUND_ENGINE = None
+
+
+def _freehand_ui_sound_engine():
+    """Lazy Windows audio engine; no voice, STT, TTS or new dependencies."""
+    global _FREEHAND_UI_SOUND_ENGINE
+    if os.name != "nt":
+        return None
+    if _FREEHAND_UI_SOUND_ENGINE is None:
+        try:
+            _FREEHAND_UI_SOUND_ENGINE = _FreehandWindowsUISoundEngine()
+        except (OSError, AttributeError):
+            return None
+    return _FREEHAND_UI_SOUND_ENGINE
+
+
+def _freehand_prewarm_ui_sounds(filenames=None):
+    engine = _freehand_ui_sound_engine()
+    if engine is not None:
+        engine.prewarm(DEFAULT_UI_SOUNDS.values() if filenames is None else filenames)
+
+
 def play_ui_sound(filename, *, stop_event=None):
-    """Play bundled UI audio. An optional event lets gesture timers cancel it early."""
+    """Nonblocking, cached Windows UI feedback; preserve Linux playback fallback."""
     if not filename or filename == "None":
         return
     folder = (ROOT / "assets" / "sounds").resolve()
     path = (folder / str(filename)).resolve()
     if path.parent != folder or not path.is_file() or path.suffix.lower() not in SOUND_EXTENSIONS:
         return
+    if stop_event is not None and stop_event.is_set():
+        return
     try:
         if os.name == "nt" and path.suffix.lower() in {".mp3", ".wav"}:
-            # Windows does not normally ship with paplay/aplay/ffplay. Use its
-            # native MCI playback asynchronously so gesture recognition never
-            # blocks while the chosen timer sound plays.
-            def _play_windows_mci():
-                alias = "spatial_ui_" + uuid.uuid4().hex[:12]
-                mci = ctypes.windll.winmm.mciSendStringW
-                try:
-                    media_type = "mpegvideo" if path.suffix.lower() == ".mp3" else "waveaudio"
-                    if mci(f'open "{path}" type {media_type} alias {alias}', None, 0, None) != 0:
-                        return
-                    if stop_event is None:
-                        mci(f"play {alias} wait", None, 0, None)
-                    else:
-                        # MCI `play ... wait` cannot be interrupted safely by the UI.
-                        # Use nonblocking playback and poll the stop event instead.
-                        if stop_event.is_set():
-                            return
-                        if mci(f"play {alias}", None, 0, None) != 0:
-                            return
-                        while not stop_event.wait(0.035):
-                            mode = ctypes.create_unicode_buffer(32)
-                            if mci(f"status {alias} mode", mode, len(mode), None) != 0:
-                                break
-                            if mode.value.strip().lower() != "playing":
-                                break
-                        if stop_event.is_set():
-                            mci(f"stop {alias}", None, 0, None)
-                except (OSError, ValueError, AttributeError):
-                    pass
-                finally:
-                    try:
-                        mci(f"close {alias}", None, 0, None)
-                    except (OSError, ValueError, AttributeError):
-                        pass
-            threading.Thread(target=_play_windows_mci, daemon=True).start()
-        else:
-            command = None
-            if shutil.which("paplay"):
-                command = ["paplay", str(path)]
-            elif shutil.which("aplay") and path.suffix.lower() == ".wav":
-                command = ["aplay", "-q", str(path)]
-            elif shutil.which("ffplay"):
-                command = ["ffplay", "-nodisp", "-autoexit", "-loglevel", "quiet", str(path)]
-            if command is not None and (stop_event is None or not stop_event.is_set()):
-                process = subprocess.Popen(command, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-                if stop_event is not None:
-                    def _stop_process_on_cancel():
-                        # Wait for exit *or* cancellation without blocking the scene timer.
-                        while process.poll() is None:
-                            if stop_event.wait(0.035):
-                                if process.poll() is None:
-                                    try:
-                                        process.terminate()
-                                    except OSError:
-                                        pass
-                                break
-                    threading.Thread(target=_stop_process_on_cancel, daemon=True).start()
+            # One persistent worker owns preopened MCI devices. Gesture frames
+            # only enqueue a play request (no thread creation or device open).
+            engine = _freehand_ui_sound_engine()
+            if engine is not None:
+                engine.play(path, stop_event)
+            return
+        command = None
+        if shutil.which("paplay"):
+            command = ["paplay", str(path)]
+        elif shutil.which("aplay") and path.suffix.lower() == ".wav":
+            command = ["aplay", "-q", str(path)]
+        elif shutil.which("ffplay"):
+            command = ["ffplay", "-nodisp", "-autoexit", "-loglevel", "quiet", str(path)]
+        if command is not None:
+            process = subprocess.Popen(command, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            if stop_event is not None:
+                def _stop_process_on_cancel():
+                    while process.poll() is None:
+                        if stop_event.wait(0.035):
+                            if process.poll() is None:
+                                try:
+                                    process.terminate()
+                                except OSError:
+                                    pass
+                            break
+                threading.Thread(target=_stop_process_on_cancel, daemon=True).start()
     except (OSError, ValueError):
         pass
+
+
+# Begin opening short Windows menu sounds while the splash is visible. This is
+# purely background work and does not delay the camera-first initialization.
+if __name__ == "__main__" and os.name == "nt":
+    _freehand_prewarm_ui_sounds()
+
+
 # A one-time accessibility probe at the START of a single pinch drag is used
 # to choose between text selection (native held left click) and touchscreen
 # scrolling. Never run these OS lookups during ordinary hand tracking frames.
@@ -1948,11 +2061,8 @@ HAND_RENDER_STYLE_LABELS = {"skeleton": "SKELETON", "flat": "FLAT", "3d": "3D"}
 # Settings -> Notify rows: (ui preference key, label, default position).
 NOTIFICATION_SETTING_ROWS = (
     ("paused_notice_position", "GESTURE LEGEND LOCATION", "bottom-center"),
-    ("heard_bar_position", "HEARD / TRANSCRIPT BAR", "bottom-center"),
     ("left_status_position", "LEFT HAND STATUS", "bottom-left"),
     ("right_status_position", "RIGHT HAND STATUS", "bottom-right"),
-    ("dictation_indicator_position", "DICTATION INDICATOR", "top-left"),
-    ("stt_indicator_position", "STT INDICATOR", "top-right"),
 )
 TTS_VOICE_OPTIONS = (
     "vits-piper-en_GB-alan-medium",
@@ -1963,94 +2073,10 @@ TTS_VOICE_OPTIONS = (
     "vits-piper-en_US-ryan-medium",
 )
 
-def normalise_wake_word_name(value):
-    """A short, speakable, user-configured trigger phrase (empty disables it)."""
-    if not isinstance(value, str):
-        return ""
-    return " ".join(value.strip().split())[:48].strip()
 
 
-def wake_word_command(transcript, wake_name):
-    """Return (matched, remainder), accepting 'name' or 'hey name command'.
-
-    This uses whole words: a named wake word must never match a substring of
-    another word or a similar-sounding command. Final recognition is authoritative.
-    """
-    name_words = re.findall(r"[a-z0-9']+", normalise_wake_word_name(wake_name).lower())
-    said_words = re.findall(r"[a-z0-9']+", str(transcript or "").lower())
-    if not name_words or not said_words:
-        return False, ""
-    if said_words[:len(name_words)] == name_words:
-        return True, " ".join(said_words[len(name_words):])
-    # Prefer exact-name matching first: a wake name such as "Hey" must not
-    # mistakenly be eaten as an optional leading greeting.
-    if (said_words[0] in ("hey", "hi", "okay", "ok") and
-            said_words[1:1+len(name_words)] == name_words):
-        return True, " ".join(said_words[1+len(name_words):])
-    return False, ""
 
 
-class WakeWordTrainingDialog(QDialog):
-    """Three *recognition* checks using existing Vosk final results.
-
-    No acoustic-model weights are modified: the three utterances validate that
-    the configured name is reliably recognized by the installed STT model.
-    """
-    def __init__(self, name, parent=None):
-        super().__init__(parent)
-        self.name = normalise_wake_word_name(name)
-        self.successes = 0
-        self.setWindowTitle("Freehand · Train Wake Word")
-        self.setWindowFlags(Qt.Dialog | Qt.WindowStaysOnTopHint)
-        self.setModal(True)
-        self.setMinimumWidth(415)
-        self.setStyleSheet("""
-            QDialog { background: #0b202d; color: #e5faff; }
-            QLabel { color: #def7ff; font-size: 12px; }
-            QCheckBox { color: #def7ff; font-size: 13px; padding: 8px; }
-            QCheckBox::indicator { width: 19px; height: 19px; }
-            QPushButton { background: #18485d; border: 1px solid #69bcd2;
-                          color: white; border-radius: 7px; padding: 9px 26px; }
-            QPushButton:hover { background: #236780; }
-        """)
-        layout = QVBoxLayout(self)
-        layout.setContentsMargins(22, 20, 22, 18)
-        layout.setSpacing(12)
-        header = QLabel(f'Say “{self.name}” clearly three separate times.')
-        header.setWordWrap(True)
-        layout.addWidget(header)
-        self.checks = []
-        for i in range(3):
-            checkbox = QCheckBox(f'Recognition {i+1} of 3')
-            checkbox.setFocusPolicy(Qt.NoFocus)
-            checkbox.setAttribute(Qt.WA_TransparentForMouseEvents, True)
-            layout.addWidget(checkbox)
-            self.checks.append(checkbox)
-        self.feedback = QLabel('Waiting for microphone…')
-        self.feedback.setWordWrap(True)
-        layout.addWidget(self.feedback)
-        controls = QHBoxLayout()
-        controls.addStretch(1)
-        self.cancel_button = QPushButton('Cancel')
-        self.cancel_button.clicked.connect(self.reject)
-        controls.addWidget(self.cancel_button)
-        layout.addLayout(controls)
-
-    def receive_final(self, text):
-        matched, remainder = wake_word_command(text, self.name)
-        if not matched or remainder:
-            self.feedback.setText(f'Heard “{text}”. Please say only “{self.name}”.')
-            return False
-        if self.successes >= 3:
-            return True
-        self.checks[self.successes].setChecked(True)
-        self.successes += 1
-        if self.successes == 3:
-            self.feedback.setText('Passed 3/3 — wake word verified!')
-            self.cancel_button.setText('Done')
-            return True
-        self.feedback.setText(f'Correct: {self.successes}/3. Say “{self.name}” again.')
-        return False
 
 
 def _set_start_on_login(enabled, app_root=ROOT):
@@ -2261,7 +2287,7 @@ def _repair_linux_appimage_shortcut(appimage, app_root):
         else:
             content = ("[Desktop Entry]\nType=Application\n"
                        "Name=Freehand: Spatial Computing\n"
-                       "Comment=Hand tracking and voice-driven spatial desktop\n"
+                       "Comment=Freehand hand-tracking spatial desktop\n"
                        f"Exec={command}\nTryExec={appimage}\n"
                        f"Path={appimage.parent}\nTerminal=false\n"
                        "StartupNotify=false\nCategories=Utility;Accessibility;\n"
@@ -2325,7 +2351,7 @@ def repair_linux_app_shortcut(app_root=ROOT):
     content = ("[Desktop Entry]\n"
                "Type=Application\n"
                "Name=Freehand: Spatial Computing\n"
-               "Comment=Hand tracking and voice-driven spatial desktop\n"
+               "Comment=Freehand hand-tracking spatial desktop\n"
                f"Exec=/bin/bash {quote_exec_path(launcher)}\n"
                f"Path={app_root}\n"
                "Terminal=false\n"
@@ -2363,22 +2389,15 @@ def repair_linux_app_shortcut(app_root=ROOT):
 def load_ui_preferences() -> dict:
     defaults = {
         "paused_notice_position": "bottom-center",
-        "heard_bar_position": "bottom-center",
         "left_status_position": "bottom-left",
         "right_status_position": "bottom-right",
-        "dictation_indicator_position": "top-left",
-        "stt_indicator_position": "top-right",
         "ui_font_scale": 1.2,
         "show_gesture_disabled_indicator": True,
         "debug_console": False,
         "start_on_login": False,
-        "d1_autostart": False,
         # None retains the historical default for users who have never switched.
         # os/virtual always records the user's most recently selected mode.
         "last_desktop_mode": None,
-        "wake_word_name": "",
-        "wake_word_trained": False,
-        "wake_word_listening": False,
         "garden_onboarding_completed": False,
         "garden_onboarding_progress": [],
         "garden_onboarding_bonus_xp": 0,
@@ -2398,7 +2417,7 @@ def load_ui_preferences() -> dict:
                     result[key] = min(1.4, max(0.7, float(value)))
                 except (TypeError, ValueError):
                     pass
-            elif key in ("show_gesture_disabled_indicator", "garden_onboarding_completed", "debug_console", "start_on_login", "wake_word_trained", "wake_word_listening", "d1_autostart"):
+            elif key in ("show_gesture_disabled_indicator", "garden_onboarding_completed", "debug_console", "start_on_login"):
                 if isinstance(value, bool):
                     result[key] = value
             elif key == "last_desktop_mode":
@@ -2410,8 +2429,6 @@ def load_ui_preferences() -> dict:
             elif key == "garden_onboarding_bonus_xp":
                 if type(value) is int:
                     result[key] = max(0, min(1000, value))
-            elif key == "wake_word_name":
-                result[key] = normalise_wake_word_name(value)
             elif key == "sound_defaults_v1_applied":
                 if isinstance(value, bool):
                     result[key] = value
@@ -2421,8 +2438,6 @@ def load_ui_preferences() -> dict:
                     result[key] = value
             elif value in NOTIFICATION_POSITIONS:
                 result[key] = value
-    if not result["wake_word_name"]:
-        result["wake_word_trained"] = False
     return result
 
 def save_ui_preferences(values: dict) -> None:
@@ -2434,7 +2449,7 @@ def save_ui_preferences(values: dict) -> None:
                 current[key] = min(1.4, max(0.7, float(value)))
             except (TypeError, ValueError):
                 pass
-        elif key in ("show_gesture_disabled_indicator", "garden_onboarding_completed", "debug_console", "start_on_login", "wake_word_trained", "wake_word_listening", "d1_autostart"):
+        elif key in ("show_gesture_disabled_indicator", "garden_onboarding_completed", "debug_console", "start_on_login"):
             if isinstance(value, bool):
                 current[key] = value
         elif key == "last_desktop_mode":
@@ -2446,8 +2461,6 @@ def save_ui_preferences(values: dict) -> None:
         elif key == "garden_onboarding_bonus_xp":
             if type(value) is int:
                 current[key] = max(0, min(1000, value))
-        elif key == "wake_word_name":
-            current[key] = normalise_wake_word_name(value)
         elif key == "sound_defaults_v1_applied":
             if isinstance(value, bool):
                 current[key] = value
@@ -2457,8 +2470,6 @@ def save_ui_preferences(values: dict) -> None:
                 current[key] = value
         elif value in NOTIFICATION_POSITIONS:
             current[key] = value
-    if not current["wake_word_name"]:
-        current["wake_word_trained"] = False
     try:
         UI_SETTINGS_FILE.write_text(json.dumps(current, indent=2) + "\n", encoding="utf-8")
     except OSError as exc:
@@ -2817,14 +2828,28 @@ def load_gesture_settings() -> dict:
 
 
 def download(url: str, target: Path) -> None:
-    print(f"Downloading {url}")
-    temp_path = str(target) + ".part"
-    urllib.request.urlretrieve(url, temp_path)
-    os.replace(temp_path, target)
+    """Download the hand model atomically, with a bounded network timeout.
+
+    This runs on the camera worker during first-time startup, never on Qt's
+    splash/main thread. A failed download leaves no corrupt .task file behind.
+    """
+    print(f"Downloading {url}", flush=True)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    temporary = target.with_name(target.name + f".{os.getpid()}.part")
+    try:
+        with urllib.request.urlopen(url, timeout=20) as source, temporary.open("wb") as output:
+            while chunk := source.read(1024 * 1024):
+                output.write(chunk)
+        if temporary.stat().st_size == 0:
+            raise RuntimeError("Downloaded hand model is empty")
+        os.replace(temporary, target)
+    except BaseException:
+        temporary.unlink(missing_ok=True)
+        raise
 
 
 def ensure_models() -> None:
-    if not HAND_MODEL.exists():
+    if not HAND_MODEL.is_file() or HAND_MODEL.stat().st_size == 0:
         download(HAND_URL, HAND_MODEL)
 
 
@@ -3120,6 +3145,277 @@ class _HandVisualMotionFilter:
         return [(float(p[0]), float(p[1])/self._Y_TO_X, float(p[2])) for p in output]
 
 
+# Camera priority: Freehand is a background hand-tracking consumer, never an
+# exclusive camera owner. No camera API provides a portable 'please preempt me'
+# callback, so we combine active OS camera sessions, open Linux device handles,
+# and a foreground fallback for dedicated camera/meeting screens. These are
+# *observations*, not access-control rules: never change other apps' settings.
+_CAMERA_PRIORITY_POLL_SECONDS = 1.25
+_CAMERA_PRIORITY_RELEASE_GRACE_SECONDS = 1.8
+_CAMERA_FOREGROUND_APPS = (
+    'camera', 'cheese', 'guvcview', 'qv4l2', 'cameractrls', 'photobooth',
+    'photo booth', 'facetime', 'facetimehd', 'webcamoid', 'megapixels',
+    'snapshot', 'kamoso', 'cameraserver',
+)
+_CAMERA_MEETING_WORDS = (
+    'video call', 'video chat', 'video meeting', 'meeting in progress',
+    'join meeting', 'join call', 'camera preview', 'take photo',
+    'webcam preview', 'google meet', 'jitsi meet', 'facetime',
+    'zoom meeting', 'teams meeting', 'whatsapp video',
+)
+
+
+def _camera_foreground_is_video_app(process_name, window_title):
+    """Be conservative: an ordinary WhatsApp/Teams *chat* is not a video call."""
+    process = str(process_name or '').casefold()
+    title = str(window_title or '').casefold()
+    if 'freehand' in process or 'spatial_desktop' in process:
+        return False
+    stem = Path(process.replace('\\', '/')).stem
+    if stem in _CAMERA_FOREGROUND_APPS or any(
+            stem.startswith(name) for name in ('windowscamera', 'microsoft.windowscamera')):
+        return True
+    # Microsoft Camera can run inside ApplicationFrameHost.exe, with its only
+    # reliable top-level identity being the literal "Camera" window title.
+    # Match the entire title, not an arbitrary document/chat containing camera.
+    if title.strip() in ('camera', 'windows camera', 'microsoft camera') and (
+            stem in ('applicationframehost', 'windowscamera', 'camera', 'cameraapp')
+            or stem.startswith('windowscamera')):
+        return True
+    return any(phrase in title for phrase in _CAMERA_MEETING_WORDS)
+
+
+def _linux_competing_camera_owner(camera_index):
+    """Find another process with THIS V4L2 device open, without root or fuser.
+
+    /proc may be restricted (e.g. sandbox/Flatpak); permission errors are a
+    best-effort miss, not evidence that a device is free.
+    """
+    try:
+        target = os.stat(f'/dev/video{int(camera_index)}').st_rdev
+        proc = Path('/proc')
+        self_pid = os.getpid()
+        for item in proc.iterdir():
+            if not item.name.isdecimal() or int(item.name) == self_pid:
+                continue
+            try:
+                for fd in (item / 'fd').iterdir():
+                    try:
+                        destination = os.readlink(fd)
+                        if not destination.startswith('/dev/video'):
+                            continue
+                        # A process can hold a different /dev/videoN device.
+                        if os.stat(fd).st_rdev != target:
+                            continue
+                        try:
+                            name = (item / 'comm').read_text(encoding='utf-8').strip()
+                        except (OSError, UnicodeError):
+                            name = f'process {item.name}'
+                        return name or 'another application'
+                    except (OSError, ValueError):
+                        continue
+            except (OSError, PermissionError):
+                continue
+    except (OSError, ValueError):
+        pass
+    return None
+
+
+def _linux_foreground_camera_app():
+    """Recognize an open camera/meeting window before it gets device access.
+
+    Only on X11 when xprop is available; Wayland compositors normally prohibit
+    global window inspection. Device-handle detection remains available there.
+    """
+    if not os.environ.get('DISPLAY') or not shutil.which('xprop'):
+        return None
+    try:
+        info = subprocess.run(['xprop', '-root', '_NET_ACTIVE_WINDOW'],
+                              capture_output=True, text=True, timeout=0.5, check=False)
+        match = re.search(r'window id # (0x[0-9a-fA-F]+)', info.stdout)
+        if not match or int(match.group(1), 16) == 0:
+            return None
+        details = subprocess.run(['xprop', '-id', match.group(1),
+                                  'WM_CLASS', '_NET_WM_NAME', 'WM_NAME'],
+                                 capture_output=True, text=True, timeout=0.5, check=False)
+        classes = re.search(r'WM_CLASS\([^)]*\)\s*=\s*(.*)', details.stdout)
+        name = (classes.group(1).split(',')[-1].strip(' "') if classes else '')
+        titles = re.findall(r'(?:_NET_WM_NAME|WM_NAME)\([^)]*\)\s*=\s*"([^"\n]*)"',
+                            details.stdout)
+        title = titles[0] if titles else ''
+        if _camera_foreground_is_video_app(name, title):
+            return name or title or 'camera application'
+    except (OSError, subprocess.TimeoutExpired, ValueError):
+        pass
+    return None
+
+
+def _windows_camera_registry_owner():
+    """Observe active Windows camera privacy sessions, excluding Freehand.
+
+    LastUsedTimeStart/Stop can be REG_QWORD or 8-byte REG_BINARY. A missing
+    stop (or stop older than start) denotes a current session. Old orphaned
+    records are ignored to avoid indefinite suspension after a crash.
+    """
+    try:
+        import winreg
+        base = ('Software\\Microsoft\\Windows\\CurrentVersion\\'
+                r'CapabilityAccessManager\ConsentStore\webcam')
+        key = winreg.OpenKey(winreg.HKEY_CURRENT_USER, base)
+    except (ImportError, OSError):
+        return None
+
+    def timestamp(value):
+        if isinstance(value, int):
+            return value
+        if isinstance(value, bytes) and len(value) == 8:
+            return int.from_bytes(value, 'little')
+        return 0
+
+    own_exe = Path(sys.executable).name.casefold()
+    now_filetime = int((time.time() + 11644473600) * 10_000_000)
+
+    def inspect(node, label):
+        lowered = label.casefold()
+        if ('freehand' in lowered or 'spatial_desktop' in lowered or
+                (own_exe.startswith('python') and
+                 ('#python.exe' in lowered or '#pythonw.exe' in lowered)) or
+                lowered in ('nonpackaged', 'webcam')):
+            return None
+        try:
+            start = timestamp(winreg.QueryValueEx(node, 'LastUsedTimeStart')[0])
+            try:
+                stop = timestamp(winreg.QueryValueEx(node, 'LastUsedTimeStop')[0])
+            except OSError:
+                stop = 0
+            # Limit very old stranded session records (driver/app crashes).
+            if (start > 116444736000000000 and start <= now_filetime and
+                    now_filetime-start < 12*3600*10_000_000 and
+                    (stop == 0 or stop < start)):
+                return label.split('#')[-1].split('\\')[-1] or 'camera app'
+        except OSError:
+            pass
+        return None
+
+    try:
+        with key:
+            for idx in range(256):
+                try:
+                    label = winreg.EnumKey(key, idx)
+                    app = winreg.OpenKey(key, label)
+                except OSError:
+                    break
+                with app:
+                    if label.casefold() != 'nonpackaged':
+                        owner = inspect(app, label)
+                        if owner:
+                            return owner
+                        continue
+                    for n in range(256):
+                        try:
+                            subname = winreg.EnumKey(app, n)
+                            child = winreg.OpenKey(app, subname)
+                        except OSError:
+                            break
+                        with child:
+                            owner = inspect(child, subname)
+                            if owner:
+                                return owner
+    except (OSError, ValueError):
+        pass
+    return None
+
+
+def _windows_foreground_camera_app():
+    try:
+        user32 = ctypes.windll.user32
+        user32.GetForegroundWindow.restype = wintypes.HWND
+        handle = user32.GetForegroundWindow()
+        if not handle:
+            return None
+        title = ctypes.create_unicode_buffer(260)
+        user32.GetWindowTextW.argtypes = (wintypes.HWND, ctypes.c_wchar_p, ctypes.c_int)
+        user32.GetWindowTextW(handle, title, len(title))
+        name = _windows_process_name(handle)  # Existing Windows HWND->exe helper.
+        if _camera_foreground_is_video_app(name, title.value):
+            return name or title.value or 'camera application'
+    except (OSError, AttributeError, TypeError, ValueError):
+        pass
+    return None
+
+
+def _windows_open_camera_app():
+    """Find an open Windows Camera window even behind Freehand's overlay.
+
+    Microsoft Camera uses either WindowsCamera.exe or ApplicationFrameHost.exe.
+    Only dedicated Camera windows qualify here; unrelated video meetings must
+    be identified as active by the existing camera session/foreground probes.
+    """
+    if not sys.platform.startswith('win'):
+        return None
+    try:
+        user = ctypes.windll.user32
+        user.IsWindowVisible.argtypes = (wintypes.HWND,)
+        user.IsWindowVisible.restype = wintypes.BOOL
+        user.GetWindowTextW.argtypes = (wintypes.HWND, ctypes.c_wchar_p, ctypes.c_int)
+        user.GetWindowTextW.restype = ctypes.c_int
+        user.GetClassNameW.argtypes = (wintypes.HWND, ctypes.c_wchar_p, ctypes.c_int)
+        user.GetClassNameW.restype = ctypes.c_int
+        found = [None]
+        callback_type = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
+        @callback_type
+        def callback(hwnd, _unused):
+            if not user.IsWindowVisible(hwnd):
+                return True
+            title = ctypes.create_unicode_buffer(160)
+            user.GetWindowTextW(hwnd, title, len(title))
+            if title.value.strip().casefold() not in ('camera', 'windows camera', 'microsoft camera'):
+                return True
+            process = _windows_process_name(hwnd)
+            cls_buf = ctypes.create_unicode_buffer(128)
+            user.GetClassNameW(hwnd, cls_buf, len(cls_buf))
+            if _camera_foreground_is_video_app(process, title.value) and (
+                    process in ('applicationframehost.exe', 'windowscamera.exe',
+                                'camera.exe', 'cameraapp.exe') or
+                    cls_buf.value.casefold() == 'applicationframewindow'):
+                found[0] = 'Windows Camera'
+                return False
+            return True
+        user.EnumWindows.argtypes = (callback_type, wintypes.LPARAM)
+        user.EnumWindows.restype = wintypes.BOOL
+        user.EnumWindows(callback, 0)
+        return found[0]
+    except (OSError, AttributeError, TypeError, ValueError):
+        return None
+
+
+def _mac_foreground_camera_app():
+    # PyObjC is optional. Do not run AppleScript (which would ask for intrusive
+    # accessibility permissions merely to detect an active window).
+    try:
+        from AppKit import NSWorkspace
+        app = NSWorkspace.sharedWorkspace().frontmostApplication()
+        if app is not None:
+            name = str(app.localizedName() or '')
+            if _camera_foreground_is_video_app(name, ''):
+                return name
+    except (ImportError, AttributeError, RuntimeError):
+        pass
+    return None
+
+
+def _camera_external_priority_owner(camera_index):
+    """Best-effort active owner, called only in the capture worker at ~1 Hz."""
+    if sys.platform.startswith('linux'):
+        return _linux_competing_camera_owner(camera_index) or _linux_foreground_camera_app()
+    if sys.platform.startswith('win'):
+        return (_windows_camera_registry_owner() or _windows_foreground_camera_app()
+                or _windows_open_camera_app())
+    if sys.platform == 'darwin':
+        return _mac_foreground_camera_app()
+    return None
+
+
 class Tracker:
     """Low-latency, hand-only MediaPipe tracker. No body-pose model is loaded."""
     def __init__(self, capture_fps=15):
@@ -3132,7 +3428,23 @@ class Tracker:
         self.camera_index = 0
         self.cap = None
         self.initialization_error = ""
+        # Startup can now be synchronized with a genuinely working camera
+        # stream and first MediaPipe inference, without waiting for a hand to
+        # enter the picture or blocking QApplication's splash animation.
+        self.started_at = time.monotonic()
+        self.camera_opened = False
+        self.model_ready = False
+        self.first_frame_ready = False
         self._reopen_failures = 0
+        # Updated solely by the capture worker; read by the Qt UI. When true,
+        # the OpenCV camera handle is genuinely closed, not just hand inference.
+        self.camera_yielded = False
+        self.camera_priority_owner = ''
+        # Windows handover confirmation. Worker requests, GUI answers, worker
+        # releases the capture handle. A denial is respected until request ends.
+        self.camera_handover_request = ''
+        self.camera_handover_response = None
+        self.camera_handover_denied = False
         self.running = True
         self.hand_tracking_enabled = True
         self.hands_data = []
@@ -3174,9 +3486,14 @@ class Tracker:
             pass
         return cap
 
-    def _clear_hand_state(self):
+    def _clear_hand_state(self, clear_camera_frame=False):
         with self.lock:
             self.hands_data = []
+            if clear_camera_frame:
+                # Face welcome must not see a stale photo after the camera is
+                # released to another app.
+                self.latest_frame = None
+                self.frame_id += 1
         self._candidate_streak = {"left": 0, "right": 0}
         self._candidate_center = {"left": None, "right": None}
         self._candidate_misses = {"left": 0, "right": 0}
@@ -3186,6 +3503,8 @@ class Tracker:
         print(f"Camera {reason}; reopening it.", flush=True)
         self._clear_hand_state()
         old, self.cap = self.cap, None
+        self.camera_opened = False
+        self.first_frame_ready = False
         if old is not None:
             try:
                 old.release()
@@ -3211,6 +3530,10 @@ class Tracker:
                 time.sleep(0.1)
             if delivered and self.running:
                 self.cap = cap
+                self.camera_opened = True
+                # When a camera re-enumerates, keep ownership checks aimed at
+                # the device actually reopened rather than the old index.
+                self.camera_index = index
                 self._reopen_failures = 0
                 print(f"Camera {index} is delivering frames again.", flush=True)
                 return True
@@ -3227,6 +3550,34 @@ class Tracker:
 
     def _loop(self):
         try:
+            # Open the actual camera FIRST. Previously MediaPipe was imported
+            # and its hand model created before cv2.VideoCapture(), leaving the
+            # webcam indicator dark for most of the branded splash screen.
+            # All driver calls stay off the GUI thread.
+            first_owner = _camera_external_priority_owner(self.camera_index)
+            if first_owner:
+                self.camera_yielded = True
+                self.camera_priority_owner = first_owner
+                print(f"Camera priority given to {first_owner} at startup.", flush=True)
+            else:
+                self.cap = self._open_camera(self.camera_index)
+                self.camera_opened = self.cap is not None
+                if self.cap is None:
+                    print("Camera not available at startup; retrying in background.", flush=True)
+            if not self.running:
+                if self.cap is not None:
+                    self.cap.release()
+                    self.cap = None
+                return
+
+            # Missing hand models download here, behind the splash, rather
+            # than holding the Qt startup path at main()->ensure_models().
+            ensure_models()
+            if not self.running:
+                if self.cap is not None:
+                    self.cap.release()
+                    self.cap = None
+                return
             import mediapipe as mp
             from mediapipe.tasks import python as mp_python
             from mediapipe.tasks.python import vision
@@ -3242,14 +3593,23 @@ class Tracker:
             landmark_model = vision.HandLandmarker.create_from_options(options)
             if not self.running:
                 landmark_model.close()
+                if self.cap is not None:
+                    self.cap.release()
+                    self.cap = None
                 return
             self.hands = landmark_model
-            self.cap = self._open_camera(self.camera_index)
-            if self.cap is None:
-                print("Camera not available at startup; retrying in background.", flush=True)
+            self.model_ready = True
         except Exception as exc:
             self.initialization_error = str(exc)
             print("Hand tracker could not initialize:", exc, flush=True)
+            # An unusable model should not leave the webcam held indefinitely.
+            old, self.cap = self.cap, None
+            if old is not None:
+                try:
+                    old.release()
+                except Exception:
+                    pass
+            self.camera_opened = False
             return
         last_frame_time = 0.0
         # Inference is the largest ongoing CPU cost. Preserve a responsive active
@@ -3269,6 +3629,8 @@ class Tracker:
         last_sample = None
         reopen_delay, next_reopen_at = 1.0, 0.0
         gap_check_armed = False
+        next_camera_priority_check = 0.0
+        last_external_use = time.monotonic()
 
         def reopen(reason, force=False):
             nonlocal failing_since, frozen_since, last_sample, reopen_delay, next_reopen_at
@@ -3285,6 +3647,61 @@ class Tracker:
             last_wall, last_mono = time.time(), time.monotonic()
 
         while self.running:
+            # A background video call must always win over Freehand. This check
+            # is on the capture thread, never on the UI/event loop. Use a low
+            # frequency so /proc, registry and window probes stay inexpensive.
+            priority_now = time.monotonic()
+            if priority_now >= next_camera_priority_check:
+                next_camera_priority_check = priority_now + _CAMERA_PRIORITY_POLL_SECONDS
+                owner = _camera_external_priority_owner(self.camera_index)
+                if owner:
+                    last_external_use = priority_now
+                    self.camera_priority_owner = owner
+                    if not self.camera_yielded and sys.platform.startswith('win'):
+                        # Windows has no universal preemption callback. Detect a
+                        # camera app, ask the user (nonblocking GUI dialog), and
+                        # keep this capture handle until they explicitly agree.
+                        if self.camera_handover_response is True:
+                            self.camera_handover_request = ''
+                        elif self.camera_handover_response is False:
+                            self.camera_handover_denied = True
+                            self.camera_handover_request = ''
+                        elif not self.camera_handover_denied:
+                            self.camera_handover_request = owner
+                    if (not self.camera_yielded and
+                            (not sys.platform.startswith('win') or
+                             self.camera_handover_response is True)):
+                        print(f"Camera released for {owner}.", flush=True)
+                        old, self.cap = self.cap, None
+                        self.camera_opened = False
+                        self.first_frame_ready = False
+                        if old is not None:
+                            try:
+                                old.release()
+                            except Exception:
+                                pass
+                        self._clear_hand_state(clear_camera_frame=True)
+                        failing_since = frozen_since = last_sample = None
+                        gap_check_armed = False
+                        self.camera_yielded = True
+                else:
+                    # A subsequent, separate camera session may request again.
+                    if not self.camera_yielded:
+                        self.camera_priority_owner = ''
+                    self.camera_handover_request = ''
+                    self.camera_handover_response = None
+                    self.camera_handover_denied = False
+                    if (self.camera_yielded and priority_now-last_external_use >=
+                            _CAMERA_PRIORITY_RELEASE_GRACE_SECONDS):
+                        self.camera_yielded = False
+                        self.camera_priority_owner = ''
+                        reopen_delay, next_reopen_at = 1.0, 0.0
+                        failing_since = frozen_since = last_sample = None
+                        gap_check_armed = False
+                        print("Camera available; resuming Freehand tracking.", flush=True)
+            if self.camera_yielded:
+                time.sleep(0.10)
+                continue
             # The user-selected capture rate controls active inference. A much
             # longer pass means
             # the PC slept (the wall clock jumps across a suspend; the monotonic clock may
@@ -3421,6 +3838,7 @@ class Tracker:
                     self.hands_data = found
                     self.latest_frame = frame.copy()
                     self.frame_id += 1
+                    self.first_frame_ready = True
                 if not gap_check_armed:
                     gap_check_armed = True
                     last_wall, last_mono = time.time(), time.monotonic()
@@ -3467,12 +3885,18 @@ class Tracker:
             self.hands.close()
 
 
-class SpeechEvents(QObject):
-    """Qt signals safely bridge worker threads to the GUI thread."""
-    final = Signal(str)
-    partial = Signal(str)
-    status = Signal(str)
-    face_status = Signal(str)
+
+# Start the camera worker as soon as its class is available, before parsing
+# and constructing the large SpatialDesktop window. Only the actual Freehand
+# entrypoint prewarms; importers and test runners never open a webcam.
+_FREEHAND_EARLY_TRACKER = None
+if __name__ == "__main__":
+    try:
+        _early_settings = load_gesture_settings()
+        _FREEHAND_EARLY_TRACKER = Tracker(
+            capture_fps=_early_settings.get("hand_capture_fps", 15))
+    except Exception as _camera_start_error:
+        print("Early hand camera initialization failed:", _camera_start_error, flush=True)
 
 
 class UpdateCheckSignals(QObject):
@@ -3482,402 +3906,6 @@ class UpdateCheckSignals(QObject):
     progress = Signal(int, int)
 
 
-class SearchHandOverlay(QWidget):
-    """Click-through overlay that keeps hands/TPI visible above the search launcher."""
-    def __init__(self, owner):
-        super().__init__(None)
-        self.owner = owner
-        self.setWindowTitle("Spatial Desktop Hand Indicators")
-        # On Windows this is a real, independent top-level window rather than a Qt.Tool.
-        # The shell's virtual-desktop pinning service needs a stable native window view;
-        # Keep Windows as a regular top-level view for virtual-desktop pinning and
-        # Task View integration; Linux keeps the established Qt.Tool behaviour unchanged.
-        overlay_kind = Qt.Window if sys.platform.startswith("win") else Qt.Tool
-        self.setWindowFlags(overlay_kind | Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint |
-                            Qt.WindowDoesNotAcceptFocus | Qt.NoDropShadowWindowHint)
-        self.setAttribute(Qt.WA_TranslucentBackground, True)
-        self.setAttribute(Qt.WA_TransparentForMouseEvents, True)
-        self.setAttribute(Qt.WA_ShowWithoutActivating, True)
-        self.setFocusPolicy(Qt.NoFocus)
-        self._last_raise = 0.0
-        self._last_native_raise = 0.0
-        self._native_style_ready = False
-        self._global_hand_layer_active = False
-        self._windows_virtual_desktop_pinned = False
-        self._windows_virtual_desktop_pin_last_attempt = 0.0
-        self._windows_virtual_desktop_pin_warning_reported = False
-        self.sync_timer = QTimer(self)
-        self.sync_timer.setTimerType(Qt.PreciseTimer)
-        self.sync_timer.setInterval(24)
-        self.sync_timer.timeout.connect(self.sync_to_launcher)
-        self.sync_timer.start()
-
-    def sync_to_launcher(self):
-        owner = self.owner
-        dialog = owner.search_dialog
-        search_visible = bool(dialog is not None and dialog.isVisible() and
-                              not owner.hand_tracking_paused)
-        # Windows needs a separate transparent hand layer which stays pinned across
-        # virtual desktops. A QCursor position follows the active desktop on its own,
-        # but hands painted into the original fullscreen window do not reliably follow
-        # Win+Tab/Task View. This independent layer is click-through and owns the hands
-        # on Windows; Linux keeps the original Search-only overlay behaviour.
-        windows_global_layer = bool(
-            sys.platform.startswith("win") and not owner.hand_tracking_paused and
-            not getattr(owner, "_wake_word_training_dialog", None) and
-            not getattr(owner, "_wake_word_name_editing", False) and
-            not getattr(owner, "hand_calibration_active", False) and
-            getattr(owner, "tli_calibration_active_side", None) is None
-        )
-        self._global_hand_layer_active = windows_global_layer
-        should_show = bool(search_visible or windows_global_layer)
-        # A permanently visible transparent Windows hand layer previously repainted
-        # the entire screen ~25 times/second even with no hands. Keep it responsive
-        # while there are visible hand landmarks or running countdowns, but let the
-        # empty layer fall to a low cadence. The 180 ms poll also detects new hands.
-        active_visuals = bool(
-            any(owner.hand_positions.get(side) for side in ("left", "right")) or
-            any(owner.peace_hold_started.get(side) is not None for side in ("left", "right")) or
-            any(owner.menu_pinch_started.get(side) is not None for side in ("left", "right")) or
-            bool(getattr(owner, "custom_gesture_rings", {})) or
-            any(owner.fist_action_menu_open.get(side, False) for side in ("left", "right")) or
-            any(bool(owner.gesture_timer_fade.get(side)) for side in ("left", "right")) or
-            any(time.monotonic() - float(anim.get("started_at", 0.0)) <
-                float(anim.get("duration", 0.2)) + 0.05
-                for anim in owner.pinch_menu_animation.values())
-        )
-        # User-configurable hand *display* FPS. This does not change camera
-        # inference, the gesture state machine, or pointer/TPI input cadence.
-        hand_frame_ms = max(1, round(1000.0 / effective_hand_visual_fps(
-            owner.hand_display_fps, owner.hand_capture_fps)))
-        # The search bar does its own text painting. Keep the transparent
-        # hand overlay at a smooth 30 FPS there rather than saturating the GUI
-        # with 90/120-FPS fullscreen alpha composition during typing.
-        if search_visible:
-            hand_frame_ms = max(hand_frame_ms, 33)
-        wanted_interval = hand_frame_ms if active_visuals else 180
-        if self.sync_timer.interval() != wanted_interval:
-            self.sync_timer.setInterval(wanted_interval)
-        if not should_show:
-            if self.isVisible():
-                self.hide()
-            return
-        target_geometry = owner.geometry()
-        if self.geometry() != target_geometry:
-            self.setGeometry(target_geometry)
-        if not self.isVisible():
-            self.show()
-        now = time.monotonic()
-        if sys.platform.startswith("win"):
-            # Pin this actual hand-rendering HWND as well as the main fullscreen owner.
-            # Retry until Explorer confirms pinning; the Windows shell API is private
-            # and may be unavailable on some builds.
-            if (not self._windows_virtual_desktop_pinned and
-                    now-self._windows_virtual_desktop_pin_last_attempt >= 2.0):
-                self._windows_virtual_desktop_pin_last_attempt = now
-                try:
-                    pinned = pin_window_on_all_virtual_desktops(int(self.winId()))
-                    if pinned:
-                        self._windows_virtual_desktop_pinned = True
-                    elif not self._windows_virtual_desktop_pin_warning_reported:
-                        print("Spatial Desktop: Windows could not pin the hand-visual overlay to all virtual desktops; retrying.")
-                        self._windows_virtual_desktop_pin_warning_reported = True
-                except Exception as exc:
-                    if not self._windows_virtual_desktop_pin_warning_reported:
-                        print("Spatial Desktop: hand-visual virtual-desktop pinning unavailable:", exc)
-                        self._windows_virtual_desktop_pin_warning_reported = True
-            if not self._native_style_ready:
-                try:
-                    hwnd = wintypes.HWND(int(self.winId()))
-                    user32 = ctypes.windll.user32
-                    # HWND is pointer-sized on 64-bit Windows. Explicit signatures prevent
-                    # ctypes from truncating it through its default 32-bit integer ABI.
-                    get_long = getattr(user32, "GetWindowLongPtrW", user32.GetWindowLongW)
-                    set_long = getattr(user32, "SetWindowLongPtrW", user32.SetWindowLongW)
-                    get_long.argtypes = [wintypes.HWND, ctypes.c_int]
-                    get_long.restype = ctypes.c_ssize_t
-                    set_long.argtypes = [wintypes.HWND, ctypes.c_int, ctypes.c_ssize_t]
-                    set_long.restype = ctypes.c_ssize_t
-                    style = int(get_long(hwnd, -20))
-                    # Transparent input, layered composition, and no activation. Keep this
-                    # as a normal top-level view: WS_EX_TOOLWINDOW explicitly excludes it
-                    # from Task View/Alt+Tab and can interfere with Explorer's virtual-
-                    # desktop view association. The overlay is still click-through and
-                    # does not accept focus.
-                    style |= 0x00000020 | 0x00080000 | 0x08000000
-                    set_long(hwnd, -20, style)
-                    self._native_style_ready = True
-                    user32.SetWindowPos.argtypes = [wintypes.HWND, wintypes.HWND,
-                                                    ctypes.c_int, ctypes.c_int,
-                                                    ctypes.c_int, ctypes.c_int, wintypes.UINT]
-                    user32.SetWindowPos.restype = wintypes.BOOL
-                    # SWP_NOSIZE|SWP_NOMOVE|SWP_NOACTIVATE|SWP_SHOWWINDOW|SWP_FRAMECHANGED.
-                    user32.SetWindowPos(hwnd, wintypes.HWND(-1), 0, 0, 0, 0,
-                                        0x0001 | 0x0002 | 0x0010 | 0x0040 | 0x0020)
-                except Exception:
-                    pass
-        # Reassert the topmost position without activation. This orders the overlay
-        # above ordinary desktop windows; immersive Windows shell surfaces such as
-        # Task View may still be in a higher system z-order band.
-        raise_interval = (0.55 if search_visible else 0.25) if active_visuals else 0.85
-        task_view_open = owner._windows_task_view_active(now)
-        # The right-click visual guard lasts up to eight seconds. A *later*
-        # grouped-app preview is a DIFFERENT shell surface; leaving that guard
-        # in charge silently stops all re-raising, which made hands disappear
-        # behind thumbnails after using the Pinch Menu. Recognize a confirmed
-        # preview independently, but never try to cover Task View itself.
-        preview_open = (sys.platform.startswith('win') and not task_view_open and
-                        _windows_shell_preview_visible(now))
-        native_menu_open = (task_view_open or
-                            (owner._native_context_menu_visual_guard(now) and
-                             not preview_open))
-        if preview_open:
-            raise_interval = min(raise_interval, 0.045)
-        if not native_menu_open and now-self._last_raise > raise_interval:
-            self.raise_()
-            self._last_raise = now
-        if (not native_menu_open and sys.platform.startswith("win")
-                and now-self._last_native_raise > raise_interval):
-            try:
-                hwnd = int(self.winId())
-                user32 = ctypes.windll.user32
-                user32.SetWindowPos.argtypes = (wintypes.HWND, wintypes.HWND,
-                                                ctypes.c_int, ctypes.c_int,
-                                                ctypes.c_int, ctypes.c_int, wintypes.UINT)
-                user32.SetWindowPos.restype = wintypes.BOOL
-                # Reorder only the transparent hand layer, without taking focus
-                # or moving native thumbnail windows.
-                user32.SetWindowPos(wintypes.HWND(hwnd), wintypes.HWND(-1), 0, 0, 0, 0,
-                                    0x0001 | 0x0002 | 0x0010 | 0x0040)
-                self._last_native_raise = now
-            except Exception:
-                pass
-        # Refresh the costly transparent hand layer only when its content
-        # changes. Hands arrive independently at the camera rate; repeated Qt
-        # timers with identical landmarks must not repaint an entire desktop.
-        tracker = getattr(owner, "tracker", None)
-        tracker_frame = getattr(tracker, "frame_id", -1)
-        def cursor_key(side):
-            cursor = owner.side_cursor_positions.get(side)
-            if cursor is None:
-                return None
-            return (round(cursor.x(), 1), round(cursor.y(), 1))
-        signature = (tracker_frame, cursor_key("left"), cursor_key("right"),
-                     tuple(bool(owner.gesture_tracking_enabled.get(side, True))
-                           for side in ("left", "right")),
-                     tuple(bool(owner.fist_action_menu_open.get(side, False))
-                           for side in ("left", "right")),
-                     bool(search_visible), bool(windows_global_layer),
-                     getattr(owner, "hand_render_style", None),
-                     float(getattr(owner, "hand_transparency", 75.0)),
-                     bool(getattr(owner, "floating_clipboard_visible", False)),
-                     bool(getattr(owner, "_selection_drag", None)),
-                     tuple(side in owner.active_push_sides for side in ("left", "right")))
-        animated = bool(
-            any(owner.peace_hold_started.get(side) is not None
-                for side in ("left", "right")) or
-            any(owner.menu_pinch_started.get(side) is not None
-                for side in ("left", "right")) or
-            any(now - float(anim.get("started_at", 0.0)) <
-                float(anim.get("duration", 0.2)) + 0.05
-                for anim in owner.pinch_menu_animation.values()) or
-            bool(getattr(owner, "custom_gesture_rings", {})) or
-            any(now < float((owner.gesture_timer_fade.get(side) or {}).get("started_at", 0)) + 0.4
-                for side in ("left", "right")) or
-            now < owner.click_flash_until or
-            bool(getattr(owner, "floating_clipboard_visible", False)) or
-            bool(getattr(owner, "_selection_drag", None))
-        )
-        if (signature != getattr(self, "_last_painted_hand_signature", None)
-                or animated or getattr(self, "_last_painted_hand_at", 0) == 0):
-            self._last_painted_hand_signature = signature
-            self._last_painted_hand_at = now
-            self.update()
-
-    def paintEvent(self, event):
-        """Paint one frame; the painter is always released, even if drawing fails.
-
-        If an exception escaped mid-frame, the QPainter stayed active on the window,
-        and every later repaint then failed ("Painter not active" / "one painter at
-        a time"), leaving stale frames stacked on screen. Re-entrant paints (possible
-        while native windows are being moved) are skipped for the same reason.
-        """
-        if getattr(self, "_in_paint_event", False):
-            return
-        self._in_paint_event = True
-        self._frame_painter = None
-        try:
-            self._paint_frame(event)
-        except Exception:
-            if not getattr(self, "_paint_error_reported", False):
-                self._paint_error_reported = True
-                import traceback
-                print("Spatial Desktop: a frame failed to paint (later failures are not repeated):")
-                traceback.print_exc()
-        finally:
-            painter = self._frame_painter
-            self._frame_painter = None
-            if painter is not None and painter.isActive():
-                painter.end()
-            self._in_paint_event = False
-
-    def _paint_frame(self, _event):
-        owner = self.owner
-        search_visible = bool(owner.search_dialog is not None and owner.search_dialog.isVisible())
-        if not (search_visible or getattr(self, "_global_hand_layer_active", False)):
-            return
-        # Native video windows can temporarily invalidate the transparent overlay surface
-        # while Windows is moving/resizing them. Skip that frame instead of issuing
-        # follow-on drawing calls against an inactive painter.
-        if not self.isVisible() or self.width() <= 0 or self.height() <= 0:
-            return
-        painter = QPainter()
-        self._frame_painter = painter
-        if not painter.begin(self):
-            return
-        painter.setRenderHint(QPainter.Antialiasing, True)
-        now = time.monotonic()
-        # The completion ring fades out while the Pinch Menu fades in/out. Paint the
-        # menu before the hands so the hand and TLI both appear on top of it.
-        for side in ("right", "left"):
-            owner._paint_gesture_timer_fade(painter, side, now)
-            owner._paint_pinch_menu(painter, side, now)
-        owner._paint_floating_clipboard(painter, now)
-        owner._paint_selected_item_drag(painter)
-        # This overlay is the sole hand-visual owner while Search is visible; the main
-        # window skips the identical layer to avoid double-painted ghost silhouettes.
-        for side in ("left", "right"):
-            points = owner.hand_positions.get(side, [])
-            if not points:
-                continue
-            color = QColor(owner.left_click_color if side == "left" else owner.right_click_color)
-            owner._paint_hand_skeleton(painter, points, side)
-            owner._paint_gesture_disabled_indicator(painter, points, side)
-            cursor = owner.side_cursor_positions.get(side)
-            peace_counting = (owner.peace_hold_started.get(side) is not None and
-                              not owner.peace_toggle_latched.get(side, False))
-            if cursor is None and peace_counting:
-                cursor = owner._scale_hand_tli_point(
-                    owner.interactive_hand_anchor(points, side), points, side)
-            if cursor is None:
-                continue
-            cursor = owner._visual_tli_position(side, cursor, points)
-            # TLI is drawn once, in the final loop below, so the Search overlay never
-            # stacks duplicate rings while a hold/pinch timer is active.
-            # Mirror only the Pinch Menu timer while Search covers the main overlay.
-            # Right-fist movement scrolls directly and intentionally has no fist timer ring.
-            started = owner.menu_pinch_started.get(side) if not owner.fist_action_menu_open.get(side) else None
-            mode = "pinch"
-            if owner.menu_pinch_release_candidate_since.get(side) is not None:
-                started = None
-            if started is not None:
-                elapsed = owner._menu_pinch_elapsed_seconds(side, now)
-                delay = owner.pinch_buffer_seconds
-                duration = owner.menu_pinch_hold_seconds
-                total_duration = delay + duration
-                # The confirmation buffer is deliberately unfilled; the ring advances
-                # only once the pinch buffer has elapsed.
-                progress = min(1.0, max(0.0, elapsed/max(0.01, duration)))
-                buffer_remaining = max(0.0, delay-(now-started))
-                remaining = buffer_remaining if buffer_remaining > 0.0 else max(0.0, duration-elapsed)
-                ring = QRectF(cursor.x()-41, cursor.y()-41, 82, 82)
-                painter.setBrush(Qt.NoBrush)
-                painter.setPen(QPen(QColor(color.red(), color.green(), color.blue(), 95), 3))
-                painter.drawEllipse(ring)
-                painter.setPen(QPen(QColor(color.red(), color.green(), color.blue(), 250), 4))
-                painter.drawArc(ring, 90*16, -int(progress*360*16))
-                painter.setPen(QColor(245, 251, 255, 245))
-                painter.setFont(QFont("Sans", 8, QFont.DemiBold))
-                painter.drawText(QRectF(cursor.x()-22, cursor.y()+23, 44, 16), Qt.AlignCenter,
-                                 f"{remaining:.1f}s")
-
-        # Keep the thumbs-up tracking-toggle countdown visible in this dedicated layer.
-        # The main window does not paint hands while this overlay owns the Windows hand
-        # layer, so its confirmation ring must be reproduced here alongside custom rings.
-        # For a hand whose tracking is currently disabled, use the same visual anchor
-        # fallback as the main window so the ring still teaches how to re-enable it.
-        for side in ("left", "right"):
-            thumbs_started = getattr(owner, "thumbs_up_hold_started", {}).get(side)
-            if (thumbs_started is None or
-                    getattr(owner, "thumbs_up_toggle_latched", {}).get(side, False)):
-                continue
-            points = owner.hand_positions.get(side, [])
-            cursor = owner.side_cursor_positions.get(side)
-            if cursor is None:
-                if not points:
-                    continue
-                cursor = owner._scale_hand_tli_point(
-                    owner.interactive_hand_anchor(points, side), points, side)
-            cursor = owner._visual_tli_position(side, cursor, points)
-            elapsed = max(0.0, now-thumbs_started)
-            duration = max(0.01, owner.gesture_tracking_toggle_hold_seconds)
-            progress = min(1.0, elapsed/duration)
-            remaining = max(0.0, duration-elapsed)
-            ring = QRectF(cursor.x()-38, cursor.y()-38, 76, 76)
-            painter.setBrush(Qt.NoBrush)
-            painter.setPen(QPen(QColor(105, 240, 255, 95), 3))
-            painter.drawEllipse(ring)
-            painter.setPen(QPen(QColor(105, 240, 255, 245), 4))
-            painter.drawArc(ring, 90*16, -int(progress*360*16))
-            painter.setPen(QColor(220, 255, 255, 245))
-            painter.setFont(owner._ui_font(8, QFont.DemiBold))
-            painter.drawText(QRectF(cursor.x()-24, cursor.y()+27, 48, 16), Qt.AlignCenter,
-                             f"{remaining:.1f}s")
-
-        # The main window suppresses its hand layer while this dedicated overlay owns
-        # rendering. Keep recorded custom-gesture countdown rings in this layer too;
-        # otherwise they disappear whenever the Windows overlay is active.
-        for key, (label, progress, remaining) in list(getattr(owner, "custom_gesture_rings", {}).items()):
-            if key == "overlap":
-                a = owner.side_cursor_positions.get("left")
-                b = owner.side_cursor_positions.get("right")
-                if a is None or b is None:
-                    continue
-                cursor = QPointF((a.x()+b.x())*0.5, (a.y()+b.y())*0.5)
-            else:
-                cursor = owner.side_cursor_positions.get(key)
-                if cursor is None:
-                    continue
-                cursor = owner._visual_tli_position(key, cursor, owner.hand_positions.get(key, []))
-            ring = QRectF(cursor.x()-41, cursor.y()-41, 82, 82)
-            painter.setBrush(Qt.NoBrush)
-            painter.setPen(QPen(QColor(110, 255, 170, 85), 3))
-            painter.drawEllipse(ring)
-            painter.setPen(QPen(QColor(110, 255, 170, 245), 4))
-            painter.drawArc(ring, 90*16, -int(progress*360*16))
-            painter.setPen(QColor(235, 255, 240, 245))
-            painter.setFont(owner._ui_font(8, QFont.DemiBold))
-            painter.drawText(QRectF(cursor.x()-50, cursor.y()-60, 100, 16), Qt.AlignCenter, label)
-            painter.drawText(QRectF(cursor.x()-22, cursor.y()+23, 44, 16), Qt.AlignCenter,
-                             f"{remaining:.1f}s")
-
-        # Repaint the TLI last so it remains visible over both launcher and menu buttons.
-        for side in ("right", "left"):
-            points = owner.hand_positions.get(side, [])
-            if not points:
-                continue
-            cursor = owner.side_cursor_positions.get(side)
-            if cursor is None:
-                continue
-            cursor = owner._visual_tli_position(side, cursor, points)
-            color = QColor(owner.left_click_color if side == "left" else owner.right_click_color)
-            if owner.fist_action_menu_open.get(side):
-                original = owner.fist_origin_points.get(side)
-                if original is not None:
-                    painter.setPen(QPen(QColor(color.red(), color.green(), color.blue(), 235), 2))
-                    painter.setBrush(Qt.NoBrush)
-                    painter.drawEllipse(original, 13, 13)
-                    painter.drawLine(QPointF(original.x()-6, original.y()), QPointF(original.x()+6, original.y()))
-                    painter.drawLine(QPointF(original.x(), original.y()-6), QPointF(original.x(), original.y()+6))
-                # The common bright TLI remains the single visible/interactive cursor.
-            engaged = side in owner.active_push_sides or (owner.click_side == side and now < owner.click_flash_until)
-            if not owner._scroll_cursor_suppressed(side):
-                owner._paint_tli(painter, cursor, side, engaged)
-        # Windows uses this layer in place of main-window hand rendering. Paint
-        # peace timers AFTER all cursors so an off hand still gets its circle.
-        for side in ("left", "right"):
-            owner._paint_peace_sign_timer(painter, side, now)
-        painter.end()
 
 
 class TliCalibrationWindow(QWidget):
@@ -4294,15 +4322,420 @@ class HandCalibrationWizard(QWidget):
         super().keyPressEvent(event)
 
 
-class VoiceReplySignals(QObject):
-    finished = Signal(str, str)
+
+
+class FreehandWhiteboard(QWidget):
+    """Independent, fullscreen, gesture-controlled drawing sheet.
+
+    Gesture contacts are forwarded from SpatialDesktop; actual mouse/tablet
+    presses are handled by this QWidget. The drawing is kept in a QImage, so
+    exporting never includes the floating palette or virtual hand cursors.
+    """
+
+    PALETTE = ("#152535", "#ffffff", "#ed4852", "#ffab3d", "#f3d75d",
+               "#48c987", "#45b6ff", "#8358e8", "#d86ed7")
+
+    def __init__(self, owner):
+        super().__init__(None)
+        self.owner = owner
+        flags = Qt.Tool | Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint
+        if sys.platform.startswith("linux"):
+            flags |= Qt.X11BypassWindowManagerHint
+        self.setWindowFlags(flags)
+        self.setAttribute(Qt.WA_OpaquePaintEvent, True)
+        self.setFocusPolicy(Qt.StrongFocus)
+        self.setMouseTracking(True)
+        self.setCursor(Qt.CrossCursor)
+        self.setWindowTitle("Freehand Whiteboard")
+        self.dark_mode = False
+        self.background = QColor("#ffffff")
+        self.pen_color = QColor("#152535")
+        self._auto_ink = True  # Default ink remains readable on either background.
+        self.pen_size = 5
+        self.eraser = False
+        # The image holds only transparent ink; whiteboard/blackboard colour is
+        # composited beneath it at paint/export time, never baked into erasures.
+        self._image = QImage()
+        self._stroke_segments = []  # Rebuild adaptive dark/light ink when toggled.
+        self._toolbar_position = None  # Floating palette can be dragged by its background.
+        self._mouse_stroke = None
+        self._mouse_button = None
+        self._hand_strokes = {"left": None, "right": None}
+        # A menu pinch may still be held on the frame that opens the board.
+        # Require a real release before drawing so the menu click leaves no dot.
+        self._hand_ready = {"left": False, "right": False}
+        self._file_dialog_open = False
+        self._hand_cursors = {}
+        self._last_reassert = 0.0
+        self._feedback = "Pinch and move to draw · Use the floating tools to change colour"
+        self.setGeometry(owner.geometry())
+        self._ensure_canvas()
+
+    def _ensure_canvas(self):
+        w, h = max(1, self.width()), max(1, self.height())
+        if not self._image.isNull() and self._image.width() == w and self._image.height() == h:
+            return
+        image = QImage(w, h, QImage.Format_ARGB32_Premultiplied)
+        image.fill(Qt.transparent)
+        if not self._image.isNull():
+            painter = QPainter(image)
+            painter.drawImage(0, 0, self._image)
+            painter.end()
+        self._image = image
+
+    def resizeEvent(self, event):
+        self._ensure_canvas()
+        super().resizeEvent(event)
+
+    def _toolbar(self):
+        # Dock the floating palette on the right, keeping the added mode toggle
+        # inside its hit region and reachable when the board is moved/resized.
+        width = min(270, max(190, self.width()-26))
+        height = 390
+        if self._toolbar_position is None:
+            x, y = self.width()-width-22, 20.0
+        else:
+            x, y = self._toolbar_position
+        x = min(max(12.0, x), max(12.0, self.width()-width-12.0))
+        y = min(max(12.0, y), max(12.0, self.height()-height-12.0))
+        return QRectF(x, y, width, height)
+
+    def _controls(self):
+        panel = self._toolbar()
+        left, top, w = panel.left(), panel.top(), panel.width()
+        pad = 15
+        diameter = min(37, (w-2*pad-4*12)/5)
+        colors = []
+        for idx, shade in enumerate(self.PALETTE):
+            column, line = idx%5, idx//5
+            x = left+pad+column*(diameter+12)
+            y = top+66+line*51
+            colors.append((f"color:{idx}", QRectF(x, y, diameter, diameter), shade))
+        buttons = {
+            "pen": QRectF(left+pad, top+181, (w-3*pad)/2, 37),
+            "eraser": QRectF(left+2*pad+(w-3*pad)/2, top+181, (w-3*pad)/2, 37),
+            "smaller": QRectF(left+pad, top+225, 41, 35),
+            "larger": QRectF(left+w-pad-41, top+225, 41, 35),
+            "save": QRectF(left+pad, top+271, (w-3*pad)/2, 42),
+            "clear": QRectF(left+2*pad+(w-3*pad)/2, top+271, (w-3*pad)/2, 42),
+            "dark_mode": QRectF(left+pad, top+327, w-2*pad, 42),
+            "close": QRectF(left+w-42, top+11, 30, 30),
+        }
+        return panel, colors, buttons
+
+    def _hit_control(self, point):
+        panel, colors, buttons = self._controls()
+        for name, rect in buttons.items():
+            if rect.contains(point):
+                return name
+        for name, rect, _ in colors:
+            if rect.contains(point):
+                return name
+        return "panel" if panel.contains(point) else None
+
+    def _apply_control(self, action):
+        if not action or action == "panel":
+            return
+        if action.startswith("color:"):
+            idx = int(action.partition(":")[2])
+            if 0 <= idx < len(self.PALETTE):
+                self.pen_color = QColor(self.PALETTE[idx])
+                self._auto_ink = idx == 0
+                if self._auto_ink and self.dark_mode:
+                    self.pen_color = QColor("#ffffff")
+                self.eraser = False
+                self._feedback = "Pen colour selected"
+        elif action == "pen":
+            self.eraser = False
+            self._feedback = "Pen selected"
+        elif action == "eraser":
+            self.eraser = True
+            self._feedback = "Eraser selected · pinch to erase"
+        elif action == "smaller":
+            self.pen_size = max(2, self.pen_size-2)
+            self._feedback = f"Brush size: {self.pen_size}px"
+        elif action == "larger":
+            self.pen_size = min(64, self.pen_size+2)
+            self._feedback = f"Brush size: {self.pen_size}px"
+        elif action == "clear":
+            self._image.fill(Qt.transparent)
+            self._stroke_segments.clear()
+            self._feedback = "Whiteboard cleared"
+        elif action == "dark_mode":
+            self.dark_mode = not self.dark_mode
+            self.background = QColor("#000000" if self.dark_mode else "#ffffff")
+            if self._auto_ink:
+                self.pen_color = QColor("#ffffff" if self.dark_mode else "#152535")
+            # Repaint recorded ink, including erasures, on the new background.
+            # Other palette colours remain exactly as the user selected them.
+            self._rebuild_canvas()
+            self._feedback = "Blackboard mode" if self.dark_mode else "Whiteboard mode"
+        elif action == "save":
+            self.save_png()
+        elif action == "close":
+            self.owner._close_whiteboard()
+        self.update()
+
+    def _paint_ink_segment(self, painter, previous, point, color, size, eraser, auto_ink):
+        if eraser:
+            # True transparent erasure: revealing the *current* board colour,
+            # not a permanent white stripe on a future blackboard.
+            painter.setCompositionMode(QPainter.CompositionMode_Clear)
+            ink = QColor("#ffffff")
+        else:
+            painter.setCompositionMode(QPainter.CompositionMode_SourceOver)
+            ink = QColor("#ffffff" if self.dark_mode else "#152535") if auto_ink else QColor(color)
+        width = max(2, size*3 if eraser else size)
+        painter.setPen(QPen(ink, float(width), Qt.SolidLine, Qt.RoundCap, Qt.RoundJoin))
+        painter.drawLine(previous, point)
+
+    def _rebuild_canvas(self):
+        self._ensure_canvas()
+        self._image.fill(Qt.transparent)
+        painter = QPainter(self._image)
+        painter.setRenderHint(QPainter.Antialiasing, True)
+        for previous, point, color, size, eraser, auto_ink in self._stroke_segments:
+            self._paint_ink_segment(painter, previous, point, color, size, eraser, auto_ink)
+        painter.end()
+        self.update()
+
+    def _draw_segment(self, previous, point):
+        self._ensure_canvas()
+        color = self.pen_color.name()
+        size = self.pen_size
+        eraser = self.eraser
+        auto_ink = self._auto_ink and not eraser
+        painter = QPainter(self._image)
+        painter.setRenderHint(QPainter.Antialiasing, True)
+        self._paint_ink_segment(painter, previous, point, color, size, eraser, auto_ink)
+        painter.end()
+        self._stroke_segments.append((QPointF(previous), QPointF(point), color,
+                                      size, eraser, auto_ink))
+        self.update()
+
+    def _export_image(self):
+        self._ensure_canvas()
+        output = QImage(self._image.size(), QImage.Format_ARGB32_Premultiplied)
+        output.fill(self.background)
+        painter = QPainter(output)
+        painter.drawImage(0, 0, self._image)
+        painter.end()
+        return output
+
+    def _start_at(self, point):
+        control = self._hit_control(point)
+        if control is None:
+            self._draw_segment(point, point)
+            return {"kind": "draw", "last": QPointF(point)}
+        if control == "panel":
+            return {"kind": "palette_drag", "last": QPointF(point)}
+        return {"kind": "control", "control": control}
+
+    def _move_stroke(self, stroke, point):
+        if stroke is None:
+            return
+        if stroke.get("kind") == "draw":
+            self._draw_segment(stroke["last"], point)
+            stroke["last"] = QPointF(point)
+        elif stroke.get("kind") == "palette_drag":
+            rect = self._toolbar()
+            dx = point.x()-stroke["last"].x()
+            dy = point.y()-stroke["last"].y()
+            self._toolbar_position = (rect.left()+dx, rect.top()+dy)
+            stroke["last"] = QPointF(point)
+            self.update()
+
+    def _finish_stroke(self, stroke, point):
+        if stroke is not None and stroke.get("kind") == "control":
+            if point is not None and self._hit_control(point) == stroke.get("control"):
+                self._apply_control(stroke["control"])
+
+    def handle_hand_frame(self, cursor_points, poses):
+        """Consume all gestures while visible; never forward touch to the OS."""
+        if not self.isVisible():
+            return
+        cursors = {}
+        for side in ("right", "left"):
+            point = cursor_points.get(side)
+            if point is not None:
+                global_pos = self.owner.mapToGlobal(QPoint(round(point.x()), round(point.y())))
+                local = self.mapFromGlobal(global_pos)
+                cursors[side] = QPointF(local)
+            held = bool(poses.get(side, {}).get("pinch", False)) and side in cursors
+            if not held:
+                self._hand_ready[side] = True
+            stroke = self._hand_strokes.get(side)
+            if self._file_dialog_open or not self._hand_ready[side]:
+                # Prevent the menu-opening pinch (or save-dialog click) from
+                # becoming a mark behind the floating colour selector.
+                continue
+            if held:
+                if stroke is None:
+                    self._hand_strokes[side] = self._start_at(cursors[side])
+                else:
+                    self._move_stroke(stroke, cursors[side])
+            elif stroke is not None:
+                self._hand_strokes[side] = None
+                self._finish_stroke(stroke, cursors.get(side))
+        self._hand_cursors = cursors
+        self.update()
+
+    def release_all_strokes(self):
+        self._hand_strokes = {"left": None, "right": None}
+        self._hand_ready = {"left": False, "right": False}
+        self._mouse_stroke = None
+        self._mouse_button = None
+        self._hand_cursors = {}
+
+    def save_png(self):
+        # Export ONLY the image layer, never the tools, hints or hand markers.
+        directory = Path.home() / "Pictures"
+        if not directory.is_dir():
+            directory = Path.home()
+        proposed = directory / f"Freehand-whiteboard-{datetime.now():%Y%m%d-%H%M%S}.png"
+        self._file_dialog_open = True
+        # Do not reassert the fullscreen board's Z-order above the Save dialog.
+        try:
+            chosen, _ = QFileDialog.getSaveFileName(self, "Save whiteboard as PNG", str(proposed),
+                                                     "PNG image (*.png)")
+        finally:
+            self._file_dialog_open = False
+        if not chosen:
+            self._feedback = "Save cancelled"
+            return False
+        if not chosen.lower().endswith(".png"):
+            chosen += ".png"
+        success = self._export_image().save(chosen, "PNG")
+        self._feedback = (f"Saved: {Path(chosen).name}" if success else
+                          "Unable to save PNG · check the destination")
+        self.update()
+        return bool(success)
+
+    def mousePressEvent(self, event):
+        if event.button() == Qt.LeftButton:
+            self._mouse_stroke = self._start_at(event.position())
+            self._mouse_button = Qt.LeftButton
+            event.accept()
+            return
+        super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event):
+        if self._mouse_stroke is not None and self._mouse_button == Qt.LeftButton:
+            self._move_stroke(self._mouse_stroke, event.position())
+            event.accept()
+            return
+        super().mouseMoveEvent(event)
+
+    def mouseReleaseEvent(self, event):
+        if event.button() == Qt.LeftButton and self._mouse_stroke is not None:
+            stroke = self._mouse_stroke
+            self._mouse_stroke = None
+            self._mouse_button = None
+            self._finish_stroke(stroke, event.position())
+            event.accept()
+            return
+        super().mouseReleaseEvent(event)
+
+    def keyPressEvent(self, event):
+        if event.key() == Qt.Key_Escape:
+            self.owner._close_whiteboard()
+            event.accept()
+        elif event.key() == Qt.Key_S and event.modifiers() & Qt.ControlModifier:
+            self.save_png()
+            event.accept()
+        else:
+            super().keyPressEvent(event)
+
+    def paintEvent(self, event):
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.Antialiasing, True)
+        painter.fillRect(self.rect(), self.background)
+        if not self._image.isNull():
+            painter.drawImage(QPointF(0, 0), self._image)
+        panel, colors, buttons = self._controls()
+        painter.setPen(QPen(QColor("#5fbfd6"), 1.5))
+        painter.setBrush(QBrush(QColor(9, 26, 42, 239)))
+        painter.drawRoundedRect(panel, 17, 17)
+        painter.setPen(QColor("#efffff"))
+        painter.setFont(QFont("Sans", 13, QFont.Bold))
+        painter.drawText(panel.adjusted(16, 10, -36, -panel.height()+50), Qt.AlignVCenter,
+                         "WHITEBOARD")
+        painter.setFont(QFont("Sans", 8))
+        painter.setPen(QColor("#a9d0dd"))
+        painter.drawText(QRectF(panel.x()+15, panel.y()+42, panel.width()-30, 20),
+                         Qt.AlignLeft | Qt.AlignVCenter, "PEN COLOURS")
+        for name, rect, shade in colors:
+            painter.setBrush(QBrush(QColor(shade)))
+            selected = (not self.eraser and
+                        ((self._auto_ink and name == "color:0") or
+                         (not self._auto_ink and QColor(shade) == self.pen_color)))
+            painter.setPen(QPen(QColor("#b9fbff") if selected else QColor("#557489"),
+                                3 if selected else 1.2))
+            painter.drawEllipse(rect)
+        for name, rect in buttons.items():
+            chosen = ((name == "eraser" and self.eraser) or
+                      (name == "pen" and not self.eraser) or
+                      (name == "dark_mode" and self.dark_mode))
+            if name == "close":
+                fill = QColor("#823340")
+            elif chosen:
+                fill = QColor("#206d83")
+            else:
+                fill = QColor("#1a3448")
+            painter.setBrush(QBrush(fill))
+            painter.setPen(QPen(QColor("#7edfe9") if chosen else QColor("#5b879b"), 1.2))
+            painter.drawRoundedRect(rect, 8, 8)
+            painter.setPen(QColor("#f5ffff"))
+            painter.setFont(QFont("Sans", 9, QFont.DemiBold))
+            label = {"pen": "PEN", "eraser": "ERASER", "smaller": "−",
+                     "larger": "+", "save": "SAVE PNG", "clear": "CLEAR",
+                     "dark_mode": "DARK MODE  ·  ON" if self.dark_mode else "DARK MODE  ·  OFF",
+                     "close": "×"}.get(name, name)
+            painter.drawText(rect, Qt.AlignCenter, label)
+        painter.setPen(QColor("#e1f5fb"))
+        painter.setFont(QFont("Sans", 10, QFont.Bold))
+        pen_text = f"{self.pen_size}px" + (" · eraser" if self.eraser else "")
+        painter.drawText(QRectF(panel.x()+60, panel.y()+225, panel.width()-120, 35),
+                         Qt.AlignCenter, pen_text)
+        # Render the same virtual hands as the normal desktop, inside the
+        # whiteboard's own window. Reusing the existing hand renderer preserves
+        # skeleton/flat/3D selection, transparency and tracking alignment.
+        # No additional topmost overlay competes with this window or Save PNG.
+        # Their appearance and TPI markers are NOT part of self._image, so PNG
+        # export remains clean.
+        owner = self.owner
+        if not owner.hand_tracking_paused:
+            origin = owner.mapToGlobal(QPoint(0, 0))
+            board_origin = self.mapToGlobal(QPoint(0, 0))
+            painter.save()
+            painter.translate(origin.x()-board_origin.x(),
+                              origin.y()-board_origin.y())
+            for side in ("left", "right"):
+                points = owner.hand_positions.get(side, [])
+                if points:
+                    owner._paint_hand_skeleton(painter, points, side)
+            painter.restore()
+        # Cursor indicators are drawn above the canvas, not included in exports.
+        for side, point in self._hand_cursors.items():
+            ink = QColor("#5091ff" if side == "right" else "#ff5555")
+            painter.setPen(QPen(ink, 2.2))
+            painter.setBrush(Qt.NoBrush)
+            painter.drawEllipse(point, 13, 13)
+            painter.drawLine(QPointF(point.x()-18, point.y()),
+                             QPointF(point.x()-9, point.y()))
+            painter.drawLine(QPointF(point.x()+9, point.y()),
+                             QPointF(point.x()+18, point.y()))
+        painter.setPen(QColor("#355566"))
+        painter.setFont(QFont("Sans", 10))
+        painter.drawText(QRectF(18, max(0, self.height()-38), max(100, self.width()-36), 29),
+                         Qt.AlignLeft | Qt.AlignVCenter, self._feedback)
+        painter.end()
 
 
 class SpatialDesktop(QWidget):
     def __init__(self):
         super().__init__()
-        self.voice_reply_signals = VoiceReplySignals(self)
-        self.voice_reply_signals.finished.connect(self._on_general_voice_answer)
+        self.whiteboard = None  # Created lazily, never consumes camera frames itself.
         self.setWindowTitle("Spatial Desktop")
         # Consistent tactile feedback for native buttons across settings and dialogs.
         self.setStyleSheet(self.styleSheet() + " QPushButton:pressed, QToolButton:pressed { background-color: rgba(75, 205, 235, 210); border: 2px solid #b9f5ff; padding-top: 2px; padding-left: 2px; }")
@@ -4371,14 +4804,6 @@ class SpatialDesktop(QWidget):
         self.custom_gesture_rings = {}
         self.custom_gesture_dropdown = None  # row index whose action list is open
         self.sound_dropdown_key = None
-        self.d1_model_dropdown_open = False
-        self._d1_server_log_cache_at = 0.0
-        self._d1_server_log_cache = []
-        # Log is anchored to its newest entry unless the user scrolls back.
-        # This is intentionally independent of the window/page scroll state.
-        self.d1_log_scroll_lines = 0
-        self._d1_log_visible_count = 1
-        self._d1_log_total_count = 0
         self.custom_gesture_key_capture = None  # gesture row awaiting a physical keyboard shortcut
         self._native_shortcut_capture = None
         self.custom_gesture_triggers = {"left": HoldTrigger(), "right": HoldTrigger(), "overlap": HoldTrigger()}
@@ -4400,36 +4825,6 @@ class SpatialDesktop(QWidget):
         self.swap_drag_scroll_notches = settings.get("swap_drag_scroll_notches", False)
         self.cursor_lock_priority = settings.get("cursor_lock_priority", "right")
         self.ui_preferences = load_ui_preferences()
-        self._d1_runtime_enabled = bool(self.ui_preferences.get("d1_autostart", False))
-        self._wake_word_armed_until = 0.0
-        self._wake_word_training_dialog = None
-        self._wake_word_name_editing = False
-        self._wake_word_training_started_speech = False
-        self._wake_word_save_timer = QTimer(self)
-        self._wake_word_save_timer.setSingleShot(True)
-        self._wake_word_save_timer.timeout.connect(self._save_wake_word_preferences)
-        # This editor is visually part of the Glass Menu, but has its own tiny
-        # native, frameless input surface. In OS mode the *main* fullscreen
-        # overlay deliberately passes mouse/keyboard input through to the desktop.
-        # An ordinary QLineEdit child cannot receive focus in that mode.
-        # Keeping the editor as a Qt.Tool window aligned exactly with the menu
-        # row makes it editable on Windows and Linux without making the whole
-        # Glass Menu block clicks to underlying applications.
-        self.wake_word_entry = QLineEdit(self)
-        self.wake_word_entry.setWindowFlags(
-            Qt.Tool | Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint)
-        self.wake_word_entry.setAttribute(Qt.WA_ShowWithoutActivating, True)
-        self.wake_word_entry.setFocusPolicy(Qt.StrongFocus)
-        self._wake_word_entry_last_raise = 0.0
-        self.wake_word_entry.setMaxLength(48)
-        self.wake_word_entry.setPlaceholderText('Empty = no wake word')
-        self.wake_word_entry.setText(self.ui_preferences.get('wake_word_name', ''))
-        self.wake_word_entry.setStyleSheet(
-            'QLineEdit {background-color: #09283a; color: #e8fdff; border: 2px solid #5cbed0; '
-            'border-radius: 8px; padding: 4px 12px; font-size: 13px;}'
-            'QLineEdit:focus {border: 2px solid #9af3de;}')
-        self.wake_word_entry.textEdited.connect(self._on_wake_word_name_edited)
-        self.wake_word_entry.hide()
         # This is the *next-launch* console state. Do not change the running
         # process when the user toggles the button in Interaction settings.
         self.debug_console_enabled = bool(self.ui_preferences.get("debug_console", False))
@@ -4440,6 +4835,10 @@ class SpatialDesktop(QWidget):
                     self.ui_preferences[sound_key] = default_file
             self.ui_preferences["sound_defaults_v1_applied"] = True
             save_ui_preferences(self.ui_preferences)
+        # Pre-open user-selected audio too; settings can choose custom files.
+        # Runs on the persistent audio worker, never on the Qt startup thread.
+        _freehand_prewarm_ui_sounds(self.ui_preferences.get(key, "None")
+                                     for key, _label in SOUND_SETTING_ROWS)
         self.ui_font_scale = float(self.ui_preferences.get("ui_font_scale", 1.2))
         self.show_gesture_disabled_indicator = bool(
             self.ui_preferences.get("show_gesture_disabled_indicator", True))
@@ -4566,8 +4965,6 @@ class SpatialDesktop(QWidget):
         self._garden_bird_last_spawn = 0.0
         self._garden_birds = []
         self._garden_prop_last_tick = time.monotonic()
-        self.d1_ui_log = ["Engine panel ready."]
-        self._last_d1_log_signature = None
         # Slider interaction intentionally moves at less than half the cursor speed for finer control.
         self.slider_drag_gain = 0.42
         self.left_click_color = QColor(settings["left_click_color"])
@@ -4591,42 +4988,20 @@ class SpatialDesktop(QWidget):
         self.right_click_mode_enabled = False
         self.scroll_mode_enabled = False
 
-        self.tracker = Tracker(capture_fps=self.hand_capture_fps)
-        self.speech_events = SpeechEvents()
-        self.speech_events.final.connect(self.on_speech)
-        self.speech_events.partial.connect(self.on_speech_partial)
-        self.speech_events.status.connect(self.on_voice_status)
-        self.speech = Speech(
-            self.speech_events.final.emit,
-            partial_callback=self.speech_events.partial.emit,
-            status_callback=self.speech_events.status.emit,
-        )
-        self.tts = KokoroTTS(status_callback=self.speech_events.status.emit, activity_callback=self.speech.set_paused)
-        self.face_enrollment_status = "Face welcome is opt-in"
-        self.face_events_status = self.speech_events.face_status
-        self.face_events_status.connect(self.on_face_status)
-        self.face_welcome = FaceWelcomeService(
-            frame_provider=self.tracker.snapshot_frame,
-            status_callback=self.speech_events.face_status.emit,
-            welcome_callback=self.tts.speak,
-        )
-        self.face_welcome.start()
-        self.last_external_foreground_hwnd = None
-        self.search_return_hwnd = None
-        self.last_external_window_id = None  # X11 window ID for Linux when xdotool is present
-        self.search_return_window_id = None
-        self.stt_enabled = False
-        # Voice input remains running while hand inference is paused, so speech can resume it.
+        # Reuse the tracker started while Python was still defining the main
+        # window class. Camera drivers and MediaPipe initialise concurrently
+        # with the remaining startup work instead of being queued behind it.
+        global _FREEHAND_EARLY_TRACKER
+        self.tracker = _FREEHAND_EARLY_TRACKER or Tracker(capture_fps=self.hand_capture_fps)
+        _FREEHAND_EARLY_TRACKER = None
+        self.tracker.set_capture_fps(self.hand_capture_fps)
+        # Freehand owns only the webcam / hand tracking; the new assistant
+        # handles D1, search, recognition, microphone and speech independently.
         self.hand_tracking_paused = False
-        self.speech_partial = ""
-        self.last_speech = ""
-        # Heard-bar feedback state: successful commands dismiss immediately; unknown
-        # commands get a brief red shake, then a clear message and timed dismissal.
-        self.heard_popup_mode = "transcript"
-        self.heard_popup_message = ""
-        self.heard_popup_generation = 0
-        self.heard_popup_shake_until = 0.0
-        self.search_dialog = None
+        self._previous_camera_yielded = False
+        self._camera_handover_dialog = None
+        self.last_external_foreground_hwnd = None
+        self.last_external_window_id = None
         # Native shell menus (especially the Windows taskbar context menu) must
         # keep the foreground and z-order until an actual user selection.
         self._native_context_menu_protect_until = 0.0
@@ -4644,16 +5019,6 @@ class SpatialDesktop(QWidget):
         self._task_view_hotkey_last_seen = 0.0
         self._task_view_native_mode = False
         self._task_view_native_position = None
-        # Focused-field dictation writes stable Vosk words into the currently focused OS field.
-        self.focus_dictation_enabled = False
-        self.focus_dictation_paused = False
-        self.focus_dictation_committed_words = []
-        self.focus_dictation_last_partial = ""
-        # Voice-driven selection modes: text selection uses a real held mouse button;
-        # image lasso copies a screen rectangle into the system clipboard as an image.
-        self.voice_selection_mode = None  # None | "text" | "image"
-        self.voice_lasso_start = None     # global screen QPointF
-        self.voice_selection_target = None
         # Floating clipboard history is populated from the real system clipboard. Entries
         # are kept in memory for this session and can be selected or dragged with a hand.
         self.floating_clipboard_visible = False
@@ -4669,7 +5034,7 @@ class SpatialDesktop(QWidget):
         self._clipboard_last_signature = None
         self._clipboard_last_signature_at = 0.0
         self._clipboard_capture_suppression_until = 0.0
-        self.status = f"Ready — offline Vosk STT · Kokoro TTS: {self.tts.status}"
+        self.status = "Freehand ready — hand tracking and gestures"
 
         saved_desktop_mode = self.ui_preferences.get("last_desktop_mode")
         self.desktop_mode = (saved_desktop_mode if saved_desktop_mode in ("os", "virtual")
@@ -4689,9 +5054,6 @@ class SpatialDesktop(QWidget):
         self.hub_visible = True
         self.settings_open = False
         self.settings_page = "interaction"
-        self.search_index = SearchIndex()
-        self.search_index.start()
-        self.search_settings_offset = 0
         # Gesture Map floats above the normal Glass Menu rather than replacing it
         # with a settings page. The previous position is restored on dismissal.
         self.gesture_map_overlay_visible = False
@@ -4952,15 +5314,9 @@ class SpatialDesktop(QWidget):
         self.settings_save_timer = QTimer(self)
         self.settings_save_timer.setSingleShot(True)
         self.settings_save_timer.timeout.connect(self.persist_gesture_settings)
-        self.tts_settings_save_timer = QTimer(self)
-        self.tts_settings_save_timer.setSingleShot(True)
-        self.tts_settings_save_timer.timeout.connect(self.tts.save_settings)
         self.virtual_desktop_save_timer = QTimer(self)
         self.virtual_desktop_save_timer.setSingleShot(True)
         self.virtual_desktop_save_timer.timeout.connect(self._save_virtual_desktop_data)
-        # A mouse-transparent topmost visual layer keeps the skeleton, TLI and gesture
-        # progress visible over the search launcher without blocking its controls.
-        self.search_hand_overlay = SearchHandOverlay(self)
         self._system_clipboard = QApplication.clipboard()
         try:
             self._system_clipboard.dataChanged.connect(self._capture_system_clipboard)
@@ -4985,10 +5341,6 @@ class SpatialDesktop(QWidget):
         self.custom_key_capture_poll_timer.setInterval(20)
         self.custom_key_capture_poll_timer.timeout.connect(self._poll_custom_key_capture)
         # Open with the existing glass menu; hand calibration stays available in Hands settings.
-        QTimer.singleShot(2400, self.speak_startup_greeting)
-        # Only a configured AND verified wake word keeps the microphone listening
-        # while normal STT is OFF. Without one, startup remains microphone-off.
-        QTimer.singleShot(400, self._refresh_wake_word_listener)
 
     def schedule_gesture_settings_save(self):
         self.settings_save_timer.start(450)
@@ -5042,16 +5394,6 @@ class SpatialDesktop(QWidget):
         scale = min(1.4, max(0.7, float(getattr(self, "ui_font_scale", 1.0))))
         return QFont("Sans", max(6, int(round(float(size) * scale))), weight)
 
-    def _log_d1_ui(self, message):
-        message = str(message).strip()
-        if not message:
-            return
-        if not hasattr(self, "d1_ui_log"):
-            self.d1_ui_log = []
-        stamp = time.strftime("%H:%M:%S")
-        self.d1_ui_log.append(f"{stamp}  {message}")
-        self.d1_ui_log = self.d1_ui_log[-1000:]
-        self.update()
 
     def _blur_glass_image(self, image, sigma=32.0):
         """Return a softly blurred, opaque RGB image for a localized frosted-glass panel."""
@@ -7939,119 +8281,9 @@ class SpatialDesktop(QWidget):
     SETTINGS_INFO_PAGE_HEIGHT = 500.0
 
     # ----- Freehand local Search & Indexing settings -------------------------
-    def _search_settings_visible_roots(self):
-        roots = self.search_index.get_scopes()
-        maximum = max(0, (len(roots)-1)//6*6)
-        self.search_settings_offset = min(maximum, max(0, self.search_settings_offset))
-        return roots[self.search_settings_offset:self.search_settings_offset+6]
 
-    def _search_settings_browse(self):
-        # Non-native Qt modal chooser keeps the dialog above the glass overlay,
-        # including Windows systems where native dialogs sometimes open behind it.
-        from PySide6.QtWidgets import QFileDialog
-        dialog = QFileDialog(self, "Add a folder to Freehand search", str(Path.home()))
-        dialog.setFileMode(QFileDialog.Directory)
-        dialog.setOption(QFileDialog.ShowDirsOnly, True)
-        dialog.setOption(QFileDialog.DontUseNativeDialog, True)
-        dialog.setWindowFlag(Qt.WindowStaysOnTopHint, True)
-        if dialog.exec() == QDialog.Accepted:
-            paths = dialog.selectedFiles()
-            if paths:
-                try:
-                    added = self.search_index.add_root(paths[0])
-                    self.search_settings_offset = max(0, (len(self.search_index.get_scopes())-1)//6*6)
-                    self.status = ("Added folder to search index: " if added else "Folder already indexed: ") + paths[0]
-                except (OSError, ValueError) as exc:
-                    self.status = "Cannot index folder: " + str(exc)
-        self.update()
 
-    def _search_settings_click(self, pressed):
-        if pressed("search_add"):
-            self._search_settings_browse()
-        elif pressed("search_auto"):
-            auto = not self.search_index.automatic()
-            self.search_index.set_automatic(auto)
-            self.status = "Automatic indexing " + ("enabled" if auto else "disabled")
-        elif pressed("search_rebuild"):
-            self.search_index.request_scan()
-            self.status = "File index refresh requested"
-        elif pressed("search_prev"):
-            self.search_settings_offset = max(0, self.search_settings_offset-6)
-        elif pressed("search_next"):
-            count = len(self.search_index.get_scopes())
-            self.search_settings_offset = min(max(0, (count-1)//6*6), self.search_settings_offset+6)
-        else:
-            visible = self._search_settings_visible_roots()
-            for i, root in enumerate(visible):
-                try:
-                    if pressed(f"search_toggle_{i}"):
-                        self.search_index.set_enabled(root["path"], not root["enabled"])
-                        self.status = "Updated indexed folder: " + root["path"]
-                        break
-                    if pressed(f"search_remove_{i}"):
-                        if os.path.normcase(root["path"]) == os.path.normcase(str(Path.home())):
-                            self.status = "Home can be switched off, but cannot be removed."
-                        else:
-                            self.search_index.remove_root(root["path"])
-                            self.status = "Removed indexed folder: " + root["path"]
-                        break
-                except (OSError, ValueError) as exc:
-                    self.status = "Index settings: " + str(exc)
-        self.update()
 
-    def _paint_search_settings_page(self, painter, controls, text_rects, scale):
-        def button(key, label, active=False, muted=False):
-            rect = controls[key]
-            fill = QColor(53, 139, 82, 230) if active else QColor(68, 76, 89, 210)
-            if muted:
-                fill = QColor(35, 51, 65, 155)
-            edge = QColor(153, 241, 181, 220) if active else QColor(155, 168, 182, 185)
-            painter.setBrush(QBrush(fill))
-            painter.setPen(QPen(edge, 1.5*scale))
-            painter.drawRoundedRect(rect, 9*scale, 9*scale)
-            painter.setPen(QColor(233, 249, 253) if not muted else QColor(142, 166, 177))
-            self._draw_fitted_button_label(painter, rect, label,
-                                           base_size=max(8, int(9*scale)), min_size=7, inset=7*scale)
-
-        button("search_add", "+ BROWSE / ADD FOLDER")
-        button("search_rebuild", "SCAN / REBUILD INDEX")
-        button("search_auto", "AUTO UPDATE  ·  " + ("ON" if self.search_index.automatic() else "OFF"),
-               active=self.search_index.automatic())
-        count = len(self.search_index.get_scopes())
-        button("search_prev", "◀ PREVIOUS", muted=self.search_settings_offset <= 0)
-        button("search_next", "NEXT ▶", muted=self.search_settings_offset+6 >= count)
-        painter.setPen(QColor(185, 226, 239))
-        painter.setFont(self._ui_font(8, QFont.DemiBold))
-        visible = self._search_settings_visible_roots()
-        for i in range(6):
-            key = f"search_row_{i}"
-            if i >= len(visible):
-                continue
-            root = visible[i]
-            directory = root["path"]
-            home = os.path.normcase(directory) == os.path.normcase(str(Path.home()))
-            rect = controls[key]
-            painter.setBrush(QBrush(QColor(8, 35, 53, 192)))
-            painter.setPen(QPen(QColor(109, 174, 193, 170), 1*scale))
-            painter.drawRoundedRect(rect, 9*scale, 9*scale)
-            painter.setFont(self._ui_font(8, QFont.Normal))
-            painter.setPen(QColor(229, 250, 253))
-            caption = ("HOME  ·  " if home else "FOLDER  ·  ") + directory
-            label = painter.fontMetrics().elidedText(caption, Qt.ElideMiddle, max(20, int(rect.width()-16*scale)))
-            painter.drawText(rect.adjusted(8*scale, 0, -8*scale, 0), Qt.AlignLeft | Qt.AlignVCenter, label)
-            button(f"search_toggle_{i}", "ON" if root["enabled"] else "OFF", active=root["enabled"])
-            button(f"search_remove_{i}", "DEFAULT" if home else "REMOVE", muted=home)
-        st = self.search_index.status()
-        summary = (f"{st['count']:,} indexed items  ·  "
-                   + (f"Scanning {st['scanned']:,}..." if st['scanning'] else "Ready")
-                   + f"  ·  {count} locations")
-        if st['error']:
-            summary += "  ·  " + st['error'][:70]
-        painter.setPen(QColor(189, 233, 239))
-        self._draw_wrapped_fitted_text(painter, text_rects["search_info"],
-                                       summary + "\nLocal only. Subfolders included. Home is indexed by default.",
-                                       base_size=max(8, int(9*scale)), min_size=7,
-                                       align=Qt.AlignLeft | Qt.AlignTop)
 
     def _settings_layout(self, page=None):
         """Logical layout of one Settings page (see the constants above)."""
@@ -8107,22 +8339,6 @@ class SpatialDesktop(QWidget):
                 stack("notify:" + key)
             texts["help"] = (L, y, W, 40.0)
             y += 40.0 + gap
-        elif page == "voice":
-            stack("tts_toggle")
-            stack("voice_cycle")
-            y += group
-            stack("test_voice")
-            stack("face_welcome")
-            y += group
-            stack("streamtts_config", h=42.0)
-            y += group
-            texts['wake_word_caption'] = (L, y, W, 21.0)
-            y += 23.0
-            stack('wake_word_field', h=40.0)
-            stack('wake_word_train', h=42.0)
-            stack('wake_word_listening_toggle', h=42.0)
-            texts["status"] = (L, y, W, 48.0)
-            y += 48.0 + gap
         elif page == "update":
             # The single UPDATE / INSTALL / RESTART button is centred in the panel.
             buttons["update_action"] = (-W*0.5, y, W, 46.0)
@@ -8132,50 +8348,12 @@ class SpatialDesktop(QWidget):
             y += 80.0
             texts["about"] = (L, y, 2*W+(R-(L+W)), 44.0)
             y += 44.0 + gap
-        elif page == "search":
-            # Full-width, paginated root list shared by painting and hit testing.
-            buttons["search_add"] = (L, 0.0, W, 40.0)
-            buttons["search_rebuild"] = (R, 0.0, W, 40.0)
-            buttons["search_auto"] = (L, 50.0, W, 40.0)
-            buttons["search_prev"] = (R, 50.0, 145.0, 40.0)
-            buttons["search_next"] = (R+155.0, 50.0, 145.0, 40.0)
-            for i in range(6):
-                row_y = 108.0+i*44.0
-                buttons[f"search_row_{i}"] = (L, row_y, 420.0, 37.0)
-                buttons[f"search_toggle_{i}"] = (L+428.0, row_y, 100.0, 37.0)
-                buttons[f"search_remove_{i}"] = (L+536.0, row_y, 104.0, 37.0)
-            texts["search_info"] = (L, 387.0, 640.0, 44.0)
-            y = 440.0
-            right_h = y
         elif page == "virtual":
             stack("virtual_scene_switch")
             stack("virtual_grid_toggle")
             stack("virtual_background_style")
             texts["help"] = (L, y, W, 58.0)
             y += 58.0 + gap
-        elif page == "d1":
-            # Controls and status on the left, a full-height log on the right.
-            # Keep the bottom of both columns clear of the common Back button.
-            stack("d1_model", h=44.0)
-            half = (W-gap)*0.5
-            buttons["d1_start"] = (L, y, half, 42.0)
-            buttons["d1_stop"] = (L+half+gap, y, half, 42.0)
-            y += 42.0 + gap
-            stack("d1_retry", h=42.0)
-            # Keep the engine page height unchanged: both functions share a row.
-            buttons["d1_autostart"] = (L, y, half, 36.0)
-            buttons["d1_export_log"] = (L+half+gap, y, half, 36.0)
-            y += 36.0+7.0
-            texts["state"] = (L, y+5.0, W, 59.0)
-            texts["about"] = (L, y+68.0, W, 77.0)
-            y += 150.0
-            # Keep the log level with the model selector and down near Back.
-            texts["log"] = (R, 0.0, W, 344.0)
-            right_h = 344.0
-            # The top-right scroll arrows are part of the ordinary menu hit map:
-            # they work with fingertip/pinch selection even on mouse-transparent HUDs.
-            buttons["d1_log_up"] = (R+W-62.0, 3.0, 25.0, 20.0)
-            buttons["d1_log_down"] = (R+W-32.0, 3.0, 25.0, 20.0)
         elif page == "gestures":
             y = 394.0  # see _custom_gesture_layout
         left_h = max(0.0, y - gap)
@@ -8202,7 +8380,7 @@ class SpatialDesktop(QWidget):
         if right_index:
             right_h = max(right_h, right_index*self.SETTINGS_SLIDER_PITCH - 12.0)
 
-        if page in ("gesture_map", "speech_commands"):
+        if page in ("gesture_map",):
             height = self.SETTINGS_INFO_PAGE_HEIGHT
             top = -height*0.5 + self.SETTINGS_INFO_CONTENT_TOP
         else:
@@ -8262,13 +8440,13 @@ class SpatialDesktop(QWidget):
         tab_height = 40.0*scale
         # Reserve more room for ENGINE and VIRTUAL without extending the strip
         # beyond the panel; labels have their own fitted text rectangles.
-        widths = [74.0, 49.0, 42.0, 53.0, 66.0, 46.0, 65.0, 48.0, 69.0, 62.0, 47.0]
+        widths = [93.0, 73.0, 64.0, 90.0, 91.0, 79.0, 91.0, 75.0]
         total = sum(widths)*scale + tab_gap*(len(widths)-1)
         left = cx-total*0.5
         _panel_width, panel_height = self._menu_panel_dimensions()
         y = cy-(panel_height*0.5-25.0)*scale
         # Keep UPDATE as the final tab at the far right of the strip.
-        names = ("interaction", "hands", "tli", "notifications", "gestures", "voice", "d1", "sounds", "virtual", "search", "update")
+        names = ("interaction", "hands", "tli", "notifications", "gestures", "sounds", "virtual", "update")
         rects = {}
         x = left
         for name, width in zip(names, widths):
@@ -8276,116 +8454,11 @@ class SpatialDesktop(QWidget):
             x += (width*scale) + tab_gap
         return rects
 
-    def _d1_model_dropdown_layout(self, cx, cy, scale):
-        """Model options in one popup, sharing the same rectangles for paint/hit test."""
-        model_rect = self._settings_control_rects(cx, cy, scale, page="d1")["d1_model"]
-        item_height = 40.0*scale
-        choices = list(D1_MODELS.items())
-        left = model_rect.left()
-        top = model_rect.bottom()+3.0*scale
-        items = [(key, spec, QRectF(left, top+i*item_height, model_rect.width(), item_height))
-                 for i, (key, spec) in enumerate(choices)]
-        return {"panel": QRectF(left, top, model_rect.width(), len(items)*item_height),
-                "items": items}
 
-    def _paint_d1_model_dropdown(self, painter, cx, cy, scale):
-        layout = self._d1_model_dropdown_layout(cx, cy, scale)
-        panel = layout["panel"]
-        painter.setBrush(QBrush(QColor(5, 22, 35, 249)))
-        painter.setPen(QPen(QColor(140, 235, 245, 238), 1.5*scale))
-        painter.drawRoundedRect(panel, 9*scale, 9*scale)
-        selected = selected_d1_model()
-        for key, spec, rect in layout["items"]:
-            painter.setBrush(QBrush(QColor(47, 132, 83, 238) if key == selected
-                                    else QColor(13, 51, 72, 245)))
-            painter.setPen(QPen(QColor(110, 208, 220, 128), 0.7*scale))
-            painter.drawRect(rect.adjusted(2*scale, 2*scale, -2*scale, -2*scale))
-            painter.setPen(QColor(238, 251, 255))
-            self._draw_fitted_button_label(painter, rect,
-                                           ("✓  " if key == selected else "    ") + spec["label"],
-                                           base_size=9, min_size=7, inset=9*scale)
 
-    def _d1_server_log_tail(self):
-        """Read a small bounded tail at most once per 1.5s, never during every repaint."""
-        now = time.monotonic()
-        if now-self._d1_server_log_cache_at < 1.5:
-            return self._d1_server_log_cache
-        self._d1_server_log_cache_at = now
-        path = ROOT / "logs" / "llama-server.log"
-        try:
-            with path.open("rb") as handle:
-                handle.seek(0, os.SEEK_END)
-                size = handle.tell()
-                start = max(0, size-131072)
-                handle.seek(start)
-                chunk = handle.read(131072).decode("utf-8", errors="replace")
-            if start > 0:
-                # The first line may be a truncated fragment from the seek.
-                chunk = chunk.partition("\n")[2]
-            lines = [line.rstrip()[:500] for line in chunk.splitlines() if line.strip()]
-            self._d1_server_log_cache = lines[-450:]
-        except OSError:
-            self._d1_server_log_cache = []
-        return self._d1_server_log_cache
 
-    def _d1_log_lines(self):
-        """One bounded UI-visible history; full server output is kept for export."""
-        return (list(self.d1_ui_log) +
-                ["──────── llama-server.log ────────"] +
-                (list(self._d1_server_log_tail()) or
-                 ["Server diagnostics appear here after startup."]))
 
-    def _scroll_d1_log(self, lines):
-        """Positive lines browse older entries; negative lines return to live."""
-        maximum = max(0, len(self._d1_log_lines()) - max(1, self._d1_log_visible_count))
-        self.d1_log_scroll_lines = max(0, min(maximum, self.d1_log_scroll_lines+int(lines)))
-        self.update()
 
-    def _export_d1_log(self):
-        """Export UI events and the complete server log without a modal OS dialog.
-
-        Native file dialogs can hide behind Freehand's topmost glass UI, so a
-        one-click export to the user's Downloads folder is more dependable.
-        """
-        folder = Path.home() / "Downloads"
-        if not folder.is_dir():
-            folder = Path.home() / "Documents"
-        if not folder.is_dir():
-            folder = Path.home()
-        stamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
-        destination = folder / f"Freehand_D1_Engine_{stamp}.log"
-        temporary = destination.with_suffix(".log.part")
-        server_log = ROOT / "logs" / "llama-server.log"
-        try:
-            info = d1_status()
-            with temporary.open("x", encoding="utf-8", errors="replace") as stream:
-                stream.write("Freehand D1 Engine Diagnostic Log\n")
-                stream.write("Exported: " + datetime.now().astimezone().isoformat(timespec="seconds") + "\n")
-                stream.write("Selected model: " + str(selected_d1_model()) + "\n")
-                stream.write("Backend: " + str(info.get("backend") or "unknown") + "\n")
-                stream.write("Ready: " + str(bool(info.get("ready"))) + "\n")
-                stream.write("Error: " + str(info.get("error") or "none") + "\n")
-                stream.write("\n--- Freehand Engine Events ---\n")
-                for line in self.d1_ui_log:
-                    stream.write(str(line) + "\n")
-                stream.write("\n--- Complete llama-server.log ---\n")
-                if server_log.is_file():
-                    with server_log.open("r", encoding="utf-8", errors="replace") as source:
-                        shutil.copyfileobj(source, stream, length=64*1024)
-                else:
-                    stream.write("Server log has not been created.\n")
-            os.replace(temporary, destination)
-        except (OSError, ValueError) as exc:
-            try:
-                temporary.unlink(missing_ok=True)
-            except OSError:
-                pass
-            self.status = f"Could not export D1 Engine log: {exc}"
-            self._log_d1_ui(self.status)
-            return False
-        self.status = f"Engine log exported: {destination}"
-        self._log_d1_ui(self.status)
-        return True
 
     def _sound_dropdown_layout(self, cx, cy, scale):
         # Persistent list in the right column, rather than a popup over the rows.
@@ -8468,44 +8541,8 @@ class SpatialDesktop(QWidget):
         self.status = f"{key.replace('_', ' ').title()}: {self.ui_preferences[key]}"
         self.update()
 
-    def _toggle_context_menu_from_voice(self):
-        """Voice-accessible toggle for the hand-anchored Pinch Menu."""
-        opened = [side for side in ("right", "left") if self.fist_action_menu_open.get(side)]
-        if opened:
-            for side in opened:
-                self._set_pinch_menu_open(side, False)
-                self.pin_menu_ready_for_selection[side] = False
-                self.fist_hovered_action[side] = None
-            self.gesture_owner = None
-            self.status = "Pinch Menu closed by voice command"
-            self.update()
-            return
-        side = "right" if self.side_cursor_positions.get("right") is not None else ("left" if self.side_cursor_positions.get("left") is not None else "right")
-        anchor = self.side_cursor_positions.get(side)
-        if anchor is None:
-            global_pos = QCursor.pos()
-            mapped = self.mapFromGlobal(global_pos)
-            anchor = QPointF(mapped.x(), mapped.y())
-        anchor = QPointF(min(max(10, anchor.x()), self.width()-10), min(max(10, anchor.y()), self.height()-10))
-        self._set_pinch_menu_open(side, True)
-        # Voice-opened context menus also require a neutral/open hand before a new
-        # grab or pinch may select anything, preventing the command's existing pose
-        # from immediately activating the hovered item.
-        self.action_stop_wait_open[side] = True
-        self.action_stop_open_since[side] = None
-        self.fist_origin_points[side] = QPointF(anchor)
-        self.fist_arm_points[side] = QPointF(anchor)
-        self.fist_hovered_action[side] = None
-        self.pin_menu_ready_for_selection[side] = True
-        self.pin_menu_selection_started_at[side] = None
-        self.pin_menu_selection_kind[side] = None
-        self.pin_menu_selection_option[side] = None
-        self.canvas_active_side = side
-        self.gesture_owner = side
-        self.status = "Pinch Menu opened by voice — hover an option and grab or pinch to select"
-        self.update()
 
-    def _toggle_glass_menu_from_voice(self):
+    def _toggle_glass_menu_from_gesture(self):
         visible = not (self.menu_open and self.hub_visible)
         self._set_menu_open(visible, reset_settings=not visible)
         self.status = "Glass menu " + ("shown" if visible else "hidden")
@@ -8613,7 +8650,7 @@ class SpatialDesktop(QWidget):
                 self._cancel_custom_gesture_key_capture("Shortcut capture cancelled because the menu closed.")
             else:
                 self._stop_native_custom_key_capture()
-            search_dialog = getattr(self, "search_dialog", None)
+            search_dialog = None
             if search_dialog is not None and search_dialog.isVisible():
                 search_dialog.close()
             # Keep the outgoing settings page painted until the fade reaches 0.
@@ -8839,6 +8876,59 @@ class SpatialDesktop(QWidget):
         return max(0.0, min(1.0, (now-self.settings_page_transition_started) /
                             max(0.01, self.settings_page_transition_duration)))
 
+    def _main_menu_whiteboard_rect(self, cx, cy, scale):
+        """The central whiteboard tile spans the full glass-button width."""
+        return QRectF(cx-166*scale, cy-36.5*scale, 332*scale, 51*scale)
+
+    def _main_menu_action_tiles(self, cx, cy, scale):
+        """Two evenly spaced, full-width pairs shared by render and click logic."""
+        width, height = 158.0*scale, 84.0*scale
+        left_x, right_x = cx-166.0*scale, cx+8.0*scale
+        top_y, bottom_y = cy-143.0*scale, cy+37.0*scale
+        return (
+            ("desktop", QRectF(left_x, top_y, width, height),
+             "OS DESKTOP" if self.desktop_mode == "virtual" else "VIRTUAL DESKTOP", "▣"),
+            ("gesture_map", QRectF(right_x, top_y, width, height), "GESTURE MAP", "✋"),
+            ("clipboard", QRectF(left_x, bottom_y, width, height), "CLIPBOARD", "▤"),
+            ("settings", QRectF(right_x, bottom_y, width, height), "SETTINGS", "⚙"),
+        )
+
+    def _open_whiteboard(self):
+        """Pause ordinary desktop input and show a separate fullscreen sheet."""
+        if self.whiteboard is not None and self.whiteboard.isVisible():
+            self.whiteboard.raise_()
+            return
+        self._end_two_hand_touch()
+        for side in ("left", "right"):
+            self._end_pinch_drag(side, status=False)
+            self._reset_fist_gesture(side)
+            self._clear_menu_pinch_sequence(side)
+            self.active_action[side] = None
+        self._set_menu_open(False, reset_settings=True)
+        if self.whiteboard is None:
+            self.whiteboard = FreehandWhiteboard(self)
+        self.whiteboard.setGeometry(self.geometry())
+        self.whiteboard.release_all_strokes()
+        self.whiteboard.show()
+        self.whiteboard.raise_()
+        self.whiteboard.activateWindow()
+        self.status = "Whiteboard open · pinch-drag to draw · Save PNG from the palette"
+        self.update()
+
+    def _close_whiteboard(self):
+        board = self.whiteboard
+        if board is None or not board.isVisible():
+            return
+        board.release_all_strokes()
+        board.hide()
+        self._end_two_hand_touch()
+        for side in ("left", "right"):
+            self._clear_menu_pinch_sequence(side)
+            self.action_stop_wait_open[side] = True
+            self.action_stop_open_since[side] = None
+        self.status = "Whiteboard closed"
+        self.update()
+
     def _menu_panel_dimensions(self, page=None):
         """Return logical menu size for a settings page, before display scaling."""
         if not self.settings_open:
@@ -8988,8 +9078,6 @@ class SpatialDesktop(QWidget):
     def _settings_slider_rows(self, page=None):
         """Slider values, ranges and labels per page, in top-to-bottom order."""
         page = self.settings_page if page is None else page
-        if page == "voice":
-            return [("tts_speed", float(self.tts.settings["speed"]), 0.7, 1.5, "SPEECH SPEED")]
         if page == "interaction":
             return [
                 ("sensitivity", self.hand_tracking_sensitivity, 0.5, 1.5, "DRAG/SCROLL SENSITIVITY"),
@@ -9950,95 +10038,21 @@ class SpatialDesktop(QWidget):
         return False
 
     def _action_menu_item_names(self):
-        return ("right_click", "clipboard_toggle", "glass_menu", "dictation_toggle", "stt_toggle")
+        return ("right_click", "clipboard_toggle", "glass_menu")
 
     def _action_menu_labels(self):
-        search_dictation = bool(self.search_dialog is not None and self.search_dialog.isVisible()
-                                and self.search_dialog.dictation_enabled)
-        dictation_on = self.focus_dictation_enabled or search_dictation
         return {
-            # These two top-row controls are icon-only by design.
             "right_click": "",
             "clipboard_toggle": "",
-            "glass_menu": ("GLASS MENU  ·  HIDE" if self.menu_open and self.hub_visible else "GLASS MENU  ·  SHOW"),
-            "dictation_toggle": "DICTATE  ·  " + ("ON" if dictation_on else "OFF"),
-            "stt_toggle": "STT  ·  " + ("ON" if self.stt_enabled else "OFF"),
+            "glass_menu": ("GLASS MENU  ·  HIDE" if self.menu_open and self.hub_visible
+                           else "GLASS MENU  ·  SHOW"),
         }
 
-    def _announce_voice_input_state(self, enabled):
-        """Use the same spoken state confirmation for all voice-input toggles."""
-        self.tts.speak("Voice input is " + ("on." if enabled else "off."))
 
-    def _toggle_focused_dictation_from_menu(self):
-        dialog = self.search_dialog
-        if dialog is not None and dialog.isVisible():
-            enabled = not dialog.dictation_enabled
-            dialog.set_dictation_enabled(enabled, notify=True)
-            self.status = "Search dictation " + ("enabled" if dialog.dictation_enabled else "disabled")
-        elif self.focus_dictation_enabled:
-            self.end_focused_dictation("")
-        else:
-            self.begin_focused_dictation()
-        dialog = self.search_dialog
-        dictation_active = bool(self.speech.running and (
-            self.focus_dictation_enabled or
-            (dialog is not None and dialog.isVisible() and dialog.dictation_enabled)))
-        self._announce_voice_input_state(dictation_active)
 
-    def _has_trained_wake_word(self):
-        """Wake-only listening is opt-in: both a name and three successful checks."""
-        return bool(self.ui_preferences.get('wake_word_trained', False) and
-                    normalise_wake_word_name(self.ui_preferences.get('wake_word_name', '')))
 
-    def _refresh_wake_word_listener(self):
-        """Keep Vosk alive for the wake name, but leave ordinary STT disabled.
 
-        This uses the existing offline recogniser: 'STT OFF' refers to command
-        processing, not microphone capture, while a trained wake word is set.
-        Never stop a stream currently needed by dictation or the trainer.
-        """
-        if (self.stt_enabled or self._wake_word_training_dialog is not None or
-                self.focus_dictation_enabled or
-                (self.search_dialog is not None and self.search_dialog.isVisible() and
-                 self.search_dialog.dictation_enabled)):
-            return
-        if (self.ui_preferences.get('wake_word_listening', False) and
-                self._has_trained_wake_word()):
-            if not self.speech.running and self.speech.start():
-                self.status = 'Voice input off — waiting for the wake word'
-        elif self.speech.running:
-            self.speech.stop()
-        # When only the wake listener is on, normal UI indicators remain OFF.
 
-    def _set_voice_input_enabled(self, enabled):
-        """Toggle full command recognition independently of wake-only standby."""
-        if enabled:
-            self.stt_enabled = bool(self.speech.start())
-            if self.stt_enabled:
-                self._wake_word_armed_until = 0.0
-            return self.stt_enabled
-        dialog = self.search_dialog
-        if dialog is not None and dialog.isVisible() and dialog.dictation_enabled:
-            dialog.set_dictation_enabled(False, notify=True)
-        self.focus_dictation_enabled = False
-        self.focus_dictation_paused = False
-        self.focus_dictation_committed_words = []
-        self.focus_dictation_last_partial = ''
-        self.stt_enabled = False
-        self._wake_word_armed_until = 0.0
-        self._refresh_wake_word_listener()
-        return False
-
-    def _toggle_stt_from_menu(self):
-        was_enabled = self.stt_enabled
-        self._set_voice_input_enabled(not was_enabled)
-        self.status = ('Vosk speech recognition enabled' if self.stt_enabled else
-                       'Voice input off — waiting for the wake word' if (
-                           self.ui_preferences.get('wake_word_listening', False) and
-                           self._has_trained_wake_word()) else
-                       'Vosk speech recognition stopped' if was_enabled else
-                       'Vosk speech recognition could not start')
-        self._announce_voice_input_state(self.stt_enabled)
 
     def _action_menu_geometry(self, side):
         """Return panel and option rectangles for the thumb/index Pinch Menu."""
@@ -10054,9 +10068,9 @@ class SpatialDesktop(QWidget):
         gap = 14.0*scale
         pad = 20.0*scale
         menu_items = self._action_menu_item_names()
-        # Compact, titleless Pinch Menu: primary actions full width, voice controls half-width.
+        # Compact hand-only menu: two top buttons and a full-width glass toggle.
         header_h = 0.0
-        panel_h = pad + 9.0*scale + item_h*3 + 2*gap + pad
+        panel_h = pad + 9.0*scale + item_h*2 + gap + pad
         if anchor.x() + panel_w + 34*scale <= self.width()-8:
             x = anchor.x() + 34*scale
         else:
@@ -10069,13 +10083,10 @@ class SpatialDesktop(QWidget):
         top = y+pad+9.0*scale
         half_w = (item_w-gap)/2
         items = {
-            # Right-click and Clipboard share the top row; their width exactly matches
-            # the Dictate and STT buttons, preserving the existing compact menu rhythm.
+            # Right-click and Clipboard share the top row.
             "right_click": QRectF(item_x, top, half_w, item_h),
             "clipboard_toggle": QRectF(item_x+half_w+gap, top, half_w, item_h),
             "glass_menu": QRectF(item_x, top+item_h+gap, item_w, item_h),
-            "dictation_toggle": QRectF(item_x, top+2*(item_h+gap), half_w, item_h),
-            "stt_toggle": QRectF(item_x+half_w+gap, top+2*(item_h+gap), half_w, item_h),
         }
         return panel, items
 
@@ -10798,10 +10809,6 @@ class SpatialDesktop(QWidget):
             self.scroll_mode_enabled = False
             self._set_menu_open(not (self.menu_open and self.hub_visible), now, reset_settings=True)
             self.status = "Glass menu " + ("shown" if self.menu_open and self.hub_visible else "hidden")
-        elif action == "dictation_toggle":
-            self._toggle_focused_dictation_from_menu()
-        elif action == "stt_toggle":
-            self._toggle_stt_from_menu()
         elif action == "clipboard_toggle":
             self._set_floating_clipboard_visible(not self.floating_clipboard_visible)
             if self.floating_clipboard_visible and clipboard_menu_anchor is not None:
@@ -10882,32 +10889,27 @@ class SpatialDesktop(QWidget):
             "virtual_grid_spacing": ("virtual_grid_spacing", 1.0),
             "virtual_grid_thickness": ("virtual_grid_thickness", 0.05),
         }
-        if name == "tts_speed":
-            if abs(value-float(self.tts.settings["speed"])) > 0.015:
-                self.tts.update_settings(speed=value, persist=False)
-                self.tts_settings_save_timer.start(450)
-        else:
-            attr, threshold = attributes[name]
-            old_value = float(getattr(self, attr))
-            if abs(value-old_value) >= threshold:
-                setattr(self, attr, int(value) if name in ("hand_display_fps", "hand_capture_fps") else value)
-                if name == "hand_capture_fps":
-                    self.tracker.set_capture_fps(int(value))
-                if name == "default_gesture_hold_seconds":
-                    self.menu_pinch_hold_seconds = value
-                    self.peace_toggle_hold_seconds = value
-                    self.gesture_tracking_toggle_hold_seconds = value
-                if name == "ui_font_scale":
-                    self.ui_preferences["ui_font_scale"] = value
-                    save_ui_preferences(self.ui_preferences)
-                    self.update()
-                elif name.startswith("virtual_grid_"):
-                    self._schedule_virtual_desktop_save()
-                    self._glass_virtual_backdrop = None
-                    self._glass_virtual_backdrop_size = None
-                    self.update()
-                else:
-                    self.schedule_gesture_settings_save()
+        attr, threshold = attributes[name]
+        old_value = float(getattr(self, attr))
+        if abs(value-old_value) >= threshold:
+            setattr(self, attr, int(value) if name in ("hand_display_fps", "hand_capture_fps") else value)
+            if name == "hand_capture_fps":
+                self.tracker.set_capture_fps(int(value))
+            if name == "default_gesture_hold_seconds":
+                self.menu_pinch_hold_seconds = value
+                self.peace_toggle_hold_seconds = value
+                self.gesture_tracking_toggle_hold_seconds = value
+            if name == "ui_font_scale":
+                self.ui_preferences["ui_font_scale"] = value
+                save_ui_preferences(self.ui_preferences)
+                self.update()
+            elif name.startswith("virtual_grid_"):
+                self._schedule_virtual_desktop_save()
+                self._glass_virtual_backdrop = None
+                self._glass_virtual_backdrop_size = None
+                self.update()
+            else:
+                self.schedule_gesture_settings_save()
         if name == "hand_display_fps":
             ratio = (snap_hand_display_fps(value)-minimum)/max(1.0, maximum-minimum)
         elif name == "hand_capture_fps":
@@ -10952,15 +10954,21 @@ class SpatialDesktop(QWidget):
             self._garden_toggle_sundial(now)
             return
         self.click_side = side
-        play_ui_sound(self.ui_preferences.get("sound_pinch", "None"))
-        if self._canvas_menu_panel_contains(point):
-            play_ui_sound(self.ui_preferences.get("sound_glass_buttons", "None"))
         self.click_flash_until = now+0.24
         self.last_active = now
         cx, cy = self.hub_pos.x()*self.width(), self.hub_pos.y()*self.height()
         scale = self.menu_ui_scale()
+        in_glass_panel = self._canvas_menu_panel_contains(point)
+        if in_glass_panel:
+            # The close tile plays the glass-toggle sound in _set_menu_open().
+            # For other menu controls, play ONLY the button clip: playing the
+            # pinch MP3 first made the real button sound seem late/overlapped.
+            if self.settings_open or not self._main_menu_close_rect(cx, cy, scale).contains(point):
+                play_ui_sound(self.ui_preferences.get("sound_glass_buttons", "None"))
+        else:
+            play_ui_sound(self.ui_preferences.get("sound_pinch", "None"))
 
-        if self._canvas_menu_panel_contains(point):
+        if in_glass_panel:
             self._glass_pressed_point = QPointF(point)
             self._glass_pressed_at = now
             self.update()
@@ -10975,46 +10983,25 @@ class SpatialDesktop(QWidget):
                     self.status = "Exiting Freehand: Spatial Computing"
                     self.close()
                     return
-                tiles = [
-                    (QRectF(cx-166*scale, cy-145*scale, 100*scale, 88*scale), "desktop"),
-                    (QRectF(cx-50*scale, cy-145*scale, 100*scale, 88*scale), "gesture_map"),
-                    (QRectF(cx+66*scale, cy-145*scale, 100*scale, 88*scale), "speech_commands"),
-                    (QRectF(cx-166*scale, cy+35*scale, 100*scale, 88*scale), "voice"),
-                    (QRectF(cx-50*scale, cy+35*scale, 100*scale, 88*scale), "settings"),
-                    (QRectF(cx+66*scale, cy+35*scale, 100*scale, 88*scale), "search"),
-                ]
-                action = next((name for rect, name in tiles if rect.contains(point)), None)
+                if self._main_menu_whiteboard_rect(cx, cy, scale).contains(point):
+                    self._open_whiteboard()
+                    return
+                action = next((name for name, rect, _, _ in
+                               self._main_menu_action_tiles(cx, cy, scale)
+                               if rect.contains(point)), None)
                 if action is not None and action != "gesture_map":
                     self._hide_gesture_map_overlay()
                 if action == "desktop":
                     self.desktop_mode = "os" if self.desktop_mode == "virtual" else "virtual"
                     self.apply_desktop_mode()
                     self.status = "OS desktop input" if self.desktop_mode == "os" else "Virtual desktop"
-                elif action == "voice":
-                    was_enabled = self.stt_enabled
-                    self._set_voice_input_enabled(not was_enabled)
-                    if self.stt_enabled:
-                        self.status = "Voice input on — listening locally with Vosk"
-                    elif was_enabled:
-                        self.status = ("Voice input off — waiting for the wake word"
-                                       if self._has_trained_wake_word() else "Voice input off")
-                    else:
-                        self.status = "Voice input could not start"
-                    self._announce_voice_input_state(self.stt_enabled)
+                elif action == "gesture_map":
+                    self._show_gesture_map_overlay()
+                elif action == "clipboard":
+                    self._set_floating_clipboard_visible(not self.floating_clipboard_visible)
                 elif action == "settings":
                     self.settings_open = True
                     self.settings_page = "interaction"
-                    self._begin_menu_transition(now)
-                elif action == "search":
-                    self.open_search_bar(from_voice=False)
-                elif action == "gesture_map":
-                    if self.gesture_map_overlay_visible:
-                        self._hide_gesture_map_overlay()
-                    else:
-                        self._show_gesture_map_overlay()
-                elif action == "speech_commands":
-                    self.settings_open = True
-                    self.settings_page = "speech_commands"
                     self._begin_menu_transition(now)
                 return  # every press in the glass panel is consumed, even blank space
 
@@ -11030,33 +11017,10 @@ class SpatialDesktop(QWidget):
                         self.sound_dropdown_key = key
                         self.ui_preferences[key] = value
                         save_ui_preferences(self.ui_preferences)
+                        _freehand_prewarm_ui_sounds((value,))
                         self.status = f"{key.replace('sound_', '').replace('_', ' ').title()} sound: {value}"
                         self.update()
                         return
-
-            if self.settings_page == "d1" and self.d1_model_dropdown_open:
-                # Clicking the selector again closes it rather than reopening it.
-                if self._settings_control_rects(cx, cy, scale, page="d1")["d1_model"].contains(point):
-                    self.d1_model_dropdown_open = False
-                    self.update()
-                    return
-                popup = self._d1_model_dropdown_layout(cx, cy, scale)
-                for key, spec, rect in popup["items"]:
-                    if rect.contains(point):
-                        self.d1_model_dropdown_open = False
-                        if key != selected_d1_model():
-                            ready = select_d1_model(key)
-                            self.status = (f"Selected {spec['label']}" if ready else
-                                           f"Downloading {spec['estimated']} model; see Engine log.")
-                            self._log_d1_ui("Selected " + spec["label"] +
-                                            (" (available)" if ready else " (download requested)"))
-                        else:
-                            self.status = "Model already selected: " + spec["label"]
-                        self._last_d1_log_signature = None
-                        self.update()
-                        return
-                # Clicks outside the list dismiss it; other buttons remain clickable.
-                self.d1_model_dropdown_open = False
 
             # Back and the three Settings sub-pages share a stable navigation row.
             if self._settings_back_rect(cx, cy, scale).contains(point):
@@ -11064,7 +11028,7 @@ class SpatialDesktop(QWidget):
                 self.settings_page = "interaction"
                 self._begin_menu_transition(now)
                 return
-            if self.settings_page not in ("gesture_map", "speech_commands"):
+            if self.settings_page not in ("gesture_map",):
                 for page_name, tab_rect in self._settings_tab_rects(cx, cy, scale).items():
                     if tab_rect.contains(point):
                         # Keep the settings panel continuously visible while navigating.
@@ -11225,50 +11189,6 @@ class SpatialDesktop(QWidget):
                         break
                 return
 
-            if self.settings_page == "voice":
-                if pressed('wake_word_field'):
-                    # Edit the actual field in the Glass Menu; never open a
-                    # keyboard-input dialog behind the transparent overlay.
-                    self._focus_wake_word_entry()
-                elif pressed('wake_word_train'):
-                    self._open_wake_word_training()
-                elif pressed('wake_word_listening_toggle'):
-                    enabled = not bool(self.ui_preferences.get('wake_word_listening', False))
-                    self.ui_preferences['wake_word_listening'] = enabled
-                    self._wake_word_armed_until = 0.0
-                    save_ui_preferences(self.ui_preferences)
-                    self._refresh_wake_word_listener()
-                    self.status = ('Wake-word listening enabled' if enabled else
-                                   'Wake-word listening disabled — standby microphone off')
-                    self.update()
-                elif pressed("tts_toggle"):
-                    self.tts.set_enabled(not self.tts.enabled)
-                    self.status = "Local TTS " + ("enabled" if self.tts.enabled else "disabled")
-                elif pressed("voice_cycle"):
-                    current = self.tts.settings.get("voice", "bf_emma")
-                    try:
-                        next_index = (TTS_VOICE_OPTIONS.index(current)+1) % len(TTS_VOICE_OPTIONS)
-                    except ValueError:
-                        next_index = 0
-                    self.tts.set_voice(TTS_VOICE_OPTIONS[next_index])
-                    self.status = f"TTS voice set to {TTS_VOICE_OPTIONS[next_index]}"
-                elif pressed("test_voice"):
-                    if not self.tts.speak("Hello. This is a test of your selected local voice."):
-                        self.status = f"TTS is not ready: {self.tts.status}"
-                elif pressed("face_welcome"):
-                    self.manage_face_welcome()
-                elif pressed("streamtts_config"):
-                    config_gui = Path(__file__).resolve().parent / "streamtts_config.py"
-                    if config_gui.is_file():
-                        try:
-                            subprocess.Popen([sys.executable, str(config_gui)], cwd=str(config_gui.parent))
-                            self.status = "Opened StreamTTS configuration."
-                        except Exception as exc:
-                            self.status = f"Could not open StreamTTS configuration: {exc}"
-                    else:
-                        self.status = "StreamTTS configuration tool is missing."
-                return
-
             if self.settings_page == "update":
                 if pressed("update_action") and not self.update_action_running and not self.update_check_running:
                     if self.update_installed:
@@ -11279,41 +11199,6 @@ class SpatialDesktop(QWidget):
                         self._start_update_check()
                 return
 
-            if self.settings_page == "search":
-                self._search_settings_click(pressed)
-                return
-            if self.settings_page == "d1":
-                if pressed("d1_log_up"):
-                    self._scroll_d1_log(6)
-                elif pressed("d1_log_down"):
-                    self._scroll_d1_log(-6)
-                elif pressed("d1_export_log"):
-                    self._export_d1_log()
-                elif pressed("d1_autostart"):
-                    wanted = not bool(self.ui_preferences.get("d1_autostart", False))
-                    self.ui_preferences["d1_autostart"] = wanted
-                    save_ui_preferences(self.ui_preferences)
-                    self.status = "D1 autostart " + ("enabled" if wanted else "disabled") + " for next launch"
-                    self._log_d1_ui(self.status)
-                elif pressed("d1_model"):
-                    self.d1_model_dropdown_open = not self.d1_model_dropdown_open
-                    self.update()
-                elif pressed("d1_start"):
-                    self._d1_runtime_enabled = True
-                    start_d1_server()
-                    self.status = "Starting local d1 runtime."
-                    self._log_d1_ui("Start / ensure running requested")
-                elif pressed("d1_stop"):
-                    self._d1_runtime_enabled = False
-                    stop_d1_server()
-                    self.status = "Local d1 runtime stopped."
-                    self._log_d1_ui("Stop local server requested")
-                elif pressed("d1_retry"):
-                    self._d1_runtime_enabled = True
-                    start_d1_loading()
-                    self.status = "Checking d1 model and runtime; download/start requested."
-                    self._log_d1_ui("Download / retry / start requested")
-                return
             return
 
         # Virtual desktop app controls remain interactive without forwarding clicks to OS apps.
@@ -12079,107 +11964,8 @@ class SpatialDesktop(QWidget):
         self.fist_shake_samples[side] = []
         self.fist_hold_ready_notified[side] = False
 
-    def on_face_status(self, text: str):
-        self.face_enrollment_status = str(text)[:160]
-        self.status = self.face_enrollment_status
-        self.update()
 
-    def manage_face_welcome(self):
-        """Explicitly enroll, replace, or remove the local face welcome profile."""
-        # Native OS dialogs can otherwise be covered by the always-on-top 3D overlay.
-        if self.desktop_mode != "os":
-            self.desktop_mode = "os"
-            self.apply_desktop_mode()
-        # Hide the glass controls before native dialogs appear, then give the OS dialog focus.
-        self._set_menu_open(False, reset_settings=True)
-        existing = self.face_welcome.profile_name()
-        if existing:
-            box = QMessageBox(self)
-            box.setWindowTitle("Face Welcome")
-            box.setWindowFlags(box.windowFlags() | Qt.WindowStaysOnTopHint)
-            box.setIcon(QMessageBox.Question)
-            box.setText(f"Local face welcome is enrolled for {existing}.")
-            box.setInformativeText("Choose Re-enrol to replace the local face template, Remove to delete it, or Cancel.")
-            reenroll = box.addButton("Re-enrol", QMessageBox.AcceptRole)
-            remove = box.addButton("Remove profile", QMessageBox.DestructiveRole)
-            box.addButton(QMessageBox.Cancel)
-            box.raise_()
-            box.activateWindow()
-            box.exec()
-            clicked = box.clickedButton()
-            if clicked is remove:
-                confirmation_box = QMessageBox(self)
-                confirmation_box.setWindowTitle("Remove Face Welcome")
-                confirmation_box.setWindowFlags(confirmation_box.windowFlags() | Qt.WindowStaysOnTopHint)
-                confirmation_box.setIcon(QMessageBox.Warning)
-                confirmation_box.setText("Delete the saved face embedding and disable welcome-back recognition? No photos are stored.")
-                confirmation_box.setStandardButtons(QMessageBox.Yes | QMessageBox.No)
-                confirmation_box.setDefaultButton(QMessageBox.No)
-                confirmation_box.raise_()
-                confirmation_box.activateWindow()
-                confirmation = confirmation_box.exec()
-                if confirmation == QMessageBox.Yes:
-                    self.face_welcome.remove_profile()
-                    self.face_enrollment_status = "Face welcome profile removed"
-                    self.update()
-                return
-            if clicked is not reenroll:
-                return
 
-        consent_box = QMessageBox(self)
-        consent_box.setWindowTitle("Enable Local Face Welcome")
-        consent_box.setWindowFlags(consent_box.windowFlags() | Qt.WindowStaysOnTopHint)
-        consent_box.setIcon(QMessageBox.Question)
-        consent_box.setText(
-            "Spatial Desktop will process camera frames locally to recognise the enrolled user after a long absence. "
-            "It stores a numeric face embedding and display name in your local .spatial_desktop folder; it does not save face photos or send images to a server. "
-            "This is a convenience feature, not secure authentication. Continue?"
-        )
-        consent_box.setStandardButtons(QMessageBox.Yes | QMessageBox.No)
-        consent_box.setDefaultButton(QMessageBox.No)
-        consent_box.raise_()
-        consent_box.activateWindow()
-        consent = consent_box.exec()
-        # Previous QMessageBox.question call replaced by explicit frontmost dialog.
-        if consent != QMessageBox.Yes:
-            return
-        name_dialog = QInputDialog(self)
-        name_dialog.setWindowTitle("Enroll Face")
-        name_dialog.setLabelText("Name to speak when you return:")
-        name_dialog.setWindowFlags(name_dialog.windowFlags() | Qt.WindowStaysOnTopHint)
-        name_dialog.raise_()
-        name_dialog.activateWindow()
-        accepted = name_dialog.exec() == QInputDialog.Accepted
-        username = name_dialog.textValue()
-        if not accepted or not username.strip():
-            return
-        if self.face_welcome.begin_enrollment(username.strip()):
-            # No modal follow-up dialog: the face worker downloads/prepares models
-            # in the background and reports progress in Settings without blocking
-            # the camera or closing the application.
-            self.face_enrollment_status = "Preparing face recognition automatically…"
-            self.status = self.face_enrollment_status
-            self.update()
-
-    def speak_startup_greeting(self):
-        """Speak a local time-of-day greeting, using the enrolled name when available."""
-        if getattr(self, "hand_calibration_active", False):
-            return
-        if not self.tts.ready:
-            return
-        hour = datetime.now().hour
-        if 5 <= hour < 12:
-            greeting = "Good morning"
-        elif 12 <= hour < 17:
-            greeting = "Good afternoon"
-        elif 17 <= hour < 22:
-            greeting = "Good evening"
-        else:
-            greeting = "Good night"
-        name = self.face_welcome.profile_name()
-        if not name:
-            name = " ".join(getpass.getuser().replace("_", " ").replace(".", " ").split()).title() or "there"
-        self.tts.speak(f"{greeting}, {name}.")
 
     def _remember_external_foreground_window(self, force=False):
         """Remember the last focused non-Spatial-Desktop window on the current OS."""
@@ -12219,451 +12005,31 @@ class SpatialDesktop(QWidget):
             except Exception:
                 pass
 
-    def close_focused_window(self):
-        """Close the last focused external native window, never Spatial Desktop itself."""
-        if sys.platform.startswith("win"):
-            try:
-                user32 = ctypes.windll.user32
-                candidates = []
-                if self.search_dialog is not None and self.search_dialog.isVisible() and self.search_return_hwnd:
-                    candidates.append(self.search_return_hwnd)
-                foreground = user32.GetForegroundWindow()
-                if foreground:
-                    pid = wintypes.DWORD(0)
-                    user32.GetWindowThreadProcessId(wintypes.HWND(foreground), ctypes.byref(pid))
-                    if pid.value != os.getpid():
-                        candidates.insert(0, int(foreground))
-                candidates.append(self.last_external_foreground_hwnd)
-                target = None
-                for candidate in candidates:
-                    if candidate and user32.IsWindow(wintypes.HWND(int(candidate))):
-                        pid = wintypes.DWORD(0)
-                        user32.GetWindowThreadProcessId(wintypes.HWND(int(candidate)), ctypes.byref(pid))
-                        if pid.value != os.getpid():
-                            target = int(candidate)
-                            break
-                if target is None:
-                    self.status = "No external focused window could be identified to close."
-                    self.tts.speak("I couldn't identify an open window to close.")
-                    return False
-                user32.PostMessageW(wintypes.HWND(target), 0x0010, 0, 0)  # WM_CLOSE
-                self.status = "Close requested for the focused window"
-                self.tts.speak("Closing the active window.")
-                self.last_external_foreground_hwnd = None
-                return True
-            except Exception as exc:
-                self.status = f"Could not close focused window: {exc}"
-                return False
 
-        if sys.platform.startswith("linux"):
-            candidates = []
-            if self.search_dialog is not None and self.search_dialog.isVisible() and self.search_return_window_id:
-                candidates.append(self.search_return_window_id)
-            try:
-                active = subprocess.check_output(["xdotool", "getactivewindow"], text=True,
-                                                 stderr=subprocess.DEVNULL, timeout=0.5).strip()
-                pid_text = subprocess.check_output(["xdotool", "getwindowpid", active], text=True,
-                                                   stderr=subprocess.DEVNULL, timeout=0.5).strip()
-                if active and int(pid_text) != os.getpid():
-                    candidates.insert(0, active)
-            except Exception:
-                pass
-            candidates.append(self.last_external_window_id)
-            for target in candidates:
-                if not target:
-                    continue
-                try:
-                    pid_text = subprocess.check_output(["xdotool", "getwindowpid", str(target)], text=True,
-                                                       stderr=subprocess.DEVNULL, timeout=0.5).strip()
-                    if int(pid_text) == os.getpid():
-                        continue
-                    subprocess.run(["xdotool", "windowclose", str(target)], check=True, timeout=2,
-                                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-                    self.status = "Close requested for the focused window"
-                    self.tts.speak("Closing the active window.")
-                    self.last_external_window_id = None
-                    return True
-                except Exception:
-                    continue
 
-        # Avoid Alt+F4/Cmd+W fallbacks here: if the native target can't be identified,
-        # those shortcuts could close Spatial Desktop or this search dialog instead.
-        self.status = "Could not safely identify an external focused window on this platform."
-        self.tts.speak("I couldn't safely identify an external window to close.")
-        return False
 
-    def open_user_folder(self):
-        """Open the current user's home directory in the native file manager."""
-        home = str(Path.home())
-        try:
-            if sys.platform.startswith("win"):
-                os.startfile(home)  # type: ignore[attr-defined]
-            elif sys.platform == "darwin":
-                subprocess.Popen(["open", home])
-            else:
-                subprocess.Popen(["xdg-open", home])
-            self.status = "Opened your user folder"
-            self.tts.speak("Opening your user folder.")
-            return True
-        except Exception as exc:
-            self.status = f"Could not open user folder: {exc}"
-            self.tts.speak("I couldn't open your user folder.")
-            return False
 
-    def open_search_bar(self, from_voice=False):
-        """Open one titleless local file launcher; repeated glass-menu activations reuse it."""
-        if self.search_dialog is not None and self.search_dialog.isVisible():
-            dialog = self.search_dialog
-            dialog.raise_()
-            dialog.activateWindow()
-            if from_voice:
-                dialog.set_dictation_enabled(True)
-            return
-        if self.search_dialog is None:
-            self.search_dialog = SearchLauncherDialog(parent=self)
-            self.search_dialog.dictation_toggled.connect(self.on_search_dictation_toggled)
-            self.search_dialog.closed.connect(self.on_search_dialog_closed)
-            self.search_dialog.speak_requested.connect(self.speak_search_result)
-        dialog = self.search_dialog
-        if not dialog.isVisible():
-            self._remember_external_foreground_window(force=True)
-            self.search_return_hwnd = self.last_external_foreground_hwnd
-            self.search_return_window_id = self.last_external_window_id
-        dialog.show()
-        dialog.raise_()
-        dialog.activateWindow()
-        # The launcher is topmost, but the click-through overlay must remain above it
-        # so the user can still see the tracked skeleton, TLI, hold ring and Pinch Menu.
-        # Reassert z-order after activation; this does not activate/focus the overlay.
-        if getattr(self, "search_hand_overlay", None) is not None:
-            self.search_hand_overlay.sync_to_launcher()
-            QTimer.singleShot(60, self.search_hand_overlay.sync_to_launcher)
-        if from_voice:
-            # The phrase that opened search proves the Vosk worker is active; keep
-            # streaming partials into the query field for the next utterance.
-            dialog.set_dictation_enabled(True)
-            if not self.speech.running:
-                self.on_search_dictation_toggled(True)
-            self.status = "Search open — live Vosk dictation"
-        else:
-            dialog.set_dictation_enabled(False)
-            self.status = "Local search open — Ctrl+Space to toggle"
 
-    def on_search_dictation_toggled(self, enabled):
-        if enabled:
-            if not self.speech.running:
-                ok = self.speech.start()
-                self.stt_enabled = bool(ok)
-                if not ok:
-                    if self.search_dialog is not None:
-                        self.search_dialog.set_dictation_enabled(False)
-                    return
-            else:
-                self.stt_enabled = True
-            self.status = "Search dictation on — words stream into the search box"
-        else:
-            self.status = "Search dictation off"
-
-    def on_search_dialog_closed(self):
-        # Global voice commands may remain enabled after closing the launcher.
-        self.status = "Search closed"
-
-    def speak_search_result(self, text):
-        if not self.tts.speak(text):
-            self.status = "Local TTS is not ready — run install_voice_models.py after installing requirements-voice.txt"
 
     @staticmethod
-    def _normalised_dictation_words(text):
-        return re.findall(r"[a-z0-9']+", (text or "").lower())
 
     @staticmethod
-    def _format_dictation_numbers(text):
-        """Convert spoken standalone number words one through nine to digits."""
-        number_words = {
-            "one": "1", "two": "2", "three": "3", "four": "4",
-            "five": "5", "six": "6", "seven": "7", "eight": "8", "nine": "9",
-        }
-        return re.sub(r"\b(one|two|three|four|five|six|seven|eight|nine)\b",
-                      lambda match: number_words[match.group(0).lower()],
-                      str(text or ""), flags=re.IGNORECASE)
 
     @staticmethod
-    def _strip_end_dictation_phrase(text):
-        """Keep content before a terminal 'end dictation' voice-control phrase."""
-        value = (text or "").strip()
-        match = re.search(r"(?i)(?:^|\s)(?:end|and)\s+dictation\s*[.!?]*$", value)
-        if match:
-            return value[:match.start()].strip(), True
-        return value, False
 
-    def _partial_may_be_voice_command(self, text):
-        words = " ".join(self._normalised_dictation_words(text))
-        if not words:
-            return True
-        phrases = [alias for aliases in aliases_for_help().values() for alias in aliases]
-        phrases.extend(("begin dictation", "end dictation", "and dictation", "stop dictation", "pause dictation", "resume dictation", "pause tracking", "resume tracking",
-                        "enable freehand", "disable freehand", "enable free hand", "disable free hand",
-                        "enable freehand gestures", "disable freehand gestures", "enable free hand gestures", "disable free hand gestures",
-                        "turn on freehand", "turn off freehand", "turn on free hand", "turn off free hand",
-                        "turn freehand on", "turn freehand off", "turn free hand on", "turn free hand off",
-                        "show menu", "show context", "search bar", "close window", "open user folder",
-                        "stop listening", "stop dictation", "open top result"))
-        normalized_phrases = [" ".join(self._normalised_dictation_words(phrase)) for phrase in phrases]
-        # Hold exact commands and partial command prefixes until Vosk has enough context
-        # to decide whether the user is speaking a command or dictating those words.
-        return any(phrase.startswith(words) for phrase in normalized_phrases if phrase)
 
-    def _type_focus_text(self, text):
-        if not text or pyautogui is None:
-            return False
-        try:
-            pyautogui.write(self._format_dictation_numbers(str(text)), interval=0, _pause=False)
-            return True
-        except Exception as exc:
-            self.status = f"Dictation typing failed: {exc}"
-            return False
 
-    def begin_focused_dictation(self):
-        """Dictate into the current focused application field, or the launcher when open."""
-        dialog = self.search_dialog
-        if dialog is not None and dialog.isVisible():
-            dialog.set_dictation_enabled(True)
-            if not self.speech.running:
-                self.on_search_dictation_toggled(True)
-            else:
-                self.stt_enabled = True
-            self.focus_dictation_enabled = False
-            self.status = "Dictation started in the search field"
-            return
-        if not self.speech.running:
-            if not self.speech.start():
-                self.stt_enabled = False
-                self.status = "Cannot begin dictation because local Vosk input is unavailable"
-                return
-        self.stt_enabled = True
-        self.focus_dictation_enabled = True
-        self.focus_dictation_paused = False
-        self.focus_dictation_committed_words = []
-        self.focus_dictation_last_partial = ""
-        self.status = "Dictation active in the focused text field — say 'end dictation' to finish"
 
-    def end_focused_dictation(self, final_text=""):
-        """Commit the final stable words and stop focused-field dictation."""
-        content, _ending = self._strip_end_dictation_phrase(final_text)
-        words = self._normalised_dictation_words(content)
-        committed = list(self.focus_dictation_committed_words)
-        if words[:len(committed)] == committed:
-            remainder = words[len(committed):]
-            if remainder:
-                self._type_focus_text(" ".join(remainder) + " ")
-        elif words and not committed:
-            self._type_focus_text(" ".join(words) + " ")
-        self.focus_dictation_enabled = False
-        self.focus_dictation_paused = False
-        self.focus_dictation_committed_words = []
-        self.focus_dictation_last_partial = ""
-        self.status = "Dictation ended"
 
-    def _stream_focused_dictation_partial(self, text):
-        if not self.focus_dictation_enabled or self.focus_dictation_paused or not text:
-            return
-        content, ending = self._strip_end_dictation_phrase(text)
-        words = self._normalised_dictation_words(content)
-        # Keep the trailing word mutable; Vosk commonly revises it as more audio arrives.
-        stable = words if ending else words[:-1]
-        if self._partial_may_be_voice_command(text):
-            return
-        committed = self.focus_dictation_committed_words
-        if stable[:len(committed)] != committed:
-            # A recognizer correction to already typed stable words is rare; do not risk
-            # backspacing through user text or a changed focus target to repair it.
-            return
-        new_words = stable[len(committed):]
-        if new_words and self._type_focus_text(" ".join(new_words) + " "):
-            committed.extend(new_words)
-        self.focus_dictation_last_partial = text
 
-    def _save_wake_word_preferences(self):
-        save_ui_preferences(self.ui_preferences)
 
-    def _on_wake_word_name_edited(self, value):
-        name = normalise_wake_word_name(value)
-        old_name = self.ui_preferences.get('wake_word_name', '')
-        if name != old_name:
-            # A new name is unverified; leave ordinary commands intact until
-            # three correctly recognised utterances confirm the replacement.
-            self.ui_preferences['wake_word_name'] = name
-            self.ui_preferences['wake_word_trained'] = False
-            self._wake_word_armed_until = 0.0
-            self._wake_word_save_timer.start(450)
-            self._refresh_wake_word_listener()
-            self.status = ('Wake-word name saved — train it to activate.' if name else
-                           'Wake word disabled — all ordinary voice commands work.')
-            self.update()
 
-    def _focus_wake_word_entry(self):
-        """Focus the in-menu field after a physical or hand-driven click."""
-        self._sync_wake_word_entry()
-        entry = self.wake_word_entry
-        if not entry.isVisible():
-            return
-        entry.raise_()
-        entry.activateWindow()
-        entry.setFocus(Qt.MouseFocusReason)
 
-    def _sync_wake_word_entry(self):
-        """Dock the live keyboard editor inside the painted Glass Menu field.
 
-        The Glass Menu's OS-mode overlay is input-transparent. This single
-        frameless QLineEdit is an independent focusable window, positioned over
-        the matching painted row, not a separate popup or dialog.
-        """
-        entry = getattr(self, 'wake_word_entry', None)
-        if entry is None:
-            return
-        show = bool(self.menu_open and self.hub_visible and self.settings_open and
-                    self.settings_page == 'voice' and
-                    self.settings_page_pending is None and
-                    (not self.settings_page_transition_started or
-                     self._settings_page_transition_progress() >= 0.94) and
-                    not (self._wake_word_training_dialog and
-                         self._wake_word_training_dialog.isVisible()) and
-                    self.width() > 0 and self.height() > 0)
-        if show:
-            box = self._settings_control_rects(page='voice').get('wake_word_field')
-            if box is None:
-                show = False
-            else:
-                local_rect = box.adjusted(2, 1, -2, -1).toRect()
-                # Native Qt.Tool geometry uses desktop coordinates, unlike a
-                # child widget. mapToGlobal also supports screens whose origin
-                # is not (0, 0), e.g. multi-monitor Windows or Linux desktops.
-                screen_rect = QRect(self.mapToGlobal(local_rect.topLeft()), local_rect.size())
-                if entry.geometry() != screen_rect:
-                    entry.setGeometry(screen_rect)
-        if entry.isVisible() != show:
-            entry.setVisible(show)
-            if show:
-                entry.raise_()
-                self._wake_word_entry_last_raise = time.monotonic()
-        elif show:
-            # The main desktop overlay reasserts its topmost order periodically.
-            # Keep the focusable field above it, without repeatedly activating
-            # the editor or stealing keyboard focus from elsewhere.
-            now = time.monotonic()
-            if now - self._wake_word_entry_last_raise >= 0.5:
-                entry.raise_()
-                self._wake_word_entry_last_raise = now
 
-    def _open_wake_word_training(self):
-        if self._wake_word_training_dialog is not None:
-            self._wake_word_training_dialog.raise_()
-            return
-        name = normalise_wake_word_name(self.wake_word_entry.text())
-        if not name:
-            self.status = 'Enter a wake-word name before training (empty disables it).'
-            self.wake_word_entry.setFocus(Qt.OtherFocusReason)
-            return
-        if name != self.ui_preferences.get('wake_word_name'):
-            self._on_wake_word_name_edited(name)
-        self._save_wake_word_preferences()
-        dialog = WakeWordTrainingDialog(name, self)
-        self._wake_word_training_dialog = dialog
-        self._wake_word_training_started_speech = False
-        # Hide the docked editor before showing the *training* dialog so the
-        # microphone checklist is never occluded by a separately raised field.
-        self._sync_wake_word_entry()
-        dialog.finished.connect(self._finish_wake_word_training)
-        dialog.show()
-        dialog.raise_()
-        dialog.activateWindow()
-        if not self.speech.running:
-            if self.speech.start():
-                self._wake_word_training_started_speech = True
-                dialog.feedback.setText('Microphone ready. Say the name clearly (1 of 3).')
-            else:
-                dialog.feedback.setText('Microphone/Vosk unavailable. Check input, or Cancel.')
-        else:
-            dialog.feedback.setText('Listening. Say the name clearly (1 of 3).')
 
-    def _finish_wake_word_training(self, _result):
-        dialog = self._wake_word_training_dialog
-        if dialog is None:
-            return
-        trained = dialog.successes == 3 and (dialog.name == self.ui_preferences.get('wake_word_name', ''))
-        if trained:
-            self.ui_preferences['wake_word_trained'] = True
-            self._save_wake_word_preferences()
-            self.status = f'Wake word “{dialog.name}” verified — standby enabled.'
-        else:
-            self.status = ('Wake-word training cancelled — ordinary commands remain available.'
-                           if not self.ui_preferences.get('wake_word_trained') else
-                           'Wake-word training closed; existing setting preserved.')
-        self._wake_word_training_started_speech = False
-        self._wake_word_training_dialog = None
-        if not self.stt_enabled:
-            # Keep the stream alive after successful training as a wake-only
-            # listener; stop it on cancellation if the name is not verified.
-            self._refresh_wake_word_listener()
-        dialog.deleteLater()
-        self._sync_wake_word_entry()
-        self.update()
 
-    def _wake_word_gate(self, transcript):
-        """Return command text, '' for activation only, or None if not addressed."""
-        name = self.ui_preferences.get('wake_word_name', '')
-        if not name or not self.ui_preferences.get('wake_word_trained', False):
-            return transcript
-        matched, remainder = wake_word_command(transcript, name)
-        if matched:
-            if not remainder:
-                self._wake_word_armed_until = time.monotonic() + 8.0
-                self.status = f'Wake word “{name}” heard — speak a command.'
-                return ''
-            self._wake_word_armed_until = 0.0
-            return remainder
-        if time.monotonic() < self._wake_word_armed_until:
-            self._wake_word_armed_until = 0.0
-            return transcript
-        return None
 
-    def on_speech_partial(self, text):
-        if self._wake_word_training_dialog is not None:
-            if text.strip():
-                self._wake_word_training_dialog.feedback.setText(
-                    f'Listening: “{text}” — say only the wake word.')
-            return
-        if not self.stt_enabled:
-            # The recogniser is only waiting for the trained name. Don't expose
-            # background speech in the Heard bar or feed either dictation path.
-            return
-        self.speech_partial = text
-        # A new phrase should immediately replace any previous unrecognised-command
-        # feedback, even before the next final recognition arrives.
-        if text and text.strip() and self.heard_popup_mode == "unrecognised":
-            self._clear_heard_popup()
-        dialog = self.search_dialog
-        if text and dialog is not None and dialog.isVisible() and dialog.dictation_enabled:
-            # Don't write the stop phrase into the text field when it is spoken.
-            content, ending = self._strip_end_dictation_phrase(text)
-            if content.lower() == "end" or content.lower().endswith(" end"):
-                content = content[:-4].strip() if content.lower().endswith(" end") else ""
-            # A terminal stop phrase must not erase a previously entered search query.
-            if content or not (ending or (text or "").strip().lower() in ("end", "end dictation")):
-                dialog.set_dictation_text(self._format_dictation_numbers(content))
-        elif self.focus_dictation_enabled:
-            self._stream_focused_dictation_partial(text)
-
-    def on_voice_status(self, text):
-        # Status callbacks from STT/TTS are routed through Qt signals.
-        if (self._wake_word_training_dialog is not None and text.startswith(
-                ('Voice input error:', 'Microphone unavailable:', 'Vosk model not found', 'Vosk model unavailable:'))):
-            self._wake_word_training_dialog.feedback.setText(
-                text + ' — check the microphone or press Cancel.')
-        if text:
-            if text.startswith(("Voice input error:", "Microphone unavailable:", "Vosk model not found")):
-                self.stt_enabled = False
-            self.status = text
 
     def set_freehand_gestures_enabled(self, enabled: bool, announce: bool = True):
         """Enable or disable both hands' gesture input while keeping camera tracking alive.
@@ -12678,8 +12044,6 @@ class SpatialDesktop(QWidget):
         if not changed:
             state = "on" if enabled else "off"
             self.status = f"Freehand gestures are already {'enabled' if enabled else 'disabled'}"
-            if announce:
-                self.tts.speak(f"Left hand gestures {state}. Right hand gestures {state}.")
             self.update()
             return
 
@@ -12708,8 +12072,6 @@ class SpatialDesktop(QWidget):
             self.tli_overrides.pop(side, None)
 
         if not enabled:
-            if self.voice_selection_mode is not None:
-                self._clear_voice_selection(release_mouse=True)
             self.active_slider = None
             self.active_slider_side = None
             self.tli_overrides = {}
@@ -12722,9 +12084,6 @@ class SpatialDesktop(QWidget):
             self.hand_tracking_notice_text = "Freehand gestures disabled"
             self.hand_tracking_notice_until = now + 5.0
         self.status = "Freehand gestures enabled" if enabled else "Freehand gestures disabled"
-        if announce:
-            state = "on" if enabled else "off"
-            self.tts.speak(f"Left hand gestures {state}. Right hand gestures {state}.")
         self.update()
 
     def set_hand_tracking_paused(self, paused: bool, announce: bool = True):
@@ -12738,8 +12097,6 @@ class SpatialDesktop(QWidget):
         self.hand_tracking_paused = paused
         self.tracker.set_hand_tracking_enabled(not paused)
         if paused:
-            if self.voice_selection_mode is not None:
-                self._clear_voice_selection(release_mouse=True)
             # End any active click/drag/scroll and release native mouse buttons so pausing
             # in the middle of a gesture cannot leave an action or held button stuck.
             for side in ("left", "right"):
@@ -12766,9 +12123,7 @@ class SpatialDesktop(QWidget):
             self.active_slider_side = None
             self.tli_overrides = {}
             self.active_push_sides = set()
-            self.status = "Hand tracking paused — say 'resume tracking' to continue"
-            if announce:
-                self.tts.speak("Hand tracking paused. Say resume tracking when you are ready.")
+            self.status = "Hand tracking paused"
         else:
             # Drop stale cursor smoothing so resuming starts at the current hand position.
             self.cursor_updated_at = {"left": 0.0, "right": 0.0}
@@ -12776,8 +12131,6 @@ class SpatialDesktop(QWidget):
             self.smoothed_side_cursor_positions = {"left": None, "right": None}
             self.hand_positions = {"left": [], "right": []}
             self.status = "Hand tracking resumed"
-            if announce:
-                self.tts.speak("Hand tracking resumed.")
         self.update()
 
     def _current_tli_global_position(self):
@@ -12796,1160 +12149,26 @@ class SpatialDesktop(QWidget):
                 pass
         return QCursor.pos()
 
-    def _focus_external_target(self, close_search=True):
-        """Restore the last external app (not Spatial Desktop) for OS-level commands."""
-        dialog = self.search_dialog
-        dialog_was_visible = bool(dialog is not None and dialog.isVisible())
-        target = None
-        if sys.platform.startswith("win"):
-            try:
-                user32 = ctypes.windll.user32
-                foreground = int(user32.GetForegroundWindow() or 0)
-                candidates = []
-                if dialog_was_visible and self.search_return_hwnd:
-                    candidates.append(int(self.search_return_hwnd))
-                if foreground:
-                    pid = wintypes.DWORD(0)
-                    user32.GetWindowThreadProcessId(wintypes.HWND(foreground), ctypes.byref(pid))
-                    if pid.value != os.getpid():
-                        candidates.insert(0, foreground)
-                if self.last_external_foreground_hwnd:
-                    candidates.append(int(self.last_external_foreground_hwnd))
-                for hwnd in candidates:
-                    if not hwnd or not user32.IsWindow(wintypes.HWND(hwnd)):
-                        continue
-                    pid = wintypes.DWORD(0)
-                    user32.GetWindowThreadProcessId(wintypes.HWND(hwnd), ctypes.byref(pid))
-                    if pid.value != os.getpid():
-                        target = hwnd
-                        break
-            except Exception:
-                target = None
-        elif sys.platform.startswith("linux"):
-            candidates = []
-            if dialog_was_visible and self.search_return_window_id:
-                candidates.append(str(self.search_return_window_id))
-            if self.last_external_window_id:
-                candidates.append(str(self.last_external_window_id))
-            for candidate in candidates:
-                try:
-                    pid_text = subprocess.check_output(["xdotool", "getwindowpid", candidate], text=True,
-                                                       stderr=subprocess.DEVNULL, timeout=0.35).strip()
-                    if int(pid_text) != os.getpid():
-                        target = candidate
-                        break
-                except Exception:
-                    continue
 
-        if dialog_was_visible and close_search:
-            dialog.close()
-        if sys.platform.startswith("win") and target:
-            try:
-                user32 = ctypes.windll.user32
-                # Restore only a minimised target. SW_RESTORE also unmaximises a
-                # maximised Explorer window, which unexpectedly shrinks it for every
-                # voice navigation/selection command.
-                if user32.IsIconic(wintypes.HWND(target)):
-                    user32.ShowWindow(wintypes.HWND(target), 9)  # SW_RESTORE
-                user32.SetForegroundWindow(wintypes.HWND(target))
-                self.last_external_foreground_hwnd = int(target)
-                time.sleep(0.045)
-                return True
-            except Exception:
-                return False
-        if sys.platform.startswith("linux") and target:
-            try:
-                subprocess.run(["xdotool", "windowactivate", "--sync", str(target)], check=True,
-                               timeout=0.75, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-                self.last_external_window_id = str(target)
-                return True
-            except Exception:
-                return False
-        # Never send keyboard shortcuts to our own overlay when an external target
-        # could not be identified. This is especially important for close/minimise/delete.
-        if sys.platform == "darwin":
-            return not dialog_was_visible or close_search
-        return False
 
-    def _voice_hotkey(self, *keys):
-        if pyautogui is None:
-            self.status = "Keyboard automation is unavailable; install pyautogui."
-            return False
-        if not self._focus_external_target(close_search=True):
-            self.status = "No external application could be focused safely. Switch to OS Desktop mode and try again."
-            return False
-        try:
-            pyautogui.hotkey(*keys, interval=0.02, _pause=False)
-            return True
-        except Exception as exc:
-            self.status = f"Voice keyboard command failed: {exc}"
-            return False
 
-    def _voice_mouse_shortcut(self, key, *mods):
-        if pyautogui is None:
-            self.status = "Mouse automation is unavailable; install pyautogui."
-            return False
-        if not self._focus_external_target(close_search=True):
-            self.status = "No external application could be focused safely."
-            return False
-        try:
-            if mods:
-                pyautogui.hotkey(*mods, key, interval=0.02, _pause=False)
-            else:
-                pyautogui.press(key, _pause=False)
-            return True
-        except Exception as exc:
-            self.status = f"Voice keyboard command failed: {exc}"
-            return False
 
-    def _begin_voice_text_selection(self):
-        if self.hand_tracking_paused:
-            self.status = "Resume hand tracking before starting a TPI text selection."
-            self.tts.speak(self.status)
-            return False
-        if self.desktop_mode != "os":
-            self.status = "Switch to OS Desktop mode before starting a voice text selection."
-            self.tts.speak(self.status)
-            return False
-        point = self._current_tli_global_position()
-        if not self._focus_external_target(close_search=True):
-            self.status = "I couldn't focus the target window for text selection."
-            self.tts.speak(self.status)
-            return False
-        if pyautogui is None:
-            return False
-        try:
-            pyautogui.moveTo(point.x(), point.y(), duration=0, _pause=False)
-            pyautogui.mouseDown(button="left", _pause=False)
-            self.voice_selection_mode = "text"
-            self.voice_lasso_start = QPointF(point)
-            self.gesture_owner = None
-            for side in ("left", "right"):
-                self._reset_fist_gesture(side)
-                self._clear_menu_pinch_sequence(side)
-            self.status = "Text selection active — move your hand, then say 'copy this' or 'finish selection'."
-            self.tts.speak("Text selection started. Move your hand to select, then say copy this.")
-            return True
-        except Exception as exc:
-            try:
-                pyautogui.mouseUp(button="left", _pause=False)
-            except Exception:
-                pass
-            self.voice_selection_mode = None
-            self.voice_lasso_start = None
-            self.status = f"Could not start text selection: {exc}"
-            return False
 
-    def _begin_voice_image_lasso(self):
-        if self.hand_tracking_paused:
-            self.status = "Resume hand tracking before starting an image lasso."
-            self.tts.speak(self.status)
-            return False
-        if self.desktop_mode != "os":
-            self.status = "Switch to OS Desktop mode before starting an image lasso."
-            self.tts.speak(self.status)
-            return False
-        start = self._current_tli_global_position()
-        self._focus_external_target(close_search=True)
-        self.voice_selection_mode = "image"
-        self.voice_lasso_start = QPointF(start)
-        self.status = "Image lasso active — move to the opposite corner and say 'copy this'."
-        self.tts.speak("Image selection started. Move to the opposite corner and say copy this.")
-        self.update()
-        return True
 
-    def _clear_voice_selection(self, release_mouse=True):
-        if release_mouse and self.voice_selection_mode == "text" and pyautogui is not None:
-            try:
-                pyautogui.mouseUp(button="left", _pause=False)
-            except Exception:
-                pass
-        self.voice_selection_mode = None
-        self.voice_lasso_start = None
-        self.voice_selection_target = None
-        self.update()
 
-    def _copy_image_lasso_to_clipboard(self):
-        if self.voice_selection_mode != "image" or self.voice_lasso_start is None:
-            return False
-        end = self._current_tli_global_position()
-        x1, y1 = int(self.voice_lasso_start.x()), int(self.voice_lasso_start.y())
-        x2, y2 = int(end.x()), int(end.y())
-        left, top = min(x1, x2), min(y1, y2)
-        width, height = abs(x2-x1), abs(y2-y1)
-        if width < 12 or height < 12:
-            self.status = "Image lasso is too small. Move farther to the opposite corner and try again."
-            return False
-        if pyautogui is None:
-            self.status = "Screen capture is unavailable; install pyautogui/Pillow."
-            return False
-        original_opacity = self.windowOpacity()
-        try:
-            # Hide the full-screen TLI/skeleton briefly so it is not copied into the image.
-            self.setWindowOpacity(0.0)
-            QApplication.processEvents()
-            time.sleep(0.06)
-            captured = pyautogui.screenshot(region=(left, top, width, height)).convert("RGBA")
-            raw = captured.tobytes("raw", "RGBA")
-            image = QImage(raw, captured.width, captured.height, captured.width*4,
-                           QImage.Format_RGBA8888).copy()
-            QApplication.clipboard().setImage(image)
-            QTimer.singleShot(120, self._capture_system_clipboard)
-        except Exception as exc:
-            self.status = f"Could not capture image region: {exc}"
-            return False
-        finally:
-            self.setWindowOpacity(original_opacity)
-            QApplication.processEvents()
-        self._clear_voice_selection(release_mouse=False)
-        self.status = f"Copied image region ({width} × {height}) to the clipboard. Say 'paste here' to insert it."
-        self.tts.speak("Image region copied. Say paste here to insert it.")
-        return True
 
-    def _copy_current_selection(self):
-        if self.voice_selection_mode == "image":
-            return self._copy_image_lasso_to_clipboard()
-        if self.voice_selection_mode == "text":
-            self._clear_voice_selection(release_mouse=True)
-        if self._voice_hotkey("ctrl", "c"):
-            QTimer.singleShot(180, self._capture_system_clipboard)
-            self.status = "Copy sent to the selected text or item. Say 'paste here' at the destination."
-            self.tts.speak("Copied. Move to the destination and say paste here.")
-            return True
-        return False
 
-    def _paste_at_tli(self):
-        point = self._current_tli_global_position()
-        if self.desktop_mode != "os":
-            self.status = "Switch to OS Desktop mode to paste at the TPI position."
-            self.tts.speak(self.status)
-            return False
-        if self.voice_selection_mode is not None:
-            self._clear_voice_selection(release_mouse=True)
-        if not self._focus_external_target(close_search=True):
-            self.status = "I couldn't focus the destination window. Click or hover its text field and try again."
-            self.tts.speak(self.status)
-            return False
-        if pyautogui is None:
-            return False
-        try:
-            pyautogui.click(point.x(), point.y(), clicks=1, interval=0, _pause=False)
-            time.sleep(0.045)
-            pyautogui.hotkey("ctrl", "v", interval=0.02, _pause=False)
-            self.status = "Pasted clipboard contents at the TPI position."
-            self.tts.speak("Pasted here.")
-            return True
-        except Exception as exc:
-            self.status = f"Paste failed: {exc}"
-            return False
 
-    def _open_known_folder(self, folder_name=None):
-        base = Path.home()
-        target = base if folder_name is None else base / folder_name
-        try:
-            if sys.platform.startswith("win"):
-                # Explorer's known-folder aliases work with redirected OneDrive and
-                # localized Windows profile folders, where Path.home()/Documents
-                # may not exist even though the Documents library does.
-                windows_known_folders = {
-                    "Documents": "shell:Personal", "Downloads": "shell:Downloads",
-                    "Desktop": "shell:Desktop", "Pictures": "shell:My Pictures",
-                    "Videos": "shell:My Video", "Music": "shell:My Music",
-                }
-                shell_target = windows_known_folders.get(folder_name, str(target)) if folder_name else str(target)
-                subprocess.Popen(["explorer.exe", shell_target])
-            else:
-                if not target.exists():
-                    self.status = f"Folder not found: {target}"
-                    self.tts.speak(f"I couldn't find the {folder_name or 'user'} folder.")
-                    return False
-                if sys.platform == "darwin":
-                    subprocess.Popen(["open", str(target)])
-                else:
-                    subprocess.Popen(["xdg-open", str(target)])
-            self.status = f"Opened {folder_name or 'user'} folder"
-            return True
-        except Exception as exc:
-            self.status = f"Could not open folder: {exc}"
-            return False
 
-    def _media_key(self, action):
-        """Send common media/volume keys without requiring a resident media service."""
-        if sys.platform.startswith("win"):
-            vk = {
-                "media_play_pause": 0xB3, "media_next": 0xB0, "media_previous": 0xB1,
-                "volume_mute": 0xAD, "volume_up": 0xAF, "volume_down": 0xAE,
-                "volume_unmute": 0xAF,
-            }.get(action)
-            if vk is None:
-                return False
-            try:
-                user32 = ctypes.windll.user32
-                user32.keybd_event(vk, 0, 0, 0)
-                user32.keybd_event(vk, 0, 2, 0)
-                return True
-            except Exception:
-                return False
-        if sys.platform.startswith("linux"):
-            if action.startswith("media_") and shutil.which("playerctl"):
-                command = {"media_play_pause": "play-pause", "media_next": "next", "media_previous": "previous"}[action]
-                return subprocess.run(["playerctl", command], timeout=1.0,
-                                      stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode == 0
-            if action.startswith("volume_") and shutil.which("pactl"):
-                args = {"volume_mute": ["set-sink-mute", "@DEFAULT_SINK@", "1"],
-                        "volume_unmute": ["set-sink-mute", "@DEFAULT_SINK@", "0"],
-                        "volume_up": ["set-sink-volume", "@DEFAULT_SINK@", "+5%"],
-                        "volume_down": ["set-sink-volume", "@DEFAULT_SINK@", "-5%"]}.get(action)
-                if args:
-                    return subprocess.run(["pactl", *args], timeout=1.0,
-                                          stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode == 0
-        # Fallback for macOS or systems exposing the media keys through pyautogui.
-        key = {"media_play_pause": "playpause", "media_next": "nexttrack", "media_previous": "prevtrack",
-               "volume_mute": "volumemute", "volume_unmute": "volumeup", "volume_up": "volumeup",
-               "volume_down": "volumedown"}.get(action)
-        try:
-            if pyautogui is not None and key:
-                pyautogui.press(key, _pause=False)
-                return True
-        except Exception:
-            pass
-        return False
 
-    def _run_windows_explorer_navigation(self, command):
-        """Use Shell automation to select/open items in the remembered Explorer view."""
-        self._remember_external_foreground_window(force=True)
-        hwnd = int(getattr(self, "last_external_foreground_hwnd", 0) or 0)
-        if not hwnd or not self._focus_external_target(close_search=True):
-            return False, "Open File Explorer to the folder you want to control, then repeat the command."
-        hwnd = int(getattr(self, "last_external_foreground_hwnd", 0) or hwnd)
-        payload = dict(command)
-        payload["hwnd"] = hwnd
-        payload_data = base64.b64encode(json.dumps(payload, ensure_ascii=True).encode("utf-8")).decode("ascii")
-        script = r"""$ErrorActionPreference = 'Stop'
-try {
-  $payload = [System.Text.Encoding]::UTF8.GetString([System.Convert]::FromBase64String('__PAYLOAD__')) | ConvertFrom-Json
-  $shell = New-Object -ComObject Shell.Application
-  $view = $null
-  foreach ($candidate in $shell.Windows()) {
-    try {
-      if ([Int64]$candidate.HWND -eq [Int64]$payload.hwnd -and $candidate.Document -and $candidate.Document.Folder) {
-        $view = $candidate
-        break
-      }
-    } catch { }
-  }
-  if ($null -eq $view) { throw 'The active external window is not a File Explorer folder. Open the target folder in File Explorer and try again.' }
-  $document = $view.Document
-  $items = @($document.Folder.Items())
 
-  function Test-ItemKind($item, $kind) {
-    if (-not $kind -or $kind -eq 'all') { return $true }
-    $isFolder = [bool]$item.IsFolder
-    if ($kind -eq 'folder') { return $isFolder }
-    if ($kind -eq 'file') { return (-not $isFolder) }
-    return $true
-  }
-  function Normalize-SpokenItemName($value) {
-    # People naturally omit punctuation while speaking names like llama.cpp,
-    # my-folder, or my_folder. Strip separators only for the fallback match.
-    return [regex]::Replace(([string]$value).ToLowerInvariant(), '[^\p{L}\p{N}]', '')
-  }
-  function Find-SpokenItem($name, $kind) {
-    $foundItems = @($items | Where-Object { ([string]$_.Name).Equals([string]$name, [System.StringComparison]::OrdinalIgnoreCase) -and (Test-ItemKind $_ $kind) })
-    if ($foundItems.Count -eq 0 -and -not ([string]$name).Contains('.')) {
-      $foundItems = @($items | Where-Object {
-        ([System.IO.Path]::GetFileNameWithoutExtension([string]$_.Name)).Equals([string]$name, [System.StringComparison]::OrdinalIgnoreCase) -and (Test-ItemKind $_ $kind)
-      })
-    }
-    if ($foundItems.Count -eq 0) {
-      $spokenKey = Normalize-SpokenItemName $name
-      if ($spokenKey.Length -gt 0) {
-        $foundItems = @($items | Where-Object {
-          (Normalize-SpokenItemName $_.Name) -eq $spokenKey -and (Test-ItemKind $_ $kind)
-        })
-      }
-    }
-    if ($foundItems.Count -eq 0) { throw ("No matching item named '{0}' was found in the current folder." -f $name) }
-    if ($foundItems.Count -gt 1) { throw ("More than one item matches '{0}'. Say its full filename or specify file/folder." -f $name) }
-    return $foundItems[0]
-  }
 
-  switch ([string]$payload.action) {
-    'select_all_kind' {
-      $selected = @($items | Where-Object { Test-ItemKind $_ ([string]$payload.kind) })
-      if ($selected.Count -eq 0) { throw ("There are no {0} to select in this folder." -f $payload.kind) }
-      $first = $true
-      foreach ($item in $selected) {
-        $flags = 1
-        if ($first) { $flags = 29 }
-        $document.SelectItem($item, $flags)
-        $first = $false
-      }
-      [Console]::Out.WriteLine(('Selected {0} {1}.' -f $selected.Count, $payload.kind))
-    }
-    'select_items' {
-      $selected = @()
-      foreach ($name in $payload.names) { $selected += Find-SpokenItem ([string]$name) ([string]$payload.kind) }
-      $first = $true
-      foreach ($item in $selected) {
-        $flags = 1
-        if ($first) { $flags = 29 }
-        $document.SelectItem($item, $flags)
-        $first = $false
-      }
-      [Console]::Out.WriteLine(('Selected {0} item(s).' -f $selected.Count))
-    }
-    'open_item' {
-      $item = Find-SpokenItem ([string]$payload.name) ([string]$payload.kind)
-      if ([bool]$item.IsFolder) {
-        try { $view.Navigate2([string]$item.Path) } catch { $view.Navigate([string]$item.Path) }
-      } else {
-        Start-Process -FilePath ([string]$item.Path)
-      }
-      [Console]::Out.WriteLine(('Opened {0}.' -f $item.Name))
-    }
-    'navigate_item' {
-      $item = Find-SpokenItem ([string]$payload.name) 'folder'
-      if (-not [bool]$item.IsFolder) { throw ("'{0}' is not a folder." -f $item.Name) }
-      try { $view.Navigate2([string]$item.Path) } catch { $view.Navigate([string]$item.Path) }
-      [Console]::Out.WriteLine(('Navigating to {0}.' -f $item.Name))
-    }
-    'create_item' {
-      $directory = [string]$document.Folder.Self.Path
-      if (-not (Test-Path -LiteralPath $directory -PathType Container)) { throw 'The active location is not a file-system folder.' }
-      $kind = [string]$payload.kind
-      if ($kind -eq 'folder') {
-        $base = 'New folder'
-        $target = Join-Path $directory $base
-        $index = 2
-        while (Test-Path -LiteralPath $target) { $target = Join-Path $directory (('{0} ({1})' -f $base, $index)); $index++ }
-        New-Item -ItemType Directory -Path $target -ErrorAction Stop | Out-Null
-        [Console]::Out.WriteLine(('Created folder {0}.' -f [System.IO.Path]::GetFileName($target)))
-      } elseif ($kind -eq 'text') {
-        $base = 'New Text Document'
-        $target = Join-Path $directory ($base + '.txt')
-        $index = 2
-        while (Test-Path -LiteralPath $target) { $target = Join-Path $directory (('{0} ({1}).txt' -f $base, $index)); $index++ }
-        [System.IO.File]::WriteAllText($target, '')
-        [Console]::Out.WriteLine(('Created text file {0}.' -f [System.IO.Path]::GetFileName($target)))
-        Start-Process -FilePath $target
-      } elseif ($kind -eq 'powerpoint') {
-        $base = 'Presentation'
-        $target = Join-Path $directory ($base + '.pptx')
-        $index = 2
-        while (Test-Path -LiteralPath $target) { $target = Join-Path $directory (('{0} ({1}).pptx' -f $base, $index)); $index++ }
-        $powerPoint = $null
-        $presentation = $null
-        try {
-          $powerPoint = New-Object -ComObject PowerPoint.Application
-          $presentation = $powerPoint.Presentations.Add()
-          $presentation.SaveAs($target, 24)
-          $presentation.Close()
-          $powerPoint.Quit()
-          [Console]::Out.WriteLine(('Created PowerPoint presentation {0}.' -f [System.IO.Path]::GetFileName($target)))
-          Start-Process -FilePath $target
-        } catch {
-          try { if ($presentation) { $presentation.Close() } } catch { }
-          try { if ($powerPoint) { $powerPoint.Quit() } } catch { }
-          throw 'PowerPoint could not create a presentation. Check that Microsoft PowerPoint is installed.'
-        }
-      } else { throw 'Unsupported new-item type.' }
-    }
-    default { throw 'Unsupported file-navigation command.' }
-  }
-} catch {
-  [Console]::Error.WriteLine($_.Exception.Message)
-  exit 1
-}
-""".replace("__PAYLOAD__", payload_data)
-        encoded = base64.b64encode(script.encode("utf-16le")).decode("ascii")
-        try:
-            result = subprocess.run(
-                ["powershell.exe", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-EncodedCommand", encoded],
-                capture_output=True, text=True, timeout=7.0,
-                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
-            )
-        except FileNotFoundError:
-            return False, "PowerShell was not found; File Explorer voice navigation is unavailable."
-        except subprocess.TimeoutExpired:
-            return False, "File Explorer did not respond to the voice command in time."
-        if result.returncode == 0:
-            message = (result.stdout or "").strip().splitlines()
-            return True, message[-1] if message else "File Explorer command completed."
-        # PowerShell diagnostics can include source excerpts and invocation text.
-        # Never send raw stderr to TTS: report a short, user-facing failure instead.
-        return False, "I couldn't complete that file command. Check the item name and make sure File Explorer is open to the correct folder."
 
-    def execute_navigation_voice_command(self, command):
-        """Execute a parsed, explicit file/folder navigation command."""
-        action = command.get("action")
-        if action == "create_item" and not sys.platform.startswith("win"):
-            if command.get("kind") == "folder" and self._voice_hotkey("ctrl", "shift", "n"):
-                self.status = "Creating a new folder in the active file manager."
-                self.tts.speak(self.status)
-                return True
-            self.status = "Creating text files and PowerPoint presentations by voice is currently supported through Windows File Explorer."
-            self.tts.speak(self.status)
-            return False
-        if action == "navigate_drive":
-            if not sys.platform.startswith("win"):
-                self.status = "Drive-letter navigation is available on Windows only."
-                self.tts.speak(self.status)
-                return False
-            drive = str(command.get("drive", "C")).upper()
-            drive_path = f"{drive}:\\"
-            if not re.fullmatch(r"[A-Z]", drive) or not os.path.isdir(drive_path):
-                self.status = f"The {drive}: drive is not available."
-                self.tts.speak(self.status)
-                return False
-            try:
-                subprocess.Popen(["explorer.exe", drive_path])
-                self.status = f"Opening the {drive}: drive."
-                self.tts.speak(self.status)
-                return True
-            except Exception as exc:
-                self.status = f"Could not open the {drive}: drive: {exc}"
-                return False
 
-        if sys.platform.startswith("win"):
-            success, message = self._run_windows_explorer_navigation(command)
-        elif sys.platform == "darwin":
-            success, message = self._run_macos_finder_navigation(command)
-        else:
-            success, message = self._run_linux_file_manager_navigation(command)
-        self.status = message
-        if message:
-            self.tts.speak(message)
-        return success
 
-    def _run_macos_finder_navigation(self, command):
-        """Use Finder AppleScript for item selection and opening."""
-        action = command.get("action")
-        try:
-            if action == "select_all_kind":
-                kind = command.get("kind")
-                if kind == "folder":
-                    expression = "every folder of front window"
-                elif kind == "file":
-                    expression = "every file of front window"
-                else:
-                    expression = "every item of front window"
-                script = f'tell application "Finder" to set selection to {expression}'
-                subprocess.run(["osascript", "-e", script], check=True, timeout=4,
-                               stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True)
-                return True, "Selected items in Finder."
-            if action == "select_items":
-                names = command.get("names", [])
-            else:
-                names = [command.get("name", "")]
-            def apple_string(value):
-                return '"' + str(value).replace("\\", "\\\\").replace('"', '\\"') + '"'
-            if action in {"select_items", "open_item", "navigate_item"}:
-                if action == "select_items":
-                    exprs = [f'(every item of front window whose name is {apple_string(n)})' for n in names]
-                    script = 'tell application "Finder"\n set picked to {}\n' + ''.join(f' set picked to picked & {expr}\n' for expr in exprs) + ' set selection to picked\nend tell'
-                else:
-                    name = str(names[0])
-                    expr = f'(first item of front window whose name is {apple_string(name)})'
-                    script = f'tell application "Finder" to open {expr}'
-                subprocess.run(["osascript", "-e", script], check=True, timeout=4,
-                               stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True)
-                return True, "Finder command completed."
-        except Exception:
-            return False, "Finder could not find or select that item."
-        return False, "That navigation command is not supported in Finder."
 
-    def _run_linux_file_manager_navigation(self, command):
-        """Use conservative X11 type-ahead actions on desktop file managers."""
-        if not shutil.which("xdotool") or not self.last_external_window_id:
-            return False, "Named file selection on Linux requires an active X11 file manager and xdotool."
-        try:
-            subprocess.run(["xdotool", "windowactivate", "--sync", str(self.last_external_window_id)],
-                           check=True, timeout=0.75, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-            action = command.get("action")
-            if action == "select_all_kind":
-                if command.get("kind") == "all":
-                    subprocess.run(["xdotool", "key", "--clearmodifiers", "ctrl+a"], check=True, timeout=1)
-                    return True, "Selected all items in the active file manager."
-                return False, "Filtering selection to files or folders needs file-manager-specific accessibility support on Linux."
-            names = command.get("names", []) if action == "select_items" else [command.get("name", "")]
-            if len(names) != 1:
-                return False, "Selecting multiple named items is supported directly in Windows File Explorer; this Linux file manager needs an accessibility adapter."
-            name = str(names[0])
-            subprocess.run(["xdotool", "key", "--clearmodifiers", "Escape"], timeout=0.5)
-            subprocess.run(["xdotool", "type", "--clearmodifiers", "--delay", "15", name], check=True, timeout=2)
-            if action in {"open_item", "navigate_item"}:
-                subprocess.run(["xdotool", "key", "Return"], check=True, timeout=1)
-                return True, f"Opening {name}."
-            if action == "select_items":
-                return True, f"Requested selection of {name} in the active file manager."
-        except Exception:
-            return False, "The active Linux file manager did not accept the voice command."
-        return False, "That file-manager command is not supported on Linux."
 
-    def execute_pc_voice_command(self, action):
-        """Run a matched deterministic desktop command; no shell text is interpreted."""
-        self._clear_heard_popup()
-        if action == "show_clipboard":
-            self._set_floating_clipboard_visible(True)
-            return True
-        if action == "hide_clipboard":
-            self._set_floating_clipboard_visible(False)
-            return True
-        if action == "copy":
-            self._copy_current_selection(); return True
-        if action == "cut":
-            if self.voice_selection_mode is not None:
-                self._clear_voice_selection(release_mouse=True)
-            if self._voice_hotkey("ctrl", "x"):
-                self.status = "Cut requested for the current selection."
-                self.tts.speak("Cut selection.")
-            return True
-        if action == "paste_here":
-            self._paste_at_tli(); return True
-        if action == "paste":
-            if self.voice_selection_mode is not None:
-                self._clear_voice_selection(release_mouse=True)
-            if self._voice_hotkey("ctrl", "v"):
-                self.status = "Clipboard pasted into the focused application."
-            return True
-        if action == "copy_image_lasso":
-            if self.voice_selection_mode == "image":
-                self._copy_image_lasso_to_clipboard()
-            else:
-                self._begin_voice_image_lasso()
-            return True
-        if action == "start_text_selection":
-            self._begin_voice_text_selection(); return True
-        if action == "finish_selection":
-            if self.voice_selection_mode == "text":
-                self._clear_voice_selection(release_mouse=True)
-                self.status = "Text selection finished. Say 'copy this' to copy it."
-            elif self.voice_selection_mode == "image":
-                self._copy_image_lasso_to_clipboard()
-            else:
-                self.status = "There is no active lasso selection."
-            return True
-        if action == "cancel_selection":
-            self._clear_voice_selection(release_mouse=True)
-            self.status = "Voice selection cancelled."
-            return True
-        if action in ("select_all", "undo", "redo"):
-            if self.voice_selection_mode is not None:
-                self._clear_voice_selection(release_mouse=True)
-            key = {"select_all": "a", "undo": "z", "redo": "y"}[action]
-            if self._voice_hotkey("ctrl", key):
-                self.status = {"select_all": "Selected all.", "undo": "Undo.", "redo": "Redo."}[action]
-            return True
-        if action in ("create_new_text_file", "create_new_powerpoint"):
-            kind = "text" if action == "create_new_text_file" else "powerpoint"
-            self.execute_navigation_voice_command({"action": "create_item", "kind": kind})
-            return True
-        if action == "new_folder":
-            if sys.platform.startswith("win"):
-                self.execute_navigation_voice_command({"action": "create_item", "kind": "folder"})
-            elif not self._voice_hotkey("ctrl", "shift", "n"):
-                self.status = "Folder creation shortcut was not accepted by the active file manager."
-            return True
-        if action.startswith("media_") or action.startswith("volume_"):
-            if self._media_key(action):
-                labels = {"media_play_pause": "Playback toggled.", "media_next": "Next track.",
-                          "media_previous": "Previous track.", "volume_up": "Volume up.",
-                          "volume_down": "Volume down.", "volume_mute": "Audio muted.", "volume_unmute": "Volume unmuted."}
-                self.status = labels.get(action, "Media command sent.")
-            else:
-                self.status = "Media control is unavailable on this system."
-            return True
-        folders = {"open_downloads": "Downloads", "open_documents": "Documents", "open_desktop_folder": "Desktop",
-                   "open_pictures": "Pictures", "open_videos": "Videos", "open_music_folder": "Music"}
-        if action in folders:
-            self._open_known_folder(folders[action]); return True
-        if action == "open_file_explorer":
-            self.open_user_folder(); return True
-        if action == "open_my_computer":
-            try:
-                if sys.platform.startswith("win"):
-                    subprocess.Popen(["explorer.exe", "shell:MyComputerFolder"])
-                elif sys.platform == "darwin":
-                    subprocess.Popen(["open", "/"])
-                else:
-                    subprocess.Popen(["xdg-open", "/"])
-                self.status = "Opening this computer's drives and locations."
-                self.tts.speak("Opening my computer.")
-            except Exception as exc:
-                self.status = f"Could not open the computer view: {exc}"
-            return True
-        if action in ("open_notepad", "open_calculator"):
-            try:
-                if sys.platform.startswith("win"):
-                    subprocess.Popen(["notepad.exe"] if action == "open_notepad" else ["calc.exe"])
-                elif sys.platform == "darwin":
-                    subprocess.Popen(["open", "-a", "TextEdit" if action == "open_notepad" else "Calculator"])
-                else:
-                    app = "mousepad" if action == "open_notepad" else "gnome-calculator"
-                    subprocess.Popen([app])
-                self.status = "Application launched."
-            except Exception as exc:
-                self.status = f"Could not launch application: {exc}"
-            return True
-        if action == "fullscreen_toggle":
-            # Route to the external application, never the Spatial Desktop overlay.
-            if self._focus_external_target(close_search=True):
-                if self._voice_hotkey("f11"):
-                    self.status = "Fullscreen toggled for the active application."
-                else:
-                    self.status = "Could not send the fullscreen shortcut to the active application."
-            else:
-                self.status = "No external application is available for fullscreen."
-            return True
-        if action in ("minimize_window", "maximize_window", "restore_window"):
-            if self._focus_external_target(close_search=True) and sys.platform.startswith("win"):
-                try:
-                    user32 = ctypes.windll.user32
-                    hwnd = int(user32.GetForegroundWindow() or 0)
-                    cmd = {"minimize_window": 6, "maximize_window": 3, "restore_window": 9}[action]
-                    user32.ShowWindow(wintypes.HWND(hwnd), cmd)
-                    self.status = action.replace("_", " ").title() + "."
-                except Exception as exc:
-                    self.status = f"Window command failed: {exc}"
-            elif action == "minimize_window":
-                self._voice_hotkey("win", "down")
-            elif action == "maximize_window":
-                self._voice_hotkey("win", "up")
-            else:
-                self.status = "Restore is supported for Windows windows; focus the target and try again."
-            return True
-        shortcuts = {
-            "switch_window": ("alt", "tab"), "show_desktop": ("win", "d"),
-            "snap_left": ("win", "left"), "snap_right": ("win", "right"),
-            "new_tab": ("ctrl", "t"), "close_tab": ("ctrl", "w"),
-            "go_back": ("alt", "left"), "go_forward": ("alt", "right"), "go_up": ("alt", "up"),
-            "refresh_window": ("ctrl", "r"), "rename_selected": ("f2",), "delete_selected": ("delete",),
-        }
-        if action == "open_start_menu":
-            if sys.platform.startswith("win"):
-                success = self._voice_hotkey("win")
-            elif sys.platform == "darwin":
-                success = self._voice_hotkey("ctrl", "f2")
-            else:
-                success = self._voice_hotkey("win")
-            self.status = "Opening the system application menu." if success else "Could not open the system application menu."
-            return True
-        if action == "show_running_apps":
-            # Use the operating system's native task/window overview, which works
-            # consistently with the active desktop environment and exposes real apps.
-            if sys.platform.startswith("win"):
-                success = self._voice_hotkey("win", "tab")
-            elif sys.platform == "darwin":
-                success = self._voice_hotkey("ctrl", "up")
-            else:
-                # GNOME/KDE commonly bind Super+Tab to application/window switching.
-                success = self._voice_hotkey("win", "tab")
-                if not success:
-                    success = self._voice_hotkey("alt", "tab")
-            self.status = ("Showing running applications." if success else
-                           "Could not open the system app switcher. Try 'switch window'.")
-            return True
-        if action in shortcuts:
-            keys = shortcuts[action]
-            success = self._voice_hotkey(*keys)
-            if success:
-                if action == "delete_selected":
-                    self.status = "Delete requested. In Explorer this moves the selected item to the Recycle Bin; review the selection first."
-                else:
-                    self.status = action.replace("_", " ").title() + "."
-            return True
-        return False
 
-    def _clear_heard_popup(self):
-        """Reset transient feedback while keeping the live STT pill visible."""
-        self.heard_popup_generation += 1
-        self.heard_popup_mode = "transcript" if self.stt_enabled else "hidden"
-        self.heard_popup_message = ""
-        self.heard_popup_shake_until = 0.0
-        self.update()
-
-    def _show_unrecognised_command(self, phrase):
-        """Show red/shaking feedback, label it after 2s, then clear after 5s."""
-        self.heard_popup_generation += 1
-        generation = self.heard_popup_generation
-        self.heard_popup_mode = "unrecognised"
-        self.heard_popup_message = f"Heard: {phrase}"
-        self.heard_popup_shake_until = time.monotonic() + 0.7
-        self.update()
-
-        def show_label():
-            if generation != self.heard_popup_generation or self.heard_popup_mode != "unrecognised":
-                return
-            self.heard_popup_message = "Unrecognised Command"
-            self.heard_popup_shake_until = 0.0
-            self.update()
-            # Keep the feedback brief, then return to a blank live-listening bar.
-            # A generation check prevents this timer clearing a newer phrase.
-            QTimer.singleShot(2000, clear_label)
-
-        def clear_label():
-            if generation != self.heard_popup_generation or self.heard_popup_mode != "unrecognised":
-                return
-            self._clear_heard_popup()
-
-        QTimer.singleShot(2000, show_label)
-
-    def _on_general_voice_answer(self, question, answer):
-        if not answer:
-            detail = str(d1_status().get("error") or "")
-            if detail:
-                self._log_d1_ui("Question could not be answered: " + detail[:180])
-            else:
-                self._log_d1_ui("Question did not return an answer")
-            # D1 is a structured decision model, not a general chat assistant.
-            # Avoid telling the user the microphone is broken or inventing replies.
-            answer = ("D1 is configured for desktop commands, not general conversation. "
-                      "A separate chat model is needed for open-ended answers.")
-        self.status = answer
-        self.tts.speak(answer)
-
-    def _ask_d1_general_question(self, question):
-        # Keep model inference off the Qt UI thread; the signal returns the result safely.
-        def worker():
-            try:
-                from d1_decision import answer_general_question
-                answer = answer_general_question(question)
-            except Exception:
-                answer = None
-            self.voice_reply_signals.finished.emit(question, answer or "")
-        threading.Thread(target=worker, name="D1-general-answer", daemon=True).start()
-
-    def on_speech(self, text):
-        # A completed phrase has been consumed; don't keep it as the idle pill's
-        # fallback transcript. The next phrase is shown from speech_partial.
-        self.last_speech = ""
-        self.speech_partial = ""
-        self.heard_popup_generation += 1
-        self.heard_popup_mode = "transcript"
-        self.heard_popup_message = ""
-        self.heard_popup_shake_until = 0.0
-        if self._wake_word_training_dialog is not None:
-            training = self._wake_word_training_dialog
-            if training.receive_final(text) and training.successes == 3:
-                self.ui_preferences['wake_word_trained'] = True
-                self._save_wake_word_preferences()
-            return
-        awakened_from_standby = False
-        if not self.stt_enabled:
-            # Passive wake-word mode: no voice commands, file operations or
-            # dictation can run until the correctly recognised name is heard.
-            if (not self.ui_preferences.get('wake_word_listening', False) or
-                    not self._has_trained_wake_word()):
-                return
-            matched, command_after_name = wake_word_command(
-                text, self.ui_preferences.get('wake_word_name', ''))
-            if not matched or not self._set_voice_input_enabled(True):
-                return
-            self.status = 'Wake word recognised — voice input enabled'
-            self._announce_voice_input_state(True)
-            awakened_from_standby = True
-            # If the user said 'Name, show menu', carry out that addressed
-            # command after enabling STT. A name by itself simply switches on.
-            if not command_after_name:
-                return
-            text = command_after_name
-        low = text.lower().strip()
-        low = re.sub(r"\s+", " ", low)
-        dialog = self.search_dialog
-        # Dictation remains free-flowing after it has been explicitly started.
-        # 'Stop listening' remains available without a wake word for safety.
-        if (not awakened_from_standby and self.ui_preferences.get('wake_word_name') and
-                self.ui_preferences.get('wake_word_trained', False) and
-                not self.focus_dictation_enabled and
-                not (dialog is not None and dialog.isVisible() and dialog.dictation_enabled) and
-                low not in ('stop listening', 'voice off', 'stop voice control')):
-            addressed = self._wake_word_gate(text)
-            if addressed is None or addressed == '':
-                return
-            text = addressed
-            low = re.sub(r"\s+", " ", text.lower().strip())
-
-        # Handle global stop-listening commands before any dictation path can type
-        # the phrase into a field. Keep confirmation identical to the Glass Menu.
-        stop_listening_phrases = {
-            "stop listening", "voice off", "stop voice control", "disable voice input",
-            "turn off voice input", "stop voice input", "turn voice input off",
-            "turn the voice input off", "disable listening", "stop listening now",
-            "turn off listening", "stop voice recognition", "disable voice recognition",
-        }
-        if low in stop_listening_phrases:
-            if dialog is not None and dialog.isVisible() and dialog.dictation_enabled:
-                dialog.set_dictation_enabled(False, notify=True)
-            if self.focus_dictation_enabled:
-                self.end_focused_dictation("")
-            self.focus_dictation_paused = False
-            self.focus_dictation_committed_words = []
-            self.focus_dictation_last_partial = ""
-            self._set_voice_input_enabled(False)
-            self.status = "Voice input off"
-            self._announce_voice_input_state(False)
-            return
-
-        # Handle everyday greetings before the D1 command classifier. d1-omni is a
-        # structured decision model and its API cannot generate conversational text.
-        # Only do this outside dictation/search so phrases can still be typed there.
-        if (not self.focus_dictation_enabled and
-                not (dialog is not None and dialog.isVisible()) and
-                low in ("how are you", "how are you doing", "how's it going",
-                        "how is it going", "how are things", "are you there")):
-            answer = "I'm here and ready to help. What would you like to do?"
-            self.status = answer
-            self.tts.speak(answer)
-            return
-
-        # Live local facts must be answered from the OS, never guessed by a model.
-        if not self.focus_dictation_enabled and not (dialog is not None and dialog.isVisible()):
-            live = live_answer(text)
-            if live:
-                kind, answer = live
-                self.status = answer
-                self.tts.speak(answer)
-                return
-
-            # Spoken file queries reuse the existing indexed local-search UI.
-            query = file_query(text)
-            if query:
-                self.open_search_bar(from_voice=False)
-                if self.search_dialog is not None:
-                    self.search_dialog.set_dictation_enabled(False)
-                    self.search_dialog.query.setText(query)
-                    self.search_dialog.query.setFocus()
-                self.status = "Searching local files for: " + query
-                self.tts.speak("Searching your local files for " + query + ".")
-                return
-        if low in ("fullscreen", "full screen", "toggle fullscreen", "toggle full screen", "make fullscreen", "make full screen"):
-            if sys.platform.startswith("win"):
-                try:
-                    hwnd = int(ctypes.windll.user32.GetForegroundWindow() or 0)
-                    overlay_hwnd = int(self.winId())
-                    if hwnd and hwnd != overlay_hwnd:
-                        # Windows' standard maximize/fullscreen toggle is F11 for common apps.
-                        self._voice_hotkey("f11")
-                        self.status = "Fullscreen toggle sent to active application"
-                    else:
-                        self.status = "Focus the application you want to toggle fullscreen"
-                except Exception as exc:
-                    self.status = f"Fullscreen toggle failed: {exc}"
-            else:
-                self._voice_hotkey("f11")
-                self.status = "Fullscreen toggle sent to active application"
-            return
-        if low in ("begin dictation", "start dictation", "dictation on", "start typing"):
-            self.begin_focused_dictation()
-            return
-        if low in ("pause dictation", "dictation pause", "hold dictation"):
-            self.focus_dictation_paused = True
-            self.status = "Dictation paused — say 'resume dictation' to continue"
-            return
-        if low in ("resume dictation", "continue dictation", "dictation resume"):
-            self.focus_dictation_paused = False
-            self.focus_dictation_enabled = True
-            self.status = "Dictation resumed"
-            return
-        if low in ("stop dictation", "dictation off", "stop typing"):
-            if dialog is not None and dialog.isVisible():
-                dialog.set_dictation_enabled(False, notify=True)
-            self.end_focused_dictation("")
-            self.status = "Dictation stopped"
-            return
-        dictation_content, ending_dictation = self._strip_end_dictation_phrase(text)
-        if ending_dictation:
-            if dialog is not None and dialog.isVisible() and dialog.dictation_enabled:
-                if dictation_content:
-                    dialog.set_dictation_text(dictation_content, final=True)
-                dialog.set_dictation_enabled(False, notify=True)
-                self.status = "Search dictation ended"
-            elif self.focus_dictation_enabled:
-                self.end_focused_dictation(text)
-            else:
-                self.status = "Dictation is not active"
-            return
-        # Global Freehand gesture commands run before dictation and keep camera inference
-        # alive, matching the thumbs-up gesture toggle rather than pausing the camera.
-        enable_freehand_phrases = {
-            "enable freehand", "enable free hand", "enable freehand gestures", "enable free hand gestures",
-            "turn on freehand", "turn on free hand", "turn freehand on", "turn free hand on",
-            "turn on freehand gestures", "enable gestures",
-        }
-        disable_freehand_phrases = {
-            "disable freehand", "disable free hand", "disable freehand gestures", "disable free hand gestures",
-            "turn off freehand", "turn off free hand", "turn freehand off", "turn free hand off",
-            "turn off freehand gestures", "disable gestures",
-        }
-        if low in enable_freehand_phrases:
-            self._clear_heard_popup()
-            self.set_freehand_gestures_enabled(True)
-            return
-        if low in disable_freehand_phrases:
-            self._clear_heard_popup()
-            self.set_freehand_gestures_enabled(False)
-            return
-
-        # Tracking commands run before search dictation so they always control the
-        # hand-input layer, even when the launcher is open and dictation is enabled.
-        if low in ("pause tracking", "pause hand tracking", "disable hand tracking", "stop hand tracking"):
-            self._clear_heard_popup()
-            self.set_hand_tracking_paused(True)
-            return
-        if low in ("resume tracking", "resume hand tracking", "enable hand tracking", "start hand tracking"):
-            self._clear_heard_popup()
-            self.set_hand_tracking_paused(False)
-            return
-        if low in ("show menu", "toggle menu", "toggle glass menu", "open glass menu", "hide menu", "close glass menu"):
-            self._clear_heard_popup()
-            self._toggle_glass_menu_from_voice()
-            return
-        if low in ("show context", "toggle context", "show context menu", "toggle pinch menu", "open context menu", "hide context", "close context menu"):
-            self._clear_heard_popup()
-            self._toggle_context_menu_from_voice()
-            return
-        # These global commands must run before dictation can place the phrase in
-        # the search field as ordinary text.
-        if low in ("close window", "close active window", "close focused window", "close this window"):
-            self._clear_heard_popup()
-            self.close_focused_window()
-            return
-        if low in ("open user folder", "open my user folder", "open home folder", "open home directory", "open my home folder"):
-            self._clear_heard_popup()
-            self.open_user_folder()
-            return
-        # These broad natural-language requests deliberately go through d1 first,
-        # so its semantic routing is exercised rather than bypassed by exact matching.
-        d1_first = low in ("open start menu", "show apps", "show the apps", "show me apps",
-                           "show running apps", "open apps", "show all apps",
-                           "open documents", "open documents folder", "open downloads",
-                           "open downloads folder", "open desktop folder", "open pictures",
-                           "open pictures folder", "open videos", "open music folder",
-                           "open file explorer", "open explorer", "open files", "open file browser")
-        pc_action = None
-        if d1_first and self._d1_runtime_enabled:
-            try:
-                pc_action = classify_voice_command(text, aliases_for_help())
-            except Exception:
-                pc_action = None
-        if pc_action:
-            self.execute_pc_voice_command(pc_action)
-            return
-        # Vosk's small English acoustic model can hear “pause media” as
-        # “cause media”.  In command mode this phrase has no other meaning;
-        # normal dictation/search routing remains unaffected.
-        media_transcript = {
-            "cause media": "pause media",
-            "cause the media": "pause media",
-            "cause music": "pause music",
-            "cause playback": "pause media",
-            "pause the media": "pause media",
-        }.get(low, low)
-        pc_action = match_pc_command(media_transcript)
-        if pc_action:
-            self.execute_pc_voice_command(pc_action)
-            return
-        navigation_command = parse_navigation_command(text)
-        if navigation_command:
-            self.execute_navigation_voice_command(navigation_command)
-            return
-        # A phrase that clearly asks to select/open a file, folder, or drive must
-        # never be sent to the generative assistant. That fallback can speak model
-        # output verbatim (including code) when speech recognition mangles a name.
-        if is_navigation_intent(text):
-            self._clear_heard_popup()
-            self.status = "I couldn't identify that file or folder. Try ‘select the llama.cpp folder’ or ‘open the Agents folder’."
-            return
-        # d1 interprets less exact natural phrasing; its output is restricted to
-        # supported action IDs and falls through on uncertainty.
-        pc_action = None
-        if self._d1_runtime_enabled:
-            try:
-                pc_action = classify_voice_command(text, aliases_for_help())
-            except Exception:
-                pc_action = None
-        if pc_action in {"new_folder", "create_new_text_file", "create_new_powerpoint"} and not has_explicit_create_prefix(text):
-            # Do not let a fuzzy classifier turn a selected item named "new folder 2"
-            # (or a truncated STT phrase "new folder") into a file-creation action.
-            pc_action = None
-        if pc_action:
-            self.execute_pc_voice_command(pc_action)
-            return
-        if self.focus_dictation_enabled:
-            if self.focus_dictation_paused:
-                return
-            # Final Vosk result commits any words not already streamed from partials.
-            words = self._normalised_dictation_words(text)
-            committed = list(self.focus_dictation_committed_words)
-            if words[:len(committed)] == committed:
-                remainder = words[len(committed):]
-                if remainder:
-                    self._type_focus_text(" ".join(remainder) + " ")
-            elif words and not committed:
-                self._type_focus_text(" ".join(words) + " ")
-            self.focus_dictation_committed_words = []
-            self.focus_dictation_last_partial = ""
-            return
-        if dialog is not None and dialog.isVisible():
-            if low in ("close search", "close search bar", "cancel search", "exit search"):
-                dialog.close()
-                self.status = "Search closed"
-                return
-            if low in ("stop dictation", "dictation off", "stop typing"):
-                dialog.set_dictation_enabled(False, notify=True)
-                return
-            if low in ("stop listening", "voice off", "stop voice control"):
-                dialog.set_dictation_enabled(False, notify=True)
-                self._set_voice_input_enabled(False)
-                self.status = "Voice input off"
-                return
-            if low in ("open top result", "open first result", "open result"):
-                dialog.open_selected()
-                return
-            if dialog.dictation_enabled:
-                dialog.set_dictation_text(text, final=True)
-                self.status = f"Searching for: {text}"
-                return
-        if low in ("search bar", "open search", "open search bar", "search files", "find files", "file search"):
-            self.open_search_bar(from_voice=True)
-            return
-        if "next desktop" in low or "next workspace" in low:
-            self.target_depth = min(2, self.target_depth+1)
-            self.status = "Voice command: next desktop"
-            self.tts.speak("Moved to the next desktop.")
-        elif "previous desktop" in low or "previous workspace" in low:
-            self.target_depth = max(0, self.target_depth-1)
-            self.status = "Voice command: previous desktop"
-            self.tts.speak("Moved to the previous desktop.")
-        elif low in ("home", "go home", "desktop home"):
-            self.target_depth = 0
-            self.status = "Voice command: home desktop"
-            self.tts.speak("Returned to the home desktop.")
-        elif low in ("stop listening", "voice off", "stop voice control"):
-            self._set_voice_input_enabled(False)
-            self.status = "Voice input off"
-            self.tts.speak("Voice input is off.")
-        elif low in ("what can you do", "help", "voice help"):
-            self.status = "Voice commands: enable/disable Freehand, pause/resume tracking, search bar, copy this/copy text, paste here/paste this, show running apps, start text selection, copy image, media playback/volume, window management, file navigation, close window, open folders, stop listening"
-            self.tts.speak("You can say enable Freehand, disable Freehand, pause tracking, resume tracking, begin dictation, end dictation, show menu, show context, search bar, start text selection, copy this, copy text, copy image, paste here, paste this, show running apps, switch window, play pause, next track, previous track, volume up, volume down, mute, unmute, minimize window, maximize window, show desktop, open downloads, create new folder, create new text file, create new powerpoint, select all, undo, redo, close window, or open user folder.")
-        else:
-            # If speech recognition drops the verb and only hears an unprefixed
-            # creation phrase, never infer a destructive/creating action from it.
-            unprefixed_create = re.fullmatch(r"new (?:folder(?: \d+)?|text file|power ?point(?: presentation)?)", low)
-            if unprefixed_create:
-                self.status = "To create an item, start the command with 'create', for example 'create new folder'."
-                return
-            # Other questions may use a compatible local chat API, when present;
-            # unsupported-model errors are explained rather than called network failures.
-            question_start = re.match(r"^(what|why|how|who|when|where|which|can you|could you|do you|is it|are you|tell me|explain|define)\b", low)
-            if (question_start and self._d1_runtime_enabled and not self.focus_dictation_enabled
-                    and not (dialog is not None and dialog.isVisible())):
-                self.status = "Thinking…"
-                self._ask_d1_general_question(text)
-            else:
-                self.status = f"Heard: {text}"
-                self._show_unrecognised_command(text)
 
     def apply_desktop_mode(self):
         """Configure a fullscreen overlay; OS mode passes physical mouse input through."""
@@ -14679,11 +12898,13 @@ try {
             if not self._custom_gesture_mouse_button(action, side):
                 return
         elif action == "toggle_glass_menu":
-            self._toggle_glass_menu_from_voice()
+            self._toggle_glass_menu_from_gesture()
         elif action == "open_search":
-            self.open_search_bar(from_voice=False)
+            self.custom_gesture_message = "Search is now in the separate AI assistant."
+            return
         else:
-            self.execute_pc_voice_command(action)
+            self.custom_gesture_message = ("That command moved to the separate AI assistant: " + action)
+            return
         self.status = f"Gesture {gesture['label']} → {CUSTOM_GESTURE_ACTION_LABELS.get(action, action)}"
         self.custom_gesture_message = self.status
 
@@ -14797,7 +13018,7 @@ try {
         if fired is not None:
             was_garden = (self.desktop_mode == "virtual" and self.virtual_garden_mode)
             lesson = self._onboarding_stage()
-            self._toggle_glass_menu_from_voice()
+            self._toggle_glass_menu_from_gesture()
             if (was_garden and lesson is not None and lesson[0] == "glass_menu" and
                     self.menu_open and self.hub_visible):
                 self._onboarding_complete_step("glass_menu")
@@ -16394,7 +14615,7 @@ try {
         """
         if self.hand_tracking_notice_until != float("inf"):
             return 1.0
-        signature = (self.hand_tracking_notice_text, bool(self.hand_tracking_paused), bool(self.stt_enabled))
+        signature = (self.hand_tracking_notice_text, bool(self.hand_tracking_paused))
         if signature != self._notice_signature:
             self._notice_signature = signature
             self._notice_full_since = now
@@ -16892,6 +15113,14 @@ try {
         """
         if getattr(self, "_capturing_glass_backdrop", False):
             return
+        if getattr(self, "_camera_handover_dialog", None) is not None:
+            # A permission prompt must win over Freehand's frequent topmost
+            # reassertions so mouse/keyboard can reach the Yes/No buttons.
+            return
+        # Whiteboard is a separate topmost interactive surface. Never raise the
+        # translucent fullscreen HUD or SearchHandOverlay above its palette.
+        if self.whiteboard is not None and self.whiteboard.isVisible():
+            return
         if (self._native_context_menu_visual_guard() or
                 self._windows_task_view_active(now)):
             return  # Preserve native context menus and Win+Tab Task View z-order.
@@ -16905,7 +15134,7 @@ try {
                 getattr(self, "_last_linux_geometry_sync_check", 0.0)) >= 0.5:
             self._last_linux_geometry_sync_check = now
             self._sync_linux_fullscreen_geometry()
-        search = getattr(self, "search_dialog", None)
+        search = None
         reassert_interval = 0.40 if search is not None and search.isVisible() else 0.12
         if sys.platform.startswith('win') and _windows_shell_preview_visible(now):
             # Let the hand-only layer reassert above a grouped-app preview.
@@ -16928,7 +15157,7 @@ try {
             # Preserve the app's normal layer ownership when one of its own dialogs is
             # visible: raise the dedicated hand overlay or calibration surface instead
             # of putting the full-screen owner over its own launcher/dialog.
-            search_dialog = getattr(self, "search_dialog", None)
+            search_dialog = None
             search_overlay = getattr(self, "search_hand_overlay", None)
             if search_dialog is not None and search_dialog.isVisible():
                 if search_overlay is None or not search_overlay.isVisible():
@@ -16984,7 +15213,7 @@ try {
 
         if not sys.platform.startswith("win"):
             return
-        search_dialog = getattr(self, "search_dialog", None)
+        search_dialog = None
         search_overlay = getattr(self, "search_hand_overlay", None)
         if (getattr(self, "tli_calibration_window", None) is not None and
                 self.tli_calibration_window.isVisible()):
@@ -17153,7 +15382,7 @@ try {
         # when the display target is much higher than actual capture FPS.
         # Keep the gesture/update timer running independently at its original rate.
         elapsed = now - getattr(self, "_last_scene_repaint", 0.0)
-        search = getattr(self, "search_dialog", None)
+        search = None
         search_visible = bool(search is not None and search.isVisible())
         if search_visible and self.desktop_mode == "os":
             # The separate SearchHandOverlay renders hand/TPI movement. Keeping
@@ -17177,10 +15406,6 @@ try {
             # does not need 90/120 redraws a second for the same menu/indicators.
             ui_fps = effective_hand_visual_fps(self.hand_display_fps,
                                                self.hand_capture_fps)
-            if (sys.platform.startswith("win") and self.desktop_mode == "os" and
-                    getattr(self, "search_hand_overlay", None) is not None and
-                    getattr(self.search_hand_overlay, "_global_hand_layer_active", False)):
-                ui_fps = min(30, ui_fps)
             minimum_interval = 1.0 / ui_fps
         if elapsed < minimum_interval:
             return
@@ -17203,7 +15428,7 @@ try {
             desired_ms = active_frame_ms if hand_present else 66
         else:
             desired_ms = active_frame_ms if hand_present else 100
-        search = getattr(self, "search_dialog", None)
+        search = None
         if search is not None and search.isVisible():
             # Search has a dedicated independently refreshed hand layer.
             # Maintain gestures at ~30Hz without needlessly redrawing the HUD.
@@ -17319,10 +15544,10 @@ try {
             # inject a competing touch (or convert to scroll mid-gesture).
             self._end_two_hand_touch()
             return False
-        search = getattr(self, "search_dialog", None)
+        search = None
         modal = (self._gesture_ui_modal_open() or self.hand_tracking_paused or
                  self.tli_calibration_active_side is not None or
-                 self.hand_calibration_active or self.voice_selection_mode is not None or
+                 self.hand_calibration_active or
                  self.custom_gesture_recording is not None or
                  self.left_click_modifier_active or
                  # A fist clutch or an active drag/scroll takes priority over touch.
@@ -17542,6 +15767,51 @@ try {
 
         return False
 
+    def _sync_camera_handover_prompt(self):
+        """Ask once per Windows camera session, without blocking tracker or Qt."""
+        if not sys.platform.startswith('win'):
+            return
+        request = str(getattr(self.tracker, 'camera_handover_request', '') or '')
+        dialog = self._camera_handover_dialog
+        if not request:
+            if dialog is not None:
+                self._camera_handover_dialog = None
+                dialog.close()
+                dialog.deleteLater()
+            return
+        if dialog is not None or self.tracker.camera_handover_response is not None:
+            # After a click the capture worker processes the answer on its next
+            # camera-ownership check; never recreate the dialog in that gap.
+            return
+        box = QMessageBox(self)
+        box.setWindowTitle('Freehand · Camera Access')
+        box.setIcon(QMessageBox.Question)
+        box.setText(f'{request} wants to use the camera.')
+        box.setInformativeText(
+            'Allow Freehand to release the webcam?\n\n'
+            'Hand tracking will pause while the other application is using it, '
+            'then resume automatically when the camera is available.')
+        allow = box.addButton('Hand Over Camera', QMessageBox.AcceptRole)
+        keep = box.addButton('Keep Freehand Camera', QMessageBox.RejectRole)
+        box.setDefaultButton(allow)
+        box.setWindowFlags(box.windowFlags() | Qt.WindowStaysOnTopHint | Qt.Dialog)
+        box.setAttribute(Qt.WA_DeleteOnClose, False)
+        self._camera_handover_dialog = box
+
+        def answered(_result, popup=box, yes_button=allow):
+            if self._camera_handover_dialog is popup:
+                self._camera_handover_dialog = None
+            if self.tracker.camera_handover_request:
+                accepted = popup.clickedButton() is yes_button
+                self.tracker.camera_handover_response = accepted
+                self.status = ('Handing camera to the other application' if accepted
+                               else 'Freehand keeping camera control')
+            popup.deleteLater()
+        box.finished.connect(answered)
+        box.show()
+        box.raise_()
+        box.activateWindow()
+
     def update_scene(self):
         """Mutually-exclusive quick clicks, direct fist manipulation, and Pinch Menu gestures."""
         # Track which hand toggled this frame so only that hand's gesture processing pauses.
@@ -17549,6 +15819,7 @@ try {
         self._timer_during_sound_seen_keys.clear()
         self._remember_external_foreground_window()
         now = time.monotonic()
+        self._sync_camera_handover_prompt()
         if self.desktop_mode == "os" and self._native_context_menu_block_active(now):
             # The right-click was already emitted; never reinterpret its held
             # selection pinch as a click on (and instant dismissal of) Explorer.
@@ -17560,7 +15831,36 @@ try {
         scroll_dt = max(0.0, min(0.05, now - previous_scene_time))
         self._last_update_scene_time = now
         self._maintain_native_topmost(now)
-        self._sync_wake_word_entry()
+        board = getattr(self, "whiteboard", None)
+        # The standalone board owns its topmost surface until it closes. Do
+        # not spin on Window.raise_(): the user's rounded-corner masks must
+        # remain above it on X11, and file dialogs must be able to appear.
+        camera_yielded = self.tracker.camera_yielded
+        if camera_yielded != self._previous_camera_yielded:
+            self._previous_camera_yielded = camera_yielded
+            if camera_yielded:
+                # Immediately release native contacts and held mouse buttons.
+                # The camera can vanish between two hand-tracking frames.
+                self._end_two_hand_touch()
+                for side in ('left', 'right'):
+                    self._cancel_side_interactions_for_tracking_pause(side)
+                    self.side_cursor_positions[side] = None
+                    self.smoothed_side_cursor_positions[side] = None
+                    self.hand_positions[side] = []
+                self.gesture_owner = self.pointer_side = self.canvas_active_side = None
+                self.tli_overrides = {}
+                self.active_push_sides.clear()
+                self._sync_scroll_cursor_visibility()
+                owner = self.tracker.camera_priority_owner or 'another application'
+                self.status = f'Camera released to {owner}; tracking resumes automatically'
+                self.hand_tracking_notice_text = 'Camera in use by another app'
+                self.hand_tracking_notice_until = now + 5.0
+            else:
+                if self.hand_tracking_paused:
+                    self.status = 'Camera available — hand tracking remains manually paused'
+                else:
+                    self.status = 'Camera available — Freehand hand tracking resumed'
+                    self._refresh_hand_tracking_notice(now, show_enabled=True)
         if self.hand_tracking_paused:
             self._end_two_hand_touch()
             self._sync_scroll_cursor_visibility()
@@ -17725,7 +16025,7 @@ try {
                         self.hand_tracking_notice_until = now + 5.0
                     else:
                         self._refresh_hand_tracking_notice(now)
-                    self.tts.speak(f"{side} {state}.")
+                    self.status = f"{side.title()} hand {state}."
                     if self._onboarding_in_garden():
                         lesson = self._onboarding_stage()
                         if not enabled and lesson is not None and lesson[0] == "peace_disabled":
@@ -17855,7 +16155,7 @@ try {
             # Treat the open glass menu/settings as a gesture-modal surface. A hand
             # outside the visible panel may still be tracked/rendered, but its pose
             # cannot start a pinch timer, drag, scroll, or click through to an app.
-            search_surface_active = (self.search_dialog is not None and self.search_dialog.isVisible())
+            search_surface_active = False
             clipboard_drag_in_progress = self.floating_clipboard_drag_state.get(side) is not None
             if (self.menu_open and self.hub_visible and not search_surface_active and
                     not self._canvas_menu_panel_contains(cursor) and
@@ -17935,7 +16235,7 @@ try {
 
         # A pinch outside the visible Search launcher dismisses it, and is consumed so
         # it cannot activate anything underneath the window.
-        search_dialog = getattr(self, "search_dialog", None)
+        search_dialog = None
         if search_dialog is not None and search_dialog.isVisible():
             try:
                 top_left = self.mapFromGlobal(search_dialog.mapToGlobal(QPoint(0, 0)))
@@ -17964,6 +16264,17 @@ try {
             self.active_push_sides = set()
             self.depth += (self.target_depth-self.depth)*0.16
             self.update()
+            self._stop_inactive_timer_during_sounds()
+            return
+
+        board = getattr(self, "whiteboard", None)
+        if board is not None and board.isVisible():
+            # WHITEBOARD is modal to every gesture backend (native touch,
+            # pinch menu, fist scroll, custom gestures, OS mouse). Drawing is
+            # handled directly from the already-calibrated TPI positions.
+            board.handle_hand_frame(cursor_points, poses)
+            self.pointer_side = None
+            self.active_push_sides.clear()
             self._stop_inactive_timer_during_sounds()
             return
 
@@ -18009,28 +16320,6 @@ try {
             if right_pose and not right_pose.get("open", False):
                 self.action_stop_wait_open["right"] = True
                 self.action_stop_open_since["right"] = None
-
-        # Voice-directed text/image lasso owns the mouse while active. Continue to track
-        # and render the TLI, but suppress ordinary gestures until the user says copy/finish/cancel.
-        if self.voice_selection_mode is not None:
-            if self.cursor_lock_priority in cursor_points:
-                self.pointer_side = self.cursor_lock_priority
-            elif ("right" if self.cursor_lock_priority == "left" else "left") in cursor_points:
-                self.pointer_side = "right" if self.cursor_lock_priority == "left" else "left"
-            else:
-                self.pointer_side = None
-            if self.desktop_mode == "os":
-                mouse_side = self.pointer_side
-                if mouse_side not in cursor_points or self.mouse_detached_by_side.get(mouse_side, False):
-                    alternate = "left" if mouse_side == "right" else "right"
-                    mouse_side = alternate if (alternate in cursor_points and
-                                               not self.mouse_detached_by_side.get(alternate, False)) else None
-                if mouse_side in cursor_points:
-                    self._set_os_pointer(cursor_points[mouse_side])
-            self.depth += (self.target_depth-self.depth)*0.16
-            self._request_scene_repaint(now)
-            self._stop_inactive_timer_during_sounds()
-            return
 
         preferred = self.cursor_lock_priority if self.cursor_lock_priority in ("left", "right") else "right"
         nonpreferred = "left" if preferred == "right" else "right"
@@ -19269,17 +17558,14 @@ try {
         self._request_scene_repaint(now)
 
     def closeEvent(self, event):
+        if self.whiteboard is not None:
+            self.whiteboard.release_all_strokes()
+            self.whiteboard.close()
         # Preserve the last active desktop mode even if the user closes Freehand
         # without switching modes or immediately after completing onboarding.
         if self.ui_preferences.get("last_desktop_mode") != self.desktop_mode:
             self.ui_preferences["last_desktop_mode"] = self.desktop_mode
             save_ui_preferences(self.ui_preferences)
-        self.search_index.close()
-        if self._wake_word_save_timer.isActive():
-            self._wake_word_save_timer.stop()
-            self._save_wake_word_preferences()
-        if self._wake_word_training_dialog is not None:
-            self._wake_word_training_dialog.reject()
         self._end_two_hand_touch()
         injector = getattr(self, "_native_touch", None)
         if injector is not None and hasattr(injector, "close"):
@@ -19306,35 +17592,13 @@ try {
             self._cancel_hand_onboarding(announce=False)
         if getattr(self, "tli_calibration_window", None) is not None:
             self._cancel_tli_calibration(announce=False)
-        if self.voice_selection_mode == "text" and pyautogui is not None:
-            try:
-                pyautogui.mouseUp(button="left", _pause=False)
-            except Exception:
-                pass
-        self.voice_selection_mode = None
-        self.voice_lasso_start = None
-        self.focus_dictation_enabled = False
-        self.focus_dictation_committed_words = []
         task_view_timer = getattr(self, "_task_view_key_timer", None)
         if task_view_timer is not None:
             task_view_timer.stop()
-        if getattr(self, "search_hand_overlay", None) is not None:
-            self.search_hand_overlay.sync_timer.stop()
-            self.search_hand_overlay.hide()
-        if self.search_dialog is not None and self.search_dialog.isVisible():
-            self.search_dialog.close()
         for side in ("left", "right"):
             self._end_pinch_drag(side, status=False)
             self._release_fist_mouse(side)
             self.active_action[side] = None
-        self.speech.stop()
-        # Do not leave a CPU-heavy local llama-server running after the app exits.
-        try:
-            stop_d1_server()
-        except Exception:
-            pass
-        self.face_welcome.close()
-        self.tts.close()
         self.tracker.close()
         event.accept()
         app = QApplication.instance()
@@ -19544,17 +17808,6 @@ try {
 
     def wheelEvent(self, event):
         """Scroll the Engine log without scrolling the OS window behind it."""
-        if (self.menu_open and self.settings_open and self.settings_page == "d1"):
-            position = event.position()
-            rect = self._settings_text_rects(page="d1").get("log")
-            if rect is not None and rect.contains(position):
-                ticks = event.angleDelta().y()/120.0
-                if not ticks and not event.pixelDelta().isNull():
-                    ticks = event.pixelDelta().y()/40.0
-                if ticks:
-                    self._scroll_d1_log(round(ticks*3) or (1 if ticks > 0 else -1))
-                    event.accept()
-                    return
         super().wheelEvent(event)
 
     def keyPressEvent(self, event):
@@ -19579,17 +17832,6 @@ try {
                 event.accept()
                 return
             event.accept()
-            return
-        if self.menu_open and self.settings_open and self.settings_page == "d1":
-            if event.key() in (Qt.Key_PageUp, Qt.Key_PageDown):
-                self._scroll_d1_log(12 if event.key() == Qt.Key_PageUp else -12)
-                event.accept()
-                return
-        if event.key() == Qt.Key_Space and event.modifiers() & Qt.ControlModifier:
-            if self.search_dialog is not None and self.search_dialog.isVisible():
-                self.search_dialog.close()
-            else:
-                self.open_search_bar(from_voice=False)
             return
         if event.key() == Qt.Key_Escape:
             self.close()
@@ -19812,16 +18054,8 @@ try {
                 painter.setFont(self._ui_font(max(8, int(10*scale)), QFont.DemiBold))
                 painter.drawText(exit_banner, Qt.AlignCenter, "Quit Freehand")
 
-                labels = [
-                    (("OS DESKTOP" if self.desktop_mode == "virtual" else "VIRTUAL DESKTOP"), cx-116*scale, cy-101*scale, "▣"),
-                    ("GESTURE MAP", cx, cy-101*scale, "✋"),
-                    ("SPEECH COMMANDS", cx+116*scale, cy-101*scale, "≡"),
-                    (("VOICE ON" if self.stt_enabled else "VOICE OFF"), cx-116*scale, cy+79*scale, "🎤"),
-                    ("SETTINGS", cx, cy+79*scale, "⚙"),
-                    ("SEARCH", cx+116*scale, cy+79*scale, "⌕"),
-                ]
-                for label, ox, oy, glyph in labels:
-                    rect = QRectF(ox-49*scale, oy-42*scale, 98*scale, 84*scale)
+                for action, rect, label, glyph in self._main_menu_action_tiles(cx, cy, scale):
+                    ox, oy = rect.center().x(), rect.center().y()
                     # Match the Close button's responsive highlight on every glass-menu
                     # tile. Use the same transformed TLI positions used for hit-testing.
                     hovered = any(
@@ -19840,43 +18074,44 @@ try {
                         tile.setColorAt(1.0, QColor(20, 100, 135, 235))
                         painter.setPen(QPen(QColor(220, 255, 255, 250), 2.0*scale))
                     else:
-                        if label in ("VOICE ON", "VOICE OFF"):
-                            tile.setColorAt(0.0, QColor(55, 170, 95, 205) if self.stt_enabled else QColor(82, 88, 98, 180))
-                            tile.setColorAt(1.0, QColor(18, 92, 48, 225) if self.stt_enabled else QColor(42, 47, 57, 220))
-                            painter.setPen(QPen(QColor(155, 245, 180, 220) if self.stt_enabled else QColor(165, 172, 182, 210), 1.5*scale))
-                        else:
-                            tile.setColorAt(0.0, QColor(125, 245, 250, 145))
-                            tile.setColorAt(1.0, QColor(7, 28, 48, 195))
-                            painter.setPen(QPen(QColor(155, 250, 250, 220), 1.5*scale))
+                        tile.setColorAt(0.0, QColor(125, 245, 250, 145))
+                        tile.setColorAt(1.0, QColor(7, 28, 48, 195))
+                        painter.setPen(QPen(QColor(155, 250, 250, 220), 1.5*scale))
                     painter.setBrush(QBrush(tile))
                     painter.drawRoundedRect(rect, 18*scale, 18*scale)
                     painter.setPen(QColor(230, 255, 255))
-                    icon_rect = QRectF(ox-46*scale, oy-34*scale, 92*scale, 30*scale)
-                    label_rect = QRectF(ox-47*scale, oy-1*scale, 94*scale, 35*scale)
-                    if label == "SPEECH COMMANDS":
-                        # A command-list icon is visually distinct from the live voice/STT waves.
-                        pen = QPen(QColor(230, 255, 255), 2.0*scale, Qt.SolidLine, Qt.RoundCap)
-                        painter.setPen(pen)
-                        for line_i, line_w in enumerate((19, 25, 15)):
-                            yy = oy-27*scale + line_i*7*scale
-                            painter.drawEllipse(QPointF(ox-13*scale, yy), 1.2*scale, 1.2*scale)
-                            painter.drawLine(QPointF(ox-7*scale, yy), QPointF(ox+(line_w-7)*scale, yy))
-                    elif label == "SEARCH":
-                        painter.setPen(QPen(QColor(230, 255, 255), 2.4*scale, Qt.SolidLine, Qt.RoundCap))
-                        painter.setBrush(Qt.NoBrush)
-                        painter.drawEllipse(QRectF(ox-12*scale, oy-31*scale, 17*scale, 17*scale))
-                        painter.drawLine(QPointF(ox+1*scale, oy-18*scale), QPointF(ox+10*scale, oy-9*scale))
-                    else:
-                        painter.setFont(self._ui_font(20, QFont.DemiBold))
-                        painter.drawText(icon_rect, Qt.AlignCenter, glyph)
+                    icon_rect = QRectF(rect.left()+8*scale, oy-34*scale,
+                                       rect.width()-16*scale, 30*scale)
+                    label_rect = QRectF(rect.left()+7*scale, oy-1*scale,
+                                        rect.width()-14*scale, 35*scale)
+                    painter.setFont(self._ui_font(20, QFont.DemiBold))
+                    painter.drawText(icon_rect, Qt.AlignCenter, glyph)
                     painter.setPen(QColor(230, 255, 255))
-                    button_label = label.replace("SPEECH COMMANDS", "SPEECH\nCOMMANDS").replace("VIRTUAL DESKTOP", "VIRTUAL\nDESKTOP")
+                    button_label = label
                     self._draw_fitted_button_label(painter, label_rect, button_label,
                                                    base_size=9, min_size=7, inset=2)
+
+                # One long central tile fits the evenly spaced two-column rows
+                # (top ends at cy-59, bottom begins at cy+37).
+                board_rect = self._main_menu_whiteboard_rect(cx, cy, scale)
+                board_hovered = any(p is not None and board_rect.contains(p)
+                                    for p in self.side_cursor_positions.values())
+                board_gradient = QLinearGradient(board_rect.topLeft(), board_rect.bottomRight())
+                board_gradient.setColorAt(0, QColor(100, 222, 236, 228) if board_hovered
+                                          else QColor(50, 155, 180, 185))
+                board_gradient.setColorAt(1, QColor(20, 110, 146, 238) if board_hovered
+                                          else QColor(9, 48, 78, 222))
+                painter.setPen(QPen(QColor(208, 255, 255) if board_hovered
+                                    else QColor(105, 232, 244), 1.6*scale))
+                painter.setBrush(QBrush(board_gradient))
+                painter.drawRoundedRect(board_rect, 12*scale, 12*scale)
+                painter.setPen(QColor(240, 255, 255))
+                painter.setFont(self._ui_font(12, QFont.DemiBold))
+                painter.drawText(board_rect, Qt.AlignCenter, "✎  WHITEBOARD")
             else:
                 # The four Settings tab captions already name their pages; retain a heading
                 # only for the two reference pages, which have no tab buttons of their own.
-                if self.settings_page in ("gesture_map", "speech_commands"):
+                if self.settings_page in ("gesture_map",):
                     page_titles = {"gesture_map": "GESTURE MAP", "speech_commands": "SPEECH COMMANDS"}
                     painter.setPen(QColor(235, 255, 255))
                     painter.setFont(self._ui_font(16, QFont.DemiBold))
@@ -19892,9 +18127,9 @@ try {
                 painter.drawText(back, Qt.AlignCenter, "← BACK")
 
                 tab_labels = {"interaction": "INTERACTION", "hands": "HANDS", "tli": "TPI",
-                              "notifications": "NOTIFY", "gestures": "GESTURES", "voice": "VOICE",
-                              "d1": "ENGINE", "update": "UPDATE", "virtual": "VIRTUAL", "sounds": "SOUNDS", "search": "SEARCH"}
-                info_pages = ("gesture_map", "speech_commands")
+                              "notifications": "NOTIFY", "gestures": "GESTURES",
+                              "update": "UPDATE", "virtual": "VIRTUAL", "sounds": "SOUNDS"}
+                info_pages = ("gesture_map",)
                 if self.settings_page not in info_pages:
                     for page_name, tab in self._settings_tab_rects(cx, cy, scale).items():
                         selected = page_name == self.settings_page
@@ -19955,69 +18190,15 @@ try {
                             ("Pinch/grip near a slider to adjust it.", False),
                             ("TPI is biased slightly toward the thumb.", False),
                             ("", False),
-                            ("VOICE CONTROL", True),
-                            ("Say 'show menu' or 'show context'.", False),
-                            ("Say 'pause tracking' / 'resume tracking'.", False),
-                            ("Use Speech Commands for the full list.", False),
-                        ],
-                    ]
-                    self._paint_reference_columns(painter, columns, cx, cy, scale)
-
-                elif self.settings_page == "speech_commands":
-                    columns = [
-                        [
-                            ("MENU / TRACKING", True),
-                            ("show menu · show context", False),
-                            ("pause tracking · resume tracking", False),
-                            ("search bar · open search", False),
-                            ("close search · open top result", False),
-                            ("begin dictation · end dictation", False),
-                            ("pause dictation · resume dictation", False),
-                            ("", False),
-                            ("WINDOW MANAGEMENT", True),
-                            ("close window · minimize window", False),
-                            ("maximize window · restore window", False),
-                            ("switch window · show desktop", False),
-                            ("snap window left · snap window right", False),
-                            ("fullscreen", False),
-                            ("", False),
-                            ("FILES / APPS", True),
-                            ("open file explorer · open user folder", False),
-                            ("open downloads · open documents", False),
-                            ("open desktop folder · open pictures", False),
-                            ("open videos · open music folder", False),
-                            ("open notepad · open calculator", False),
-                        ],
-                        [
-                            ("EDITING / SELECTION", True),
-                            ("copy this · copy selection · cut this", False),
-                            ("paste · paste here · select all", False),
-                            ("undo · redo", False),
-                            ("start text selection", False),
-                            ("finish selection · cancel selection", False),
-                            ("copy image · start image lasso", False),
-                            ("copy this to finish a lasso", False),
-                            ("", False),
-                            ("MEDIA / AUDIO", True),
-                            ("play pause · next track", False),
-                            ("previous track · volume up/down", False),
-                            ("mute · unmute", False),
-                            ("", False),
-                            ("FILE / APP NAVIGATION", True),
-                            ("create new folder · create new text file", False),
-                            ("create new powerpoint · new tab · close tab", False),
-                            ("go back · go forward · go up", False),
-                            ("refresh · rename selected", False),
-                            ("delete selected", False),
-                            ("", False),
-                            ("Commands are local; availability can", False),
-                            ("depend on your OS and active app.", False),
+                            ("GESTURE CONTROL", True),
+                            ("Show Glass Menu with the two-TPI gesture.", False),
+                            ("Use Pinch Menu for clipboard and right-click.", False),
                         ],
                     ]
                     self._paint_reference_columns(painter, columns, cx, cy, scale)
 
                 elif self.settings_page in ("interaction", "hands", "tli", "gestures",
-                                            "notifications", "voice", "update", "d1", "virtual", "sounds", "search"):
+                                            "notifications", "update", "virtual", "sounds"):
                     # Every control below is placed by _settings_layout(), the same
                     # geometry used for click hit-testing and hover/press feedback.
                     controls = self._settings_control_rects(cx, cy, scale)
@@ -20240,64 +18421,6 @@ try {
                                                        "Select a row to cycle through six screen positions.\nChanges save automatically.",
                                                        base_size=max(7, int(8*scale)), min_size=6)
 
-                    elif self.settings_page == "voice":
-                        tts_toggle = controls["tts_toggle"]
-                        voice_button = controls["voice_cycle"]
-                        painter.setBrush(QBrush(QColor(55, 145, 82, 225) if self.tts.enabled else QColor(75, 80, 89, 205)))
-                        painter.setPen(QPen(QColor(155, 245, 180, 220) if self.tts.enabled else QColor(155, 162, 172, 200), 1.5*scale))
-                        painter.drawRoundedRect(tts_toggle, 10*scale, 10*scale)
-                        painter.setBrush(QBrush(QColor(25, 95, 115, 225)))
-                        painter.setPen(QPen(QColor(140, 230, 240, 215), 1.5*scale))
-                        painter.drawRoundedRect(voice_button, 10*scale, 10*scale)
-                        painter.setPen(QColor(240, 253, 255))
-                        self._draw_fitted_button_label(painter, tts_toggle, "LOCAL TTS  ·  "+("ON" if self.tts.enabled else "OFF"), base_size=label_size, min_size=6, inset=12*scale)
-                        self._draw_fitted_button_label(painter, voice_button, "VOICE  ·  "+str(self.tts.settings.get("voice", "bf_emma")).upper()+"  ·  CLICK TO CHANGE", base_size=label_size, min_size=6, inset=12*scale)
-
-                        test_button = controls["test_voice"]
-                        face_button = controls["face_welcome"]
-                        streamtts_config_button = controls["streamtts_config"]
-                        for rect in (test_button, face_button, streamtts_config_button):
-                            painter.setBrush(QBrush(QColor(10, 47, 67, 225)))
-                            painter.setPen(QPen(QColor(140, 230, 240, 210), 1.5*scale))
-                            painter.drawRoundedRect(rect, 10*scale, 10*scale)
-                        painter.setPen(QColor(240, 253, 255))
-                        self._draw_fitted_button_label(painter, test_button, "TEST VOICE", base_size=label_size, min_size=6, inset=12*scale)
-                        face_label = ("FACE WELCOME  ·  " + self.face_welcome.profile_name() + "  ·  MANAGE" if self.face_welcome.has_profile()
-                                      else "ENROL FACE FOR WELCOME-BACK")
-                        self._draw_fitted_button_label(painter, face_button, face_label, base_size=label_size, min_size=6, inset=12*scale)
-                        self._draw_fitted_button_label(painter, streamtts_config_button, "OPEN STREAMTTS CONFIG", base_size=label_size, min_size=6, inset=12*scale)
-                        painter.setPen(QColor(170, 215, 225, 230))
-                        caption = text_rects.get('wake_word_caption')
-                        if caption is not None:
-                            painter.setPen(QColor(196, 238, 242))
-                            painter.setFont(self._ui_font(9, QFont.DemiBold))
-                            painter.drawText(caption, Qt.AlignVCenter | Qt.AlignLeft,
-                                             'WAKE-WORD NAME   ·   EMPTY = DISABLED')
-                        train_rect = controls['wake_word_train']
-                        enabled_name = self.ui_preferences.get('wake_word_name', '')
-                        trained = bool(enabled_name and self.ui_preferences.get('wake_word_trained', False))
-                        painter.setBrush(QBrush(QColor(39, 123, 84, 228) if trained else QColor(10, 47, 67, 225)))
-                        painter.setPen(QPen(QColor(155, 245, 185, 215) if trained else QColor(140, 230, 240, 210), 1.5*scale))
-                        painter.drawRoundedRect(train_rect, 10*scale, 10*scale)
-                        painter.setPen(QColor(240, 253, 255))
-                        self._draw_fitted_button_label(painter, train_rect,
-                            'TRAIN WAKE WORD  ·  ' + ('VERIFIED' if trained else '3 RECOGNITIONS'),
-                            base_size=label_size, min_size=6, inset=12*scale)
-                        listen_rect = controls['wake_word_listening_toggle']
-                        listening = bool(self.ui_preferences.get('wake_word_listening', False))
-                        painter.setBrush(QBrush(QColor(39, 123, 84, 228) if listening else QColor(75, 80, 89, 205)))
-                        painter.setPen(QPen(QColor(155, 245, 185, 215) if listening else QColor(155, 162, 172, 200), 1.5*scale))
-                        painter.drawRoundedRect(listen_rect, 10*scale, 10*scale)
-                        painter.setPen(QColor(240, 253, 255))
-                        self._draw_fitted_button_label(painter, listen_rect,
-                            'WAKE-WORD LISTENING  ·  ' + ('ON' if listening else 'OFF'),
-                            base_size=label_size, min_size=6, inset=12*scale)
-                        wake_status = ('Wake standby: microphone listening locally  ·  '
-                                       if listening and trained and not self.stt_enabled and self.speech.running else '')
-                        voice_status = wake_status + f"{self.tts.status}  ·  {self.face_enrollment_status}"
-                        self._draw_wrapped_fitted_text(painter, text_rects["status"], voice_status[:150],
-                                                       base_size=max(6, int(7*scale)), min_size=6)
-
                     elif self.settings_page == "update":
                         action_button = controls["update_action"]
                         downloading = self.update_action_running and self.update_action_mode == "download"
@@ -20338,152 +18461,11 @@ try {
                                                        base_size=max(6, int(7*scale)), min_size=6,
                                                        align=Qt.AlignHCenter | Qt.AlignTop)
 
-                    elif self.settings_page == "search":
-                        self._paint_search_settings_page(painter, controls, text_rects, scale)
-                    elif self.settings_page == "d1":
-                        info = d1_status()
-                        model_key = selected_d1_model()
-                        model_button = controls["d1_model"]
-                        runtime_button = controls["d1_start"]
-                        stop_button = controls["d1_stop"]
-                        retry_button = controls["d1_retry"]
-                        export_button = controls["d1_export_log"]
-                        autostart_button = controls["d1_autostart"]
-                        running = bool(info.get("ready") or info.get("loading"))
-                        model_active = bool(info.get("model_exists"))
-                        retry_active = bool(info.get("error") or info.get("downloading") or not model_active)
-                        button_states = (
-                            (model_button, model_active),
-                            (runtime_button, running),
-                            (stop_button, running),
-                            (retry_button, retry_active),
-                            (export_button, False),
-                            (autostart_button, bool(self.ui_preferences.get("d1_autostart", False))),
-                        )
-                        for rect, active in button_states:
-                            fill = QColor(48, 132, 76, 230) if active else QColor(72, 78, 88, 210)
-                            edge = QColor(155, 245, 180, 230) if active else QColor(155, 165, 178, 190)
-                            painter.setBrush(QBrush(fill))
-                            painter.setPen(QPen(edge, 1.5*scale))
-                            painter.drawRoundedRect(rect, 10*scale, 10*scale)
-                        painter.setPen(QColor(240, 253, 255))
-                        self._draw_fitted_button_label(painter, model_button,
-                                                       "MODEL  ·  " + D1_MODELS[model_key]["label"].upper() + "  ▾",
-                                                       base_size=label_size, min_size=7, inset=10*scale)
-                        self._draw_fitted_button_label(painter, runtime_button, "START / ENSURE RUNNING", base_size=label_size, min_size=6, inset=8*scale)
-                        self._draw_fitted_button_label(painter, stop_button, "STOP LOCAL SERVER", base_size=label_size, min_size=6, inset=8*scale)
-                        self._draw_fitted_button_label(painter, retry_button, "DOWNLOAD / RETRY / START", base_size=label_size, min_size=6, inset=10*scale)
-                        self._draw_fitted_button_label(painter, export_button, "EXPORT ENGINE LOG", base_size=label_size, min_size=6, inset=8*scale)
-                        self._draw_fitted_button_label(painter, autostart_button,
-                                                       "AUTO START: " + ("ON" if self.ui_preferences.get("d1_autostart", False) else "OFF"),
-                                                       base_size=label_size, min_size=6, inset=8*scale)
-                        painter.setPen(QColor(185, 225, 232))
-                        if info.get("downloading"):
-                            state = "DOWNLOADING MODEL FILES…"
-                        elif info.get("loading"):
-                            state = "STARTING LLAMA.CPP SERVER…"
-                        elif info.get("ready"):
-                            state = "LOCAL SERVER: RUNNING"
-                        elif info.get("error"):
-                            state = "STATUS: " + str(info.get("error"))[:90]
-                        else:
-                            state = "LOCAL SERVER: STOPPED / NOT READY"
-                        backend = str(info.get("backend") or "CPU / GPU checking")
-                        if info.get("ready") or info.get("loading"):
-                            state += "\nPROCESSOR: " + backend[:65]
-                        elif info.get("model_exists"):
-                            state += "\nNEXT START: " + backend[:65]
-                        self._draw_wrapped_fitted_text(painter, text_rects["state"], state,
-                                                       base_size=max(7, int(8*scale)), min_size=6)
-                        self._draw_wrapped_fitted_text(painter, text_rects["about"],
-                                                       "D1 is disabled at launch by default; enable AUTO START or press START. "
-                                                       "D1 handles desktop-command decisions via llama.cpp /v1/systemone. "
-                                                       "Open-ended voice conversations need a generative chat model. "
-                                                       "The larger D1 model downloads only if selected.",
-                                                       base_size=max(7, int(8*scale)), min_size=6)
-                        # The server diagnostics fill the right column down to Back.
-                        log_rect = text_rects["log"]
-                        painter.setBrush(QBrush(QColor(3, 10, 20, 220)))
-                        painter.setPen(QPen(QColor(90, 170, 190, 190), 1.0*scale))
-                        painter.drawRoundedRect(log_rect, 8*scale, 8*scale)
-                        signature = (bool(info.get("ready")), bool(info.get("loading")),
-                                     bool(info.get("downloading")), str(info.get("error") or ""),
-                                     bool(info.get("model_exists")), str(info.get("backend") or ""))
-                        if signature != self._last_d1_log_signature:
-                            self._last_d1_log_signature = signature
-                            if info.get("error"):
-                                self._log_d1_ui("ERROR: " + str(info.get("error"))[:120])
-                            elif info.get("downloading"):
-                                self._log_d1_ui("Downloading model files…")
-                            elif info.get("loading"):
-                                self._log_d1_ui("Starting local runtime…")
-                            elif info.get("ready"):
-                                self._log_d1_ui("Local server ready")
-                            elif info.get("model_exists"):
-                                self._log_d1_ui("Model files available; server stopped")
-                            else:
-                                self._log_d1_ui("Model files missing; use Download / Retry / Start")
-                        # Draw only the visible lines. The scroll offset is measured
-                        # from the newest line (0 follows live output); wheel, arrows
-                        # and pinch controls all share this state.
-                        log_lines = self._d1_log_lines()
-                        painter.setFont(self._ui_font(7, QFont.Normal))
-                        fm = painter.fontMetrics()
-                        line_height = max(11.0*scale, float(fm.height())+2.0*scale)
-                        text_area = log_rect.adjusted(9.0*scale, 27.0*scale,
-                                                      -19.0*scale, -8.0*scale)
-                        visible = max(1, int(text_area.height()//line_height))
-                        self._d1_log_visible_count = visible
-                        self._d1_log_total_count = len(log_lines)
-                        maximum = max(0, len(log_lines)-visible)
-                        self.d1_log_scroll_lines = min(maximum, max(0, self.d1_log_scroll_lines))
-                        end_line = max(0, len(log_lines)-self.d1_log_scroll_lines)
-                        first_line = max(0, end_line-visible)
-                        painter.save()
-                        painter.setClipRect(text_area)
-                        painter.setPen(QColor(190, 222, 230))
-                        baseline = text_area.top()+float(fm.ascent())
-                        for index in range(first_line, end_line):
-                            display = fm.elidedText(log_lines[index], Qt.ElideRight,
-                                                    max(12, int(text_area.width())))
-                            painter.drawText(QPointF(text_area.left(), baseline), display)
-                            baseline += line_height
-                        painter.restore()
-                        painter.setPen(QColor(185, 225, 232))
-                        painter.setFont(self._ui_font(7, QFont.DemiBold))
-                        painter.drawText(log_rect.adjusted(9*scale, 3*scale, -72*scale, -4*scale),
-                                         Qt.AlignLeft | Qt.AlignTop, "ENGINE LOG")
-                        # Two small arrows make it scrollable with hand input even
-                        # when the operating system owns the mouse wheel.
-                        for name, glyph in (("d1_log_up", "▲"), ("d1_log_down", "▼")):
-                            button = controls[name]
-                            painter.setBrush(QBrush(QColor(18, 52, 73, 220)))
-                            painter.setPen(QPen(QColor(105, 191, 207, 185), 1*scale))
-                            painter.drawRoundedRect(button, 4*scale, 4*scale)
-                            painter.setPen(QColor(229, 248, 250))
-                            painter.drawText(button, Qt.AlignCenter, glyph)
-                        # Scrollbar illustrates position and remaining history.
-                        track = QRectF(log_rect.right()-12*scale,
-                                       text_area.top(), 5*scale, text_area.height())
-                        painter.setPen(Qt.NoPen)
-                        painter.setBrush(QBrush(QColor(47, 78, 96, 180)))
-                        painter.drawRoundedRect(track, 2.5*scale, 2.5*scale)
-                        if len(log_lines) > visible:
-                            ratio = visible/len(log_lines)
-                            thumb_h = max(17.0*scale, track.height()*ratio)
-                            amount = 1.0 - self.d1_log_scroll_lines/max(1, maximum)
-                            thumb_y = track.top() + (track.height()-thumb_h)*amount
-                            painter.setBrush(QBrush(QColor(116, 216, 234, 230)))
-                            painter.drawRoundedRect(QRectF(track.x(), thumb_y, track.width(), thumb_h),
-                                                    2.5*scale, 2.5*scale)
-
                     if self.settings_page == "gestures" and self.custom_gesture_dropdown is not None:
                         # Painted after the sliders so the open list sits on top of them.
                         self._paint_custom_gesture_dropdown(painter, cx, cy, scale)
                     if self.settings_page == "sounds":
                         self._paint_sound_dropdown(painter, cx, cy, scale)
-                    if self.settings_page == "d1" and self.d1_model_dropdown_open:
-                        self._paint_d1_model_dropdown(painter, cx, cy, scale)
             painter.restore()
             # Fade the gesture-map sheet together with the glass panel, not at
             # full opacity while the menu is still emerging.
@@ -20521,25 +18503,13 @@ try {
                 painter.drawLine(QPointF(x-3, y), QPointF(x+3, y))
                 painter.drawLine(QPointF(x, y-3), QPointF(x, y+3))
 
-        # When Search is open, the dedicated topmost SearchHandOverlay is the single
-        # owner of hands/TPIs/timers/Pinch Menu. Painting the same layer here too causes
-        # offset duplicate/ghost hands, often noticed around the screen centre.
-        search_overlay = getattr(self, "search_hand_overlay", None)
-        search_dialog = getattr(self, "search_dialog", None)
-        search_overlay_draws_hand_layer = bool(
-            search_overlay is not None and search_overlay.isVisible() and (
-                (search_dialog is not None and search_dialog.isVisible()) or
-                (sys.platform.startswith("win") and
-                 getattr(search_overlay, "_global_hand_layer_active", False))
-            )
-        )
         calibration_window_owns_hand_layer = (
             (self.tli_calibration_active_side is not None and
              self.tli_calibration_window is not None and self.tli_calibration_window.isVisible()) or
             (self.hand_calibration_active and self.hand_calibration_window is not None and
              self.hand_calibration_window.isVisible())
         )
-        if not search_overlay_draws_hand_layer and not calibration_window_owns_hand_layer:
+        if not calibration_window_owns_hand_layer:
             # The floating Pinch Menu (and the completed gesture ring fading away as it
             # fades in) is painted first, so the virtual hand and its TLI draw on top of it.
             for side in ("left", "right"):
@@ -20656,32 +18626,11 @@ try {
                 "LEFT HAND FIST: MODIFIER  ·  LEFT OR RIGHT HAND PINCH: CLICK  ·  GRAB & DRAG: SCROLL PAGE")
             painter.restore()
 
-        if self.voice_selection_mode is not None and self.voice_lasso_start is not None:
-            end_global = self._current_tli_global_position()
-            start_local = self.mapFromGlobal(QPoint(round(self.voice_lasso_start.x()), round(self.voice_lasso_start.y())))
-            end_local = self.mapFromGlobal(end_global)
-            selection_rect = QRectF(start_local, end_local).normalized()
-            painter.setPen(QPen(QColor(100, 230, 255, 235), 2, Qt.DashLine))
-            painter.setBrush(QBrush(QColor(40, 170, 220, 38)) if self.voice_selection_mode == "image" else Qt.NoBrush)
-            if self.voice_selection_mode == "image":
-                painter.drawRect(selection_rect)
-                hint = "IMAGE LASSO · SAY 'COPY THIS'"
-            else:
-                painter.drawLine(start_local, end_local)
-                hint = "TEXT SELECTION · SAY 'COPY THIS'"
-            label = QRectF(selection_rect.left(), max(4, selection_rect.top()-28), 245, 24)
-            painter.setPen(Qt.NoPen)
-            painter.setBrush(QBrush(QColor(5, 20, 33, 220)))
-            painter.drawRoundedRect(label, 6, 6)
-            painter.setPen(QColor(210, 250, 255))
-            painter.setFont(self._ui_font(9, QFont.DemiBold))
-            painter.drawText(label.adjusted(7, 0, -5, 0), Qt.AlignVCenter | Qt.AlignLeft, hint)
-
-        # Keep the active Tap Location Indicator above the Pinch Menu glass and buttons,
-        # so users can always see precisely which item is under their hand. When Search's
-        # topmost overlay owns the hand layer, it already paints this final TLI; repeating it
-        # on the main window can create a fixed-centre ghost ring during menu gestures.
-        if not search_overlay_draws_hand_layer:
+        # Keep the active Tap Location Indicator above the Pinch Menu glass and buttons.
+        # Freehand now owns the hand layer directly: SearchHandOverlay belongs to the
+        # separate assistant and its removed state must never be consulted here.
+        # A dedicated calibration window is the only case that owns this layer.
+        if not calibration_window_owns_hand_layer:
             for side in ("right", "left"):
                 if not self.fist_action_menu_open.get(side):
                     continue
@@ -20820,68 +18769,6 @@ try {
         # floating clipboard and all later glass-menu toggles.
         painter.save()
         painter.setOpacity(painter.opacity()*self._startup_notification_opacity_at(now))
-        # Small persistent on-state badges for dictation and speech recognition.
-        # Their screen anchors are independently configurable on the Notifications page.
-        search_dictation_active = bool(self.search_dialog is not None and
-                                       self.search_dialog.isVisible() and
-                                       self.search_dialog.dictation_enabled)
-        dictation_active = bool(self.focus_dictation_enabled or search_dictation_active)
-        active_indicators = []
-        if dictation_active:
-            active_indicators.append(("🎤>_", "dictation_indicator_position", QColor(104, 235, 180, 255)))
-        if self.stt_enabled:
-            active_indicators.append(("🎤", "stt_indicator_position", QColor(110, 220, 250, 255)))
-        elif (self.ui_preferences.get('wake_word_listening', False) and
-              self._has_trained_wake_word() and self.speech.running):
-            active_indicators.append(("WAKE", "stt_indicator_position", QColor(195, 205, 135, 255)))
-        for indicator_text, position_key, accent in active_indicators:
-            indicator_rect = self._notification_rect(
-                self.ui_preferences.get(position_key, "top-left" if position_key == "dictation_indicator_position" else "top-right"),
-                72 if indicator_text == "🎤" else 82, 28, margin=18)
-            painter.save()
-            # These are critical live-state indicators: always fully opaque, even
-            # when the rest of the notification stack fades into the background.
-            painter.setPen(QPen(accent, 1.2))
-            bg = QColor(5, 18, 32, 205)
-            painter.setBrush(QBrush(bg))
-            painter.drawRoundedRect(indicator_rect, 12, 12)
-            painter.setPen(QColor(235, 252, 255, 250))
-            painter.setFont(self._ui_font(8, QFont.DemiBold))
-            painter.drawText(indicator_rect, Qt.AlignCenter, indicator_text)
-            painter.restore()
-
-        if self.stt_enabled:
-            if self.heard_popup_mode == "unrecognised":
-                transcript = self.heard_popup_message or "Unrecognised Command"
-            else:
-                transcript = self.speech_partial or (f"Heard: {self.last_speech}" if self.last_speech else "Listening locally…")
-            pill_w = min(width-48, max(300, min(760, 18 + len(transcript)*8)))
-            heard_position = self.ui_preferences.get("heard_bar_position", "bottom-center")
-            pill = self._stacked_notification_rect(heard_position, pill_w, 34,
-                                                   notification_stack_offsets, margin=18)
-            now_mono = time.monotonic()
-            if self.heard_popup_mode == "unrecognised" and now_mono < self.heard_popup_shake_until:
-                # math is imported at module level. A local "import math" here made
-                # math a local name for this whole method, so the window-drag sparkle
-                # animation earlier in the frame raised UnboundLocalError mid-paint.
-                shake = int(math.sin(now_mono * 48.0) * 4.0)
-                pill.translate(shake, 0)
-            painter.save()
-            # The Heard / transcript pill is a live STT indicator: keep it fully opaque
-            # while speech recognition is enabled, independent of notification fading.
-            if self.heard_popup_mode == "unrecognised":
-                painter.setPen(QPen(QColor(255, 86, 92, 245), 1.5))
-                painter.setBrush(QBrush(QColor(74, 12, 20, 225)))
-                painter.setPen(QColor(255, 225, 226))
-            else:
-                painter.setPen(QPen(QColor(115, 220, 235, 205), 1.2))
-                painter.setBrush(QBrush(QColor(5, 18, 32, 148)))
-                painter.setPen(QColor(224, 250, 255))
-            painter.drawRoundedRect(pill, 14, 14)
-            painter.setFont(self._ui_font(9, QFont.DemiBold))
-            painter.drawText(pill.adjusted(12, 0, -12, 0), Qt.AlignVCenter | Qt.AlignLeft, transcript)
-            painter.restore()
-
         # Persistent per-hand status cards. Keep them near the screen edges so they
         # don't obscure the centred controls banner; the modifier badge occupies the
         # centre only while the left-fist modifier is active.
@@ -20997,10 +18884,10 @@ try {
             # hub anchor as the actual controls rather than the screen centre.
             cx, cy = self.hub_pos.x()*self.width(), self.hub_pos.y()*self.height()
             hovered_settings_rects = [self._settings_back_rect(cx, cy, scale)]
-            if self.settings_page not in ("gesture_map", "speech_commands"):
+            if self.settings_page not in ("gesture_map",):
                 hovered_settings_rects.extend(self._settings_tab_rects(cx, cy, scale).values())
             page = self.settings_page
-            if page not in ("gesture_map", "speech_commands"):
+            if page not in ("gesture_map",):
                 # Same rectangles the page paints and hit-tests (see _settings_layout).
                 hovered_settings_rects.extend(self._settings_control_rects(cx, cy, scale).values())
             for rect in hovered_settings_rects:
@@ -21037,10 +18924,10 @@ try {
                     QRectF(pcx+66*pscale, pcy+35*pscale, 100*pscale, 88*pscale)])
             else:
                 press_rects.append(self._settings_back_rect(pcx, pcy, pscale))
-                if self.settings_page not in ("gesture_map", "speech_commands"):
+                if self.settings_page not in ("gesture_map",):
                     press_rects.extend(self._settings_tab_rects(pcx, pcy, pscale).values())
                 page = self.settings_page
-                if page not in ("gesture_map", "speech_commands"):
+                if page not in ("gesture_map",):
                     press_rects.extend(self._settings_control_rects(pcx, pcy, pscale).values())
                 if page == "gestures":
                     layout = self._custom_gesture_layout(pcx, pcy, pscale)
@@ -21060,20 +18947,37 @@ try {
                 painter.restore()
 
         painter.end()
-        if self.menu_open and self.hub_visible:
-            self._startup_glass_frame_painted = True
+        # The main overlay has completed a paint pass. On first startup the glass
+        # panel is open and has been prepared for its synced reveal; if a gesture
+        # closed it before the splash minimum elapsed, the successful frame must
+        # still release the splash instead of trapping it permanently on-screen.
+        self._startup_glass_frame_painted = True
+
+
+def _freehand_camera_ready_to_reveal(tracker, now=None):
+    """Wait for a real inference frame but never strand the splash on hardware.
+
+    Empty camera view is normal: no physical hand needs to be in sight. A
+    separate app owning the camera, a failed driver/model, or more than seven
+    seconds spent starting it are all valid reasons to reveal the usable UI
+    and allow Freehand's background camera retries to continue.
+    """
+    now = time.monotonic() if now is None else float(now)
+    return bool(
+        tracker.first_frame_ready or tracker.camera_yielded or
+        tracker.initialization_error or now - tracker.started_at >= 7.0
+    )
 
 
 def main():
     app = QApplication.instance() or QApplication(sys.argv)
     app.setQuitOnLastWindowClosed(False)
-    # The splash is already visible, even if downloading initial camera models
-    # blocks the GUI thread before the main fullscreen overlay is constructed.
-    ensure_models()
+    # The camera worker was started before the large UI class was defined.
+    # Model download and hand tracking initialization must NEVER block this
+    # GUI thread; the branded splash remains responsive throughout both.
     # Shared tactile pressed feedback for every native button in the application.
     app.setStyleSheet("QPushButton:pressed, QToolButton:pressed { background-color: rgba(75, 205, 235, 210); border: 2px solid #b9f5ff; padding-top: 2px; padding-left: 2px; }")
-    # The main overlay uses Qt.Tool and the search launcher is a child QDialog;
-    # closing the launcher must never terminate the entire Spatial Desktop process.
+    # Keep the hand overlay alive when auxiliary whiteboard dialogs close.
     app.setQuitOnLastWindowClosed(False)
     window = SpatialDesktop()
     window.showFullScreen()
@@ -21089,10 +18993,14 @@ def main():
         splash = _FREEHAND_BOOT_SPLASH
         if splash is None or _FREEHAND_SPLASH_EXIT_ANIMATION is not None:
             return
-        if (window.isVisible() and window.menu_open and window.hub_visible
+        elapsed = time.monotonic() - _FREEHAND_SPLASH_SHOWN_AT
+        # A successful inference frame means the camera AND landmark model
+        # are ready. If the camera is unavailable, fall back rather than
+        # hiding the UI behind a forever-running splash screen.
+        if (window.isVisible()
                 and getattr(window, "_startup_glass_frame_painted", False)
-                and time.monotonic() - _FREEHAND_SPLASH_SHOWN_AT >=
-                    _FREEHAND_SPLASH_MIN_VISIBLE_SECONDS):
+                and elapsed >= _FREEHAND_SPLASH_MIN_VISIBLE_SECONDS
+                and _freehand_camera_ready_to_reveal(window.tracker)):
             # The rendered glass is ready *before* revealing it; synchronise
             # both opacity transitions within the same GUI event-loop turn.
             window._release_startup_glass_menu()
@@ -21121,16 +19029,6 @@ def main():
             QTimer.singleShot(50, _dismiss_splash_after_glass_ready)
 
     QTimer.singleShot(50, _dismiss_splash_after_glass_ready)
-    # Starting llama.cpp may involve process cleanup/model probing. Do it after
-    # the first paint so a slow local engine cannot hold up the desktop overlay.
-    def _boot_engine():
-        try:
-            start_d1_loading(fresh=True)
-        except Exception as exc:
-            print("Local D1 startup failed:", exc, flush=True)
-    if window.ui_preferences.get("d1_autostart", False):
-        QTimer.singleShot(750, lambda: threading.Thread(
-            target=_boot_engine, name="Freehand-D1-startup", daemon=True).start())
     if sys.platform.startswith("linux"):
         QTimer.singleShot(0, repair_linux_app_shortcut)
     sys.exit(app.exec())
