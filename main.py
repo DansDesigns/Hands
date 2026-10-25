@@ -626,6 +626,171 @@ def available_ui_sounds():
     except OSError:
         return []
 
+class _FreehandFastUISoundCache:
+    """Low-latency sound effects backed by decoded PCM, not MCI MP3 playback.
+
+    The bundled UI clips are usually MP3. Qt's asynchronous audio decoder
+    converts them once during startup to small PCM WAV files, then QSoundEffect
+    keeps their playback buffers resident. Failure to decode never prevents
+    startup and retains the old MCI fallback.
+    """
+
+    def __init__(self):
+        from PySide6.QtMultimedia import QSoundEffect, QAudioDecoder
+        self._Effect = QSoundEffect
+        self._Decoder = QAudioDecoder
+        self._effects = {}       # Path -> [two independently playable QSoundEffects]
+        self._pending = {}       # Path -> (decoder, list of PCM pieces, format)
+        self._unavailable = set()
+        self._cache_dir = Path(tempfile.gettempdir()) / "Freehand-UI-PCM"
+
+    def _attach_effect(self, path, wav_path):
+        try:
+            effects = []
+            for _ in range(2):
+                effect = self._Effect(QApplication.instance())
+                effect.setSource(QUrl.fromLocalFile(str(wav_path)))
+                effects.append(effect)
+            self._effects[path] = effects
+        except Exception:
+            self._unavailable.add(path)
+
+    def prewarm(self, filenames):
+        folder = ROOT / "assets" / "sounds"
+        for name in dict.fromkeys(str(n) for n in filenames if n and n != "None"):
+            path = (folder / name).resolve()
+            if (path.parent != folder.resolve() or not path.is_file() or
+                    path in self._effects or path in self._pending or path in self._unavailable):
+                continue
+            ext = path.suffix.casefold()
+            if ext == ".wav":
+                self._attach_effect(path, path)
+            elif ext == ".mp3":
+                try:
+                    stat = path.stat()
+                    key = hashlib.sha256(f"{path}:{stat.st_size}:{stat.st_mtime_ns}".encode()).hexdigest()[:24]
+                    destination = self._cache_dir / (key + ".wav")
+                    if destination.is_file() and destination.stat().st_size > 44:
+                        self._attach_effect(path, destination)
+                        continue
+                    decoder = self._Decoder(QApplication.instance())
+                    chunks = []
+                    state = {"format": None, "bad": False}
+                    self._pending[path] = (decoder, chunks, state)
+
+                    def accept_buffer(p=path, d=decoder, c=chunks, info=state):
+                        try:
+                            while d.bufferAvailable():
+                                buf = d.read()
+                                fmt = buf.format()
+                                if info["format"] is None:
+                                    info["format"] = fmt
+                                if (fmt.sampleRate() != info["format"].sampleRate() or
+                                        fmt.channelCount() != info["format"].channelCount() or
+                                        fmt.sampleFormat() != info["format"].sampleFormat()):
+                                    info["bad"] = True
+                                    return
+                                c.append(bytes(buf.data()))
+                        except Exception:
+                            info["bad"] = True
+
+                    def finalize(p=path, d=decoder, c=chunks, info=state, out=destination):
+                        self._pending.pop(p, None)
+                        try:
+                            import wave
+                            fmt = info["format"]
+                            # Qt/Media Foundation can decode to 16-bit, float,
+                            # 32-bit integer or unsigned 8-bit PCM depending on
+                            # Windows and sound-device drivers.
+                            if info["bad"] or not c or fmt is None:
+                                self._unavailable.add(p)
+                                return
+                            from PySide6.QtMultimedia import QAudioFormat
+                            from array import array
+                            source = b"".join(c)
+                            sample_format = fmt.sampleFormat()
+                            if sample_format == QAudioFormat.SampleFormat.Int16:
+                                samples = source
+                            else:
+                                if sample_format == QAudioFormat.SampleFormat.Float:
+                                    values = array("f")
+                                    values.frombytes(source)
+                                    output = array("h", (int(max(-1.0, min(1.0, v))*32767)
+                                                        if math.isfinite(v) else 0 for v in values))
+                                elif sample_format == QAudioFormat.SampleFormat.Int32:
+                                    values = array("i")
+                                    values.frombytes(source)
+                                    output = array("h", (max(-32768, min(32767, v >> 16))
+                                                        for v in values))
+                                elif sample_format == QAudioFormat.SampleFormat.UInt8:
+                                    output = array("h", ((v-128)*256 for v in source))
+                                else:
+                                    self._unavailable.add(p)
+                                    return
+                                samples = output.tobytes()
+                            self._cache_dir.mkdir(parents=True, exist_ok=True)
+                            tmp = out.with_suffix(".tmp")
+                            with wave.open(str(tmp), "wb") as stream:
+                                stream.setnchannels(fmt.channelCount())
+                                stream.setsampwidth(2)
+                                stream.setframerate(fmt.sampleRate())
+                                stream.writeframes(samples)
+                            os.replace(tmp, out)
+                            self._attach_effect(p, out)
+                        except Exception:
+                            self._unavailable.add(p)
+                        finally:
+                            d.deleteLater()
+
+                    def mark_failed(*_args, p=path, d=decoder):
+                        self._pending.pop(p, None)
+                        self._unavailable.add(p)
+                        d.stop()
+                        d.deleteLater()
+
+                    decoder.bufferReady.connect(accept_buffer)
+                    decoder.finished.connect(finalize)
+                    decoder.errorOccurred.connect(mark_failed)
+                    decoder.setSource(QUrl.fromLocalFile(str(path)))
+                    decoder.start()
+                except Exception:
+                    self._pending.pop(path, None)
+                    self._unavailable.add(path)
+
+    def play(self, path):
+        effects = self._effects.get(path)
+        if not effects:
+            return False
+        try:
+            ready = [effect for effect in effects if effect.isLoaded()]
+            if not ready:
+                return False
+            effect = next((e for e in ready if not e.isPlaying()), ready[0])
+            if effect.isPlaying():
+                effect.stop()
+            effect.play()
+            return True
+        except Exception:
+            return False
+
+
+_FREEHAND_FAST_UI_SOUNDS = None
+
+
+def _freehand_fast_ui_sounds():
+    """Qt audio must be constructed/called on the GUI thread, not the MCI worker."""
+    global _FREEHAND_FAST_UI_SOUNDS
+    if not sys.platform.startswith("win"):
+        return None
+    if _FREEHAND_FAST_UI_SOUNDS is None:
+        try:
+            if QApplication.instance() is not None:
+                _FREEHAND_FAST_UI_SOUNDS = _FreehandFastUISoundCache()
+        except (ImportError, RuntimeError, OSError):
+            return None
+    return _FREEHAND_FAST_UI_SOUNDS
+
+
 class _FreehandWindowsUISoundEngine:
     """Keep short UI clips open in one non-blocking Windows MCI worker.
 
@@ -765,9 +930,16 @@ def _freehand_ui_sound_engine():
 
 
 def _freehand_prewarm_ui_sounds(filenames=None):
+    requested = tuple(DEFAULT_UI_SOUNDS.values() if filenames is None else filenames)
     engine = _freehand_ui_sound_engine()
     if engine is not None:
-        engine.prewarm(DEFAULT_UI_SOUNDS.values() if filenames is None else filenames)
+        engine.prewarm(requested)
+    # Qt must only be called on the UI thread. Prewarm also handles sounds
+    # selected later in Settings; the first play never has to decode on demand.
+    if threading.current_thread() is threading.main_thread():
+        fast = _freehand_fast_ui_sounds()
+        if fast is not None:
+            fast.prewarm(requested)
 
 
 def play_ui_sound(filename, *, stop_event=None):
@@ -782,8 +954,12 @@ def play_ui_sound(filename, *, stop_event=None):
         return
     try:
         if os.name == "nt" and path.suffix.lower() in {".mp3", ".wav"}:
-            # One persistent worker owns preopened MCI devices. Gesture frames
-            # only enqueue a play request (no thread creation or device open).
+            # UI buttons use already-decoded PCM for immediate tactile feedback;
+            # timed sounds retain cancellable MCI playback below.
+            if stop_event is None:
+                fast = _FREEHAND_FAST_UI_SOUNDS
+                if fast is not None and fast.play(path):
+                    return
             engine = _freehand_ui_sound_engine()
             if engine is not None:
                 engine.play(path, stop_event)
@@ -815,7 +991,11 @@ def play_ui_sound(filename, *, stop_event=None):
 # Begin opening short Windows menu sounds while the splash is visible. This is
 # purely background work and does not delay the camera-first initialization.
 if __name__ == "__main__" and os.name == "nt":
-    _freehand_prewarm_ui_sounds()
+    # Leave the camera-first startup order intact: QtMultimedia codecs are
+    # initialised later, after the camera worker has already started.
+    _background_ui_audio = _freehand_ui_sound_engine()
+    if _background_ui_audio is not None:
+        _background_ui_audio.prewarm(DEFAULT_UI_SOUNDS.values())
 
 
 # A one-time accessibility probe at the START of a single pinch drag is used
@@ -1392,6 +1572,33 @@ def _windows_shell_preview_visible(now=None):
         pass
     _windows_shell_preview_visible._cached = (now, found)
     return found
+
+
+
+def _windows_start_menu_active(now=None):
+    """Detect the focused Windows Start shell without scanning every HWND."""
+    if not sys.platform.startswith("win"):
+        return False
+    now = time.monotonic() if now is None else float(now)
+    previous = getattr(_windows_start_menu_active, "_cached", None)
+    if previous is not None and now-previous[0] < 0.09:
+        return previous[1]
+    active = False
+    try:
+        user = ctypes.windll.user32
+        user.GetForegroundWindow.restype = wintypes.HWND
+        hwnd = user.GetForegroundWindow()
+        if hwnd:
+            process = _windows_process_name(hwnd)
+            active = process in ("startmenuexperiencehost.exe", "shellexperiencehost.exe")
+            if not active and process == "explorer.exe":
+                buffer = ctypes.create_unicode_buffer(128)
+                user.GetWindowTextW(wintypes.HWND(hwnd), buffer, len(buffer))
+                active = buffer.value.casefold().strip() == "start"
+    except (OSError, AttributeError, ValueError):
+        pass
+    _windows_start_menu_active._cached = (now, active)
+    return active
 
 
 def _windows_window_uses_native_mouse(screen_point):
@@ -3021,31 +3228,49 @@ def is_fully_open_hand_pose(landmarks, edge_tolerant=False):
     return all(value >= threshold for value in _finger_straightness_values(landmarks))
 
 
-def is_thumb_index_menu_pinch(landmarks, edge_tolerant=False):
-    """Robust thumb/index pinch (index only) with at least two other fingers extended.
+def _real_thumb_index_gap(landmarks):
+    """Camera-space thumb/index contact ratio, completely independent of hand scale.
 
-    The index finger naturally bends while making a pinch, so its straightness must not
-    be a prerequisite. A closed fist still fails because it has fewer than two extended
-    non-index fingers. This makes the timed Pinch Menu much less likely to keep restarting.
+    MediaPipe fingertip Z is relatively noisy when the two fingertips occlude
+    each other. Full Euclidean Z used to reject real contacts even though the
+    physical thumb and index met. Keep some depth discrimination while using
+    the actual camera landmarks, never the shrunken on-screen hand skeleton.
+    """
+    if landmarks is None or len(landmarks) < 21:
+        return float("inf")
+    def coord(point, axis):
+        return float(getattr(point, axis) if hasattr(point, axis) else point["xyz".index(axis)])
+    thumb, index, wrist, middle = (landmarks[i] for i in (4, 8, 0, 9))
+    palm = max(1e-5, math.hypot(coord(wrist, "x")-coord(middle, "x"),
+                                 coord(wrist, "y")-coord(middle, "y")))
+    dx, dy = coord(thumb, "x")-coord(index, "x"), coord(thumb, "y")-coord(index, "y")
+    dz = coord(thumb, "z")-coord(index, "z")
+    return math.sqrt(dx*dx+dy*dy+0.12*dz*dz)/palm
+
+
+def is_thumb_index_menu_pinch(landmarks, edge_tolerant=False):
+    """Detect real thumb-to-index contact using unscaled camera landmarks.
+
+    A slight Z disagreement at occlusion no longer prevents a genuine pinch.
+    The TPI visual position is never used as input. Non-index fingertips must
+    not be the closer contact, and a clenched fist is separately filtered.
     """
     if landmarks is None or len(landmarks) < 21:
         return False
-    # Only the index finger makes the built-in pinch: thumb-to-middle/ring/pinky
-    # pinches are reserved for custom gestures.
-    if not thumb_pinches_index([distance3d(landmarks, 4, tip) for tip in (8, 12, 16, 20)]):
+    gap = _real_thumb_index_gap(landmarks)
+    if gap > (0.32 if edge_tolerant else 0.30):
         return False
-    palm = max(1e-5, distance3d(landmarks, 0, 9))
-    pinch_gap = distance3d(landmarks, 4, 8) / palm
-    # The TPI is a visual pointer, NOT a pinch trigger. The older menu-pose
-    # tolerance (over half a palm length) accepted an index finger merely
-    # passing through the TPI. Require actual thumb/index fingertip proximity.
-    if pinch_gap > 0.29:
-        return False
-    straight = _finger_straightness_values(landmarks)
-    return should_recognize_menu_pinch(normalized_gap=pinch_gap,
-                                       finger_straightness=straight,
-                                       edge_tolerant=edge_tolerant)
-
+    thumb = landmarks[4]
+    palm = max(1e-5, math.hypot(landmarks[0].x-landmarks[9].x,
+                                landmarks[0].y-landmarks[9].y))
+    # A thumb pinching the middle/ring/pinky should never count as an index click.
+    for tip in (12, 16, 20):
+        other = landmarks[tip]
+        other_gap = math.sqrt((thumb.x-other.x)**2 + (thumb.y-other.y)**2 +
+                              0.12*(thumb.z-other.z)**2)/palm
+        if other_gap + 0.075 < gap:
+            return False
+    return True
 
 
 class _HandVisualMotionFilter:
@@ -4345,7 +4570,10 @@ class FreehandWhiteboard(QWidget):
         self.setAttribute(Qt.WA_OpaquePaintEvent, True)
         self.setFocusPolicy(Qt.StrongFocus)
         self.setMouseTracking(True)
-        self.setCursor(Qt.CrossCursor)
+        # The fullscreen board is controlled by visible virtual hands. Keep the
+        # OS pointer hidden without touching the global cursor state: leaving
+        # the board automatically restores the pointer in normal applications.
+        self.setCursor(Qt.BlankCursor)
         self.setWindowTitle("Freehand Whiteboard")
         self.dark_mode = False
         self.background = QColor("#ffffff")
@@ -4594,12 +4822,17 @@ class FreehandWhiteboard(QWidget):
             directory = Path.home()
         proposed = directory / f"Freehand-whiteboard-{datetime.now():%Y%m%d-%H%M%S}.png"
         self._file_dialog_open = True
+        # Show a normal pointer only while the native Save dialog is open so
+        # its folders, filename field, and buttons remain usable with a mouse.
+        # The drawing surface itself always keeps the pointer hidden.
+        self.setCursor(Qt.ArrowCursor)
         # Do not reassert the fullscreen board's Z-order above the Save dialog.
         try:
             chosen, _ = QFileDialog.getSaveFileName(self, "Save whiteboard as PNG", str(proposed),
                                                      "PNG image (*.png)")
         finally:
             self._file_dialog_open = False
+            self.setCursor(Qt.BlankCursor)
         if not chosen:
             self._feedback = "Save cancelled"
             return False
@@ -4732,6 +4965,61 @@ class FreehandWhiteboard(QWidget):
         painter.end()
 
 
+class _FreehandHandVisualOverlay(QWidget):
+    """Mouse-transparent, independent topmost hand-only surface for Windows.
+
+    Explorer's Start menu and grouped-taskbar preview may re-stack above the
+    fullscreen Freehand HUD. A separate tiny-purpose layer can be reasserted
+    without reconfiguring the HUD (which would make it disappear for a frame).
+    """
+
+    def __init__(self, owner):
+        flags = (Qt.Tool | Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint |
+                 Qt.WindowDoesNotAcceptFocus | Qt.WindowTransparentForInput)
+        super().__init__(None, flags)
+        self.owner = owner
+        self.setAttribute(Qt.WA_TranslucentBackground, True)
+        self.setAttribute(Qt.WA_TransparentForMouseEvents, True)
+        self.setAttribute(Qt.WA_ShowWithoutActivating, True)
+        self.setGeometry(owner.geometry())
+
+    def make_native_click_through(self):
+        if not sys.platform.startswith("win"):
+            return
+        try:
+            user = ctypes.windll.user32
+            hwnd = wintypes.HWND(int(self.winId()))
+            get_long = getattr(user, "GetWindowLongPtrW", user.GetWindowLongW)
+            set_long = getattr(user, "SetWindowLongPtrW", user.SetWindowLongW)
+            get_long.argtypes = (wintypes.HWND, ctypes.c_int)
+            get_long.restype = ctypes.c_ssize_t
+            set_long.argtypes = (wintypes.HWND, ctypes.c_int, ctypes.c_ssize_t)
+            set_long.restype = ctypes.c_ssize_t
+            extended = get_long(hwnd, -20)
+            # TOOLWINDOW | TRANSPARENT | LAYERED | NOACTIVATE
+            set_long(hwnd, -20, extended | 0x80 | 0x20 | 0x80000 | 0x08000000)
+        except (OSError, AttributeError, ValueError):
+            pass
+
+    def paintEvent(self, event):
+        owner = self.owner
+        if owner is None or not owner.isVisible():
+            return
+        calibration = (
+            (owner.tli_calibration_window is not None and owner.tli_calibration_window.isVisible()) or
+            (owner.hand_calibration_window is not None and owner.hand_calibration_window.isVisible()))
+        if calibration:
+            return
+        painter = QPainter(self)
+        if not painter.isActive():
+            return
+        try:
+            painter.setRenderHint(QPainter.Antialiasing, True)
+            owner._paint_hand_top_layer(painter, time.monotonic())
+        finally:
+            painter.end()
+
+
 class SpatialDesktop(QWidget):
     def __init__(self):
         super().__init__()
@@ -4837,8 +5125,9 @@ class SpatialDesktop(QWidget):
             save_ui_preferences(self.ui_preferences)
         # Pre-open user-selected audio too; settings can choose custom files.
         # Runs on the persistent audio worker, never on the Qt startup thread.
-        _freehand_prewarm_ui_sounds(self.ui_preferences.get(key, "None")
-                                     for key, _label in SOUND_SETTING_ROWS)
+        selected_sounds = [self.ui_preferences.get(key, "None")
+                           for key, _label in SOUND_SETTING_ROWS]
+        _freehand_prewarm_ui_sounds(selected_sounds)
         self.ui_font_scale = float(self.ui_preferences.get("ui_font_scale", 1.2))
         self.show_gesture_disabled_indicator = bool(
             self.ui_preferences.get("show_gesture_disabled_indicator", True))
@@ -5045,6 +5334,7 @@ class SpatialDesktop(QWidget):
         self._applied_desktop_mode = None
         self._applied_menu_state = None
         self._last_native_topmost_reassert = 0.0
+        self._hand_visual_layer = None  # Windows-only transparent topmost hand layer
         self._windows_virtual_desktop_pinned = False
         self._windows_virtual_desktop_pin_last_attempt = 0.0
         self._windows_virtual_desktop_pin_warning_reported = False
@@ -13862,6 +14152,15 @@ class SpatialDesktop(QWidget):
                 points = display[1]
 
         joints = {i: sp(i) for i in range(21)}
+        # Rendering is user-scaled, recognition is always camera-space. When
+        # camera landmarks say the fingertips actually touch, close residual
+        # smoothed visual gaps as well, so the user sees the contact that fired.
+        if side in ("left", "right") and _real_thumb_index_gap(
+                getattr(self, "hand_positions", {}).get(side)) <= 0.18:
+            shared = QPointF((joints[4].x()+joints[8].x())*0.5,
+                             (joints[4].y()+joints[8].y())*0.5)
+            joints[4] = QPointF(shared)
+            joints[8] = QPointF(shared)
         painter.save()
         painter.setOpacity(painter.opacity() * min(1.0, max(0.10, float(getattr(self, "hand_transparency", 50.0)) / 100.0)))
         darkness = min(1.0, max(0.0, float(getattr(self, "skin_tone_darkness", -50.0))/100.0))
@@ -14819,9 +15118,19 @@ class SpatialDesktop(QWidget):
         # An intentional thumb/index pinch typically leaves middle, ring and
         # little fingers extended. Two clearly folding fingers (or three just
         # starting to fold) indicate a fist being formed, not a pinch.
-        forming_fist = (fingers_closed_pose(landmarks, edge_tolerant=edge_tolerant)
-                         or sum(value < 0.88 for value in straight[1:]) >= 2
-                         or sum(value < 0.91 for value in straight[1:]) == 3)
+        full_fist = fingers_closed_pose(landmarks, edge_tolerant=edge_tolerant)
+        tight_contact = _real_thumb_index_gap(landmarks) <= 0.19
+        independent_finger = any(value >= 0.85 for value in straight[1:])
+        # Curling the ring and little fingers is normal when pinching; it must
+        # not latch the fist guard for 300ms and swallow a deliberate click.
+        real_pinch_override = tight_contact and independent_finger and not full_fist
+        forming_fist = full_fist or (
+            not real_pinch_override and (
+                sum(value < 0.88 for value in straight[1:]) >= 2 or
+                sum(value < 0.91 for value in straight[1:]) == 3))
+        if real_pinch_override:
+            self._forming_fist_pinch_guard[side] = False
+            self._fist_guard_open_since[side] = None
         if forming_fist:
             self._forming_fist_pinch_guard[side] = True
             self._fist_guard_open_since[side] = None
@@ -14854,8 +15163,11 @@ class SpatialDesktop(QWidget):
                 landmarks is None or len(landmarks) < 21):
             self._pinch_pose_confirm_frames[side] = 0
             return False
+        # A real thumb/index pinch is valid even when the ring/pinky curl. A
+        # separate full-fist detector and fist-formation latch guard grabbing.
         straight = _finger_straightness_values(landmarks)
-        if sum(value >= 0.89 for value in straight[1:]) < 2:
+        if (sum(value >= 0.82 for value in straight[1:]) < 1 and
+                _real_thumb_index_gap(landmarks) > 0.18):
             self._pinch_pose_confirm_frames[side] = 0
             return False
         self._pinch_pose_confirm_frames[side] = min(
@@ -15111,6 +15423,22 @@ class SpatialDesktop(QWidget):
         overlay's stacking order periodically, without activating it or stealing
         focus from the launcher or the application under the pointer.
         """
+        layer = getattr(self, "_hand_visual_layer", None)
+        if layer is not None:
+            whiteboard_active = self.whiteboard is not None and self.whiteboard.isVisible()
+            calibration_active = (
+                (self.tli_calibration_window is not None and self.tli_calibration_window.isVisible()) or
+                (self.hand_calibration_window is not None and self.hand_calibration_window.isVisible()))
+            should_show = (getattr(self, "_glass_startup_released", False) and
+                           not whiteboard_active and not calibration_active)
+            if not should_show and layer.isVisible():
+                layer.hide()
+            elif should_show:
+                if not layer.isVisible():
+                    layer.setGeometry(self.geometry())
+                    layer.show()
+                    layer.make_native_click_through()
+                layer.update()
         if getattr(self, "_capturing_glass_backdrop", False):
             return
         if getattr(self, "_camera_handover_dialog", None) is not None:
@@ -15136,10 +15464,12 @@ class SpatialDesktop(QWidget):
             self._sync_linux_fullscreen_geometry()
         search = None
         reassert_interval = 0.40 if search is not None and search.isVisible() else 0.12
-        if sys.platform.startswith('win') and _windows_shell_preview_visible(now):
-            # Let the hand-only layer reassert above a grouped-app preview.
-            # The underlying fullscreen HUD must not jump over that popup.
-            return
+        if sys.platform.startswith('win') and (
+                _windows_shell_preview_visible(now) or _windows_start_menu_active(now)):
+            # Start and grouped-taskbar preview windows can enter a higher
+            # stacking position after Freehand is already running. Raise only
+            # our transparent hand surface promptly, without stealing focus.
+            reassert_interval = 0.045
         if now-self._last_native_topmost_reassert <= reassert_interval:
             return
 
@@ -15272,6 +15602,11 @@ class SpatialDesktop(QWidget):
                                         wintypes.HWND(-1), 0, 0, 0, 0, flags)
             user32.SetWindowPos(wintypes.HWND(int(target.winId())),
                                 wintypes.HWND(-1), 0, 0, 0, 0, flags)
+            # Raise hands LAST, above Freehand's menu, without raising the
+            # full-size transparent HUD over Explorer's interactive surfaces.
+            if layer is not None and layer.isVisible():
+                user32.SetWindowPos(wintypes.HWND(int(layer.winId())),
+                                    wintypes.HWND(-1), 0, 0, 0, 0, flags)
             self._last_native_topmost_reassert = now
         except Exception:
             pass
@@ -16174,8 +16509,7 @@ class SpatialDesktop(QWidget):
                 # A tight thumb/index contact is the left-hand click pose even when the
                 # broad fist classifier overlaps it. It also clears a stale fist latch
                 # from prior noisy frames; the right-hand fist-scroll priority is untouched.
-                palm = max(1e-5, distance3d(landmarks, 0, 9))
-                pinch_gap = distance3d(landmarks, 4, 8) / palm
+                pinch_gap = _real_thumb_index_gap(landmarks)
                 clear_left_pinch = should_prefer_clear_left_pinch_over_fist(
                     is_pinch=raw_pinch, normalized_gap=pinch_gap)
             if side == "right" and raw_fist:
@@ -17600,6 +17934,10 @@ class SpatialDesktop(QWidget):
             self._release_fist_mouse(side)
             self.active_action[side] = None
         self.tracker.close()
+        visual_layer = getattr(self, "_hand_visual_layer", None)
+        if visual_layer is not None:
+            visual_layer.close()
+            self._hand_visual_layer = None
         event.accept()
         app = QApplication.instance()
         if app is not None:
@@ -17870,6 +18208,65 @@ class SpatialDesktop(QWidget):
             if painter is not None and painter.isActive():
                 painter.end()
             self._in_paint_event = False
+
+    def _paint_hand_top_layer(self, painter, now):
+        """Shared visual hand painter, independent of input and visual hand scale."""
+        # Reticle and skeleton use the fixed hand-relative (optionally calibrated) TLI anchor.
+        # During TLI calibration the dedicated target window is the sole visual owner;
+        # painting here as well produced a second, differently transformed skeleton.
+        for side in ("left", "right"):
+            points = self.hand_positions.get(side, [])
+            if not points:
+                continue
+            color = QColor(self.left_click_color if side == "left" else self.right_click_color)
+            # The skeleton is mapped without cursor clamping; joints may leave the
+            # camera-to-screen active rectangle and be clipped by the display itself.
+            # Clamping every joint individually made the skeleton squash against an
+            # artificial wall near the top and bottom of the screen.
+            self._paint_hand_skeleton(painter, points, side)
+            self._paint_gesture_disabled_indicator(painter, points, side)
+            # Keep the virtual skeleton visible when a hand is disabled, but remove
+            # its moving TLI/cursor until peace sign re-enables tracking.
+            if self.gesture_tracking_enabled.get(side, True):
+                cursor = self.side_cursor_positions.get(side)
+                if cursor is None:
+                    cursor = self._scale_hand_tli_point(self.interactive_hand_anchor(points, side), points, side)
+                cursor = self._visual_tli_position(side, cursor, points)
+                engaged = side in self.active_push_sides or (self.click_side == side and now < self.click_flash_until)
+                if not self._scroll_cursor_suppressed(side):
+                    self._paint_tli(painter, cursor, side, engaged)
+
+        # One countdown renderer for both ON->OFF and OFF->ON, even though
+        # OFF hands deliberately have no live TLI or side cursor.
+        for side in ("left", "right"):
+            self._paint_peace_sign_timer(painter, side, now)
+
+        # Custom gestures with their circle timer on show a filling ring at the TLI
+        # (midway between both TPIs for the overlap gesture) until the gesture fires.
+        for key, (label, progress, remaining) in list(getattr(self, "custom_gesture_rings", {}).items()):
+            if key == "overlap":
+                a, b = self.side_cursor_positions.get("left"), self.side_cursor_positions.get("right")
+                if a is None or b is None:
+                    continue
+                cursor = QPointF((a.x()+b.x())*0.5, (a.y()+b.y())*0.5)
+            else:
+                cursor = self.side_cursor_positions.get(key)
+                if cursor is None:
+                    continue
+                cursor = self._visual_tli_position(key, cursor)
+            ring = QRectF(cursor.x()-41, cursor.y()-41, 82, 82)
+            painter.setBrush(Qt.NoBrush)
+            painter.setPen(QPen(QColor(110, 255, 170, 85), 3))
+            painter.drawEllipse(ring)
+            painter.setPen(QPen(QColor(110, 255, 170, 245), 4))
+            painter.drawArc(ring, 90*16, -int(progress*360*16))
+            painter.setPen(QColor(235, 255, 240, 245))
+            painter.setFont(self._ui_font(8, QFont.DemiBold))
+            painter.drawText(QRectF(cursor.x()-50, cursor.y()-60, 100, 16), Qt.AlignCenter, label)
+            painter.drawText(QRectF(cursor.x()-22, cursor.y()+23, 44, 16), Qt.AlignCenter,
+                             f"{remaining:.1f}s")
+
+
 
     def _paint_frame(self, event):
         # Native video windows can temporarily invalidate the transparent overlay surface
@@ -18518,60 +18915,12 @@ class SpatialDesktop(QWidget):
             self._paint_floating_clipboard(painter, now)
             self._paint_selected_item_drag(painter)
 
-            # Reticle and skeleton use the fixed hand-relative (optionally calibrated) TLI anchor.
-            # During TLI calibration the dedicated target window is the sole visual owner;
-            # painting here as well produced a second, differently transformed skeleton.
-            for side in ("left", "right"):
-                points = self.hand_positions.get(side, [])
-                if not points:
-                    continue
-                color = QColor(self.left_click_color if side == "left" else self.right_click_color)
-                # The skeleton is mapped without cursor clamping; joints may leave the
-                # camera-to-screen active rectangle and be clipped by the display itself.
-                # Clamping every joint individually made the skeleton squash against an
-                # artificial wall near the top and bottom of the screen.
-                self._paint_hand_skeleton(painter, points, side)
-                self._paint_gesture_disabled_indicator(painter, points, side)
-                # Keep the virtual skeleton visible when a hand is disabled, but remove
-                # its moving TLI/cursor until peace sign re-enables tracking.
-                if self.gesture_tracking_enabled.get(side, True):
-                    cursor = self.side_cursor_positions.get(side)
-                    if cursor is None:
-                        cursor = self._scale_hand_tli_point(self.interactive_hand_anchor(points, side), points, side)
-                    cursor = self._visual_tli_position(side, cursor, points)
-                    engaged = side in self.active_push_sides or (self.click_side == side and now < self.click_flash_until)
-                    if not self._scroll_cursor_suppressed(side):
-                        self._paint_tli(painter, cursor, side, engaged)
-
-            # One countdown renderer for both ON->OFF and OFF->ON, even though
-            # OFF hands deliberately have no live TLI or side cursor.
-            for side in ("left", "right"):
-                self._paint_peace_sign_timer(painter, side, now)
-
-            # Custom gestures with their circle timer on show a filling ring at the TLI
-            # (midway between both TPIs for the overlap gesture) until the gesture fires.
-            for key, (label, progress, remaining) in list(getattr(self, "custom_gesture_rings", {}).items()):
-                if key == "overlap":
-                    a, b = self.side_cursor_positions.get("left"), self.side_cursor_positions.get("right")
-                    if a is None or b is None:
-                        continue
-                    cursor = QPointF((a.x()+b.x())*0.5, (a.y()+b.y())*0.5)
-                else:
-                    cursor = self.side_cursor_positions.get(key)
-                    if cursor is None:
-                        continue
-                    cursor = self._visual_tli_position(key, cursor)
-                ring = QRectF(cursor.x()-41, cursor.y()-41, 82, 82)
-                painter.setBrush(Qt.NoBrush)
-                painter.setPen(QPen(QColor(110, 255, 170, 85), 3))
-                painter.drawEllipse(ring)
-                painter.setPen(QPen(QColor(110, 255, 170, 245), 4))
-                painter.drawArc(ring, 90*16, -int(progress*360*16))
-                painter.setPen(QColor(235, 255, 240, 245))
-                painter.setFont(self._ui_font(8, QFont.DemiBold))
-                painter.drawText(QRectF(cursor.x()-50, cursor.y()-60, 100, 16), Qt.AlignCenter, label)
-                painter.drawText(QRectF(cursor.x()-22, cursor.y()+23, 44, 16), Qt.AlignCenter,
-                                 f"{remaining:.1f}s")
+            # A second topmost, input-transparent window renders hands on
+            # Windows, so Start and grouped-taskbar previews can't hide the
+            # tracked hands while the main HUD remains click-through.
+            visual_layer = getattr(self, "_hand_visual_layer", None)
+            if visual_layer is None or not visual_layer.isVisible():
+                self._paint_hand_top_layer(painter, now)
 
             # Only timed pinches show a progress circle. A right fist scrolls on
             # deliberate vertical movement and does not wait for or draw a fist timer.
@@ -18916,12 +19265,9 @@ class SpatialDesktop(QWidget):
             if not self.settings_open:
                 press_rects.append(self._main_menu_close_rect(pcx, pcy, pscale))
                 press_rects.append(self._main_menu_exit_rect(pcx, pcy, pscale))
-                press_rects.extend([QRectF(pcx-166*pscale, pcy-145*pscale, 100*pscale, 88*pscale),
-                    QRectF(pcx-50*pscale, pcy-145*pscale, 100*pscale, 88*pscale),
-                    QRectF(pcx+66*pscale, pcy-145*pscale, 100*pscale, 88*pscale),
-                    QRectF(pcx-166*pscale, pcy+35*pscale, 100*pscale, 88*pscale),
-                    QRectF(pcx-50*pscale, pcy+35*pscale, 100*pscale, 88*pscale),
-                    QRectF(pcx+66*pscale, pcy+35*pscale, 100*pscale, 88*pscale)])
+                press_rects.extend([rect for _, rect, _, _ in
+                                    self._main_menu_action_tiles(pcx, pcy, pscale)])
+                press_rects.append(self._main_menu_whiteboard_rect(pcx, pcy, pscale))
             else:
                 press_rects.append(self._settings_back_rect(pcx, pcy, pscale))
                 if self.settings_page not in ("gesture_map",):
@@ -18987,6 +19333,12 @@ def main():
     QTimer.singleShot(0, window._sync_linux_fullscreen_geometry)
     QTimer.singleShot(250, window._sync_linux_fullscreen_geometry)
     window.apply_desktop_mode()
+    if sys.platform.startswith("win"):
+        try:
+            # Prepared behind the splash; map it only when the menu is ready.
+            window._hand_visual_layer = _FreehandHandVisualOverlay(window)
+        except Exception as exc:
+            print("Freehand hand layer unavailable; continuing with main HUD:", exc)
 
     def _dismiss_splash_after_glass_ready():
         global _FREEHAND_BOOT_SPLASH, _FREEHAND_SPLASH_EXIT_ANIMATION
@@ -19004,6 +19356,16 @@ def main():
             # The rendered glass is ready *before* revealing it; synchronise
             # both opacity transitions within the same GUI event-loop turn.
             window._release_startup_glass_menu()
+            layer = getattr(window, "_hand_visual_layer", None)
+            if layer is not None and not layer.isVisible():
+                try:
+                    layer.setGeometry(window.geometry())
+                    layer.show()
+                    layer.make_native_click_through()
+                    layer.raise_()
+                except Exception as exc:
+                    print("Freehand: separate visual hand layer failed:", exc)
+                    layer.hide()
             # A nonblocking fade lets Freehand continue rendering behind the
             # logo. Only close once opacity reaches zero; never use finish(),
             # which can unexpectedly focus the mouse-transparent OS overlay.
