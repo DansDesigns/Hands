@@ -16969,6 +16969,40 @@ class SpatialDesktop(QWidget):
         Right hand always wins; the left is a fallback when right is absent.
         Neither gesture attachment settings nor normal desktop input changes.
         """
+        # Freehand's own glass/settings and pinch menus take priority over any
+        # detected Windows shell surface. Otherwise a shell false-positive can
+        # swallow the entire gesture frame: pinches go to the desktop behind
+        # glass and the two-TPI toggle can never run. This guard also covers
+        # the glass fade-out, until it has actually disappeared.
+        local_menu_owns_input = (
+            self._gesture_ui_modal_open()
+            or any(self.fist_action_menu_open.values())
+            or self._glass_menu_opacity_at(now) > 0.01
+        )
+        # The two-open-hand TPI-overlap is a dedicated Glass Menu toggle, even
+        # when Start or Task Manager truly is open. Let the gesture dispatcher
+        # (later in the same frame) own it rather than forcing mouse mode.
+        left = cursor_points.get('left')
+        right = cursor_points.get('right')
+        overlap_toggles_glass = bool(
+            left is not None and right is not None
+            and all(not poses.get(side, {}).get('pinch', False)
+                    and not poses.get(side, {}).get('fist', False)
+                    for side in ('left', 'right'))
+            and tli_overlap((left.x(), left.y()), (right.x(), right.y()),
+                            float(self.tli_diameter))
+        )
+        if local_menu_owns_input or overlap_toggles_glass:
+            # Do not let a pinch from a menu become a click in a shell window
+            # after the menu closes; a fresh release must happen first.
+            self._shell_native_mode = False
+            self._shell_native_target = None
+            self._shell_native_pinch_side = None
+            self._shell_native_pinch_started = None
+            self._shell_native_pinch_origin = None
+            self._shell_native_wait_release = True
+            return False
+
         target = (_windows_hand_pointer_shell_target(now)
                   if (sys.platform.startswith('win') and self.desktop_mode == 'os'
                       and not self.hand_tracking_paused
