@@ -749,15 +749,24 @@ class _FreehandFastUISoundCache:
         self._pending = {}       # Path -> (decoder, list of PCM pieces, format)
         self._unavailable = set()
         self._cache_dir = Path(tempfile.gettempdir()) / "Freehand-UI-PCM"
+        # Each hand's cancellable gesture-timer sound owns its own PCM voice.
+        # The MCI fallback stays available until the asynchronous decoder is ready.
+        self._wav_sources = {}  # source MP3 -> decoded/cached WAV
+        self._timed_effects = {}  # threading.Event -> QSoundEffect
+        from PySide6.QtCore import QTimer
+        self._timer_check = QTimer(QApplication.instance())
+        self._timer_check.setInterval(15)
+        self._timer_check.timeout.connect(self._check_timed_effects)
 
     def _attach_effect(self, path, wav_path):
         try:
             effects = []
-            for _ in range(2):
+            for _ in range(3):
                 effect = self._Effect(QApplication.instance())
                 effect.setSource(QUrl.fromLocalFile(str(wav_path)))
                 effects.append(effect)
             self._effects[path] = effects
+            self._wav_sources[path] = wav_path
         except Exception:
             self._unavailable.add(path)
 
@@ -863,18 +872,60 @@ class _FreehandFastUISoundCache:
                     self._pending.pop(path, None)
                     self._unavailable.add(path)
 
-    def play(self, path):
+    def _check_timed_effects(self):
+        # Qt audio is controlled only from the GUI thread. An event is set at
+        # gesture completion/cancellation and checked at most 15 ms later.
+        for stop_event, effect in tuple(self._timed_effects.items()):
+            if stop_event.is_set():
+                # Some Windows audio backends report isPlaying=False briefly
+                # before the playback thread actually begins output. Keep the
+                # cancellation ownership until the gesture itself ends.
+                effect.stop()
+                self._timed_effects.pop(stop_event, None)
+        if not self._timed_effects:
+            self._timer_check.stop()
+
+    def stop_timed(self, stop_event):
+        """Stop the matching hand's countdown now, not another hand's sound."""
+        effect = self._timed_effects.pop(stop_event, None)
+        if effect is not None:
+            effect.stop()
+        if not self._timed_effects:
+            self._timer_check.stop()
+
+    def play(self, path, stop_event=None):
         effects = self._effects.get(path)
-        if not effects:
+        if not effects or (stop_event is not None and stop_event.is_set()):
             return False
         try:
-            ready = [effect for effect in effects if effect.isLoaded()]
-            if not ready:
-                return False
-            effect = next((e for e in ready if not e.isPlaying()), ready[0])
-            if effect.isPlaying():
-                effect.stop()
-            effect.play()
+            reserved = set(self._timed_effects.values())
+            ready = [effect for effect in effects
+                     if effect.isLoaded() and effect not in reserved]
+            idle = next((effect for effect in ready if not effect.isPlaying()), None)
+            if idle is None:
+                # Never truncate the left hand's countdown to play a right-hand
+                # effect or vice versa. Provide extra independent voices for
+                # rapid pinches and overlapping peace/pinch-menu timers.
+                if len(effects) < 8 and path in self._wav_sources:
+                    idle = self._Effect(QApplication.instance())
+                    idle.setSource(QUrl.fromLocalFile(str(self._wav_sources[path])))
+                    effects.append(idle)
+                    if not idle.isLoaded():
+                        return False  # Use MCI until this new PCM voice is ready.
+                elif ready:
+                    # Non-timed clicks may reuse a click channel. Timed holds
+                    # must never interrupt an existing cancellable voice.
+                    if stop_event is not None:
+                        return False
+                    idle = ready[0]
+                    idle.stop()
+                else:
+                    return False
+            idle.play()
+            if stop_event is not None:
+                self._timed_effects[stop_event] = idle
+                if not self._timer_check.isActive():
+                    self._timer_check.start()
             return True
         except Exception:
             return False
@@ -993,8 +1044,13 @@ class _FreehandWindowsUISoundEngine:
             if stop_event is not None and stop_event.is_set():
                 continue
             if action == "warm":
-                if not self._channels.get(path):
-                    self._open_channel(path)
+                # Even before Qt's PCM cache is ready, both hands must be able
+                # to play the 0.77 s peace-sign timer without opening an MP3
+                # decoder during the gesture. Preopen independent MCI voices.
+                count = 2 if path.name.casefold() == 'gesture_timer_during.mp3' else 1
+                while len(self._channels.get(path, ())) < count:
+                    if self._open_channel(path) is None:
+                        break
             elif action == "play":
                 channel = self._select_channel(path)
                 if channel is None:
@@ -1019,6 +1075,245 @@ class _FreehandWindowsUISoundEngine:
         # Daemon worker can finish its MCI shutdown without blocking the UI.
 
 
+# Windows sound effects: direct, predecoded PCM through waveOut. The original
+# MP3s remain untouched for Settings and Linux. The matching PCM resources in
+# assets/sounds/pcm are intentionally shipped with Freehand by the builder.
+# Unlike MCI MP3 and Qt's asynchronous decoder, waveOutWrite never queues a
+# codec operation between a pinch/timer event and the audio device.
+class _FreehandWindowsPCMSoundEngine:
+    """Low-latency, independently cancellable Windows sound effects.
+
+    All WinMM operations and device handles belong to one worker thread. The
+    UI only queues a command or sets a cancellation Event; it never waits for
+    a decoder/device, including during MediaPipe's busiest frames.
+    """
+
+    class _WaveFormat(ctypes.Structure):
+        _fields_ = [
+            ('wFormatTag', ctypes.c_ushort),
+            ('nChannels', ctypes.c_ushort),
+            ('nSamplesPerSec', ctypes.c_uint32),
+            ('nAvgBytesPerSec', ctypes.c_uint32),
+            ('nBlockAlign', ctypes.c_ushort),
+            ('wBitsPerSample', ctypes.c_ushort),
+            ('cbSize', ctypes.c_ushort),
+        ]
+
+    class _WaveHeader(ctypes.Structure):
+        _fields_ = [
+            ('lpData', ctypes.c_void_p),
+            ('dwBufferLength', ctypes.c_uint32),
+            ('dwBytesRecorded', ctypes.c_uint32),
+            ('dwUser', ctypes.c_size_t),
+            ('dwFlags', ctypes.c_uint32),
+            ('dwLoops', ctypes.c_uint32),
+            ('lpNext', ctypes.c_void_p),
+            ('reserved', ctypes.c_size_t),
+        ]
+
+    def __init__(self, winmm=None, *, autostart=True):
+        self._winmm = winmm if winmm is not None else ctypes.WinDLL('winmm', use_last_error=True)
+        self._commands = queue.PriorityQueue()
+        self._lock = threading.Lock()
+        self._serial = 0
+        self._stopping = False
+        self._channels = {}  # Worker-owned: source path -> cached waveOut voices
+        self._missing = set()
+        self._pcm_folder = (ROOT / 'assets' / 'sounds' / 'pcm').resolve()
+        # WinMM's device mapper is UINT_MAX. Explicit function signatures also
+        # make this work on both 32-bit and 64-bit Python/Windows.
+        handle = ctypes.c_void_p
+        ptr = ctypes.c_void_p
+        size = ctypes.c_uint32
+        defs = (
+            ('waveOutOpen', [ctypes.POINTER(handle), ctypes.c_uint, ctypes.POINTER(self._WaveFormat), ptr, ptr, size]),
+            ('waveOutPrepareHeader', [handle, ctypes.POINTER(self._WaveHeader), size]),
+            ('waveOutWrite', [handle, ctypes.POINTER(self._WaveHeader), size]),
+            ('waveOutReset', [handle]),
+            ('waveOutUnprepareHeader', [handle, ctypes.POINTER(self._WaveHeader), size]),
+            ('waveOutClose', [handle]),
+        )
+        for name, signature in defs:
+            fn = getattr(self._winmm, name)
+            # Native ctypes functions support argtypes/restype. Fake backends in
+            # regression tests need only implement the same call signatures.
+            if hasattr(fn, 'argtypes'):
+                fn.argtypes = signature
+                fn.restype = ctypes.c_uint
+        self._thread = threading.Thread(target=self._run, name='FreehandPCMPlayback', daemon=True)
+        if autostart:
+            self._thread.start()
+
+    def _submit(self, priority, action, path=None, stop_event=None):
+        with self._lock:
+            if self._stopping:
+                return
+            self._serial += 1
+            self._commands.put_nowait((priority, self._serial, action, path, stop_event))
+
+    def can_play(self, path):
+        # Only predecoded bundled clips are handled here. User-selected MP3s
+        # without matching PCM assets retain the existing audio fallback.
+        return path.suffix.lower() in ('.mp3', '.wav') and (self._pcm_folder / (path.stem + '.wav')).is_file()
+
+    def prewarm(self, filenames):
+        base = (ROOT / 'assets' / 'sounds').resolve()
+        for name in dict.fromkeys(str(n) for n in filenames if n and n != 'None'):
+            path = (base / name).resolve()
+            if path.parent == base and path.is_file() and self.can_play(path):
+                self._submit(2, 'warm', path)
+
+    def play(self, path, stop_event=None):
+        if not self.can_play(path):
+            return False
+        if stop_event is not None and stop_event.is_set():
+            return True
+        self._submit(0, 'play', path, stop_event)
+        return True
+
+    def _open_voice(self, source):
+        import wave
+        pcm = self._pcm_folder / (source.stem + '.wav')
+        try:
+            with wave.open(str(pcm), 'rb') as stream:
+                channels, rate, width = (stream.getnchannels(), stream.getframerate(), stream.getsampwidth())
+                frames = stream.readframes(stream.getnframes())
+            if not frames or width != 2 or channels not in (1, 2) or rate < 8000:
+                return None
+            fmt = self._WaveFormat(1, channels, rate, rate * channels * width,
+                                   channels * width, 16, 0)
+            handle = ctypes.c_void_p()
+            if self._winmm.waveOutOpen(ctypes.byref(handle), 0xFFFFFFFF,
+                                       ctypes.byref(fmt), None, None, 0) != 0:
+                return None
+            data = ctypes.create_string_buffer(frames)
+            header = self._WaveHeader()
+            header.lpData = ctypes.cast(data, ctypes.c_void_p)
+            header.dwBufferLength = len(frames)
+            header.dwLoops = 0
+            result = self._winmm.waveOutPrepareHeader(handle, ctypes.byref(header),
+                                                       ctypes.sizeof(header))
+            if result != 0:
+                self._winmm.waveOutClose(handle)
+                return None
+            return {'handle': handle, 'format': fmt, 'data': data, 'header': header,
+                    'stop_event': None, 'active': False, 'started': 0.0,
+                    'duration': len(frames) / (rate * channels * width)}
+        except (OSError, EOFError, ValueError, RuntimeError):
+            return None
+
+    def _stop_voice(self, voice):
+        self._winmm.waveOutReset(voice['handle'])
+        voice['active'] = False
+        voice['stop_event'] = None
+
+    def _poll(self):
+        now = time.monotonic()
+        for voices in self._channels.values():
+            for voice in voices:
+                if not voice['active']:
+                    continue
+                event = voice['stop_event']
+                if event is not None and event.is_set():
+                    self._stop_voice(voice)
+                elif voice['header'].dwFlags & 0x1:  # WHDR_DONE
+                    voice['active'] = False
+                    voice['stop_event'] = None
+                elif now - voice['started'] > voice['duration'] + 1.0:
+                    # Device/driver never signalled WHDR_DONE; do not hold a
+                    # nonplaying channel hostage indefinitely.
+                    self._stop_voice(voice)
+
+    def _get_voice(self, path):
+        voices = self._channels.setdefault(path, [])
+        for voice in voices:
+            if not voice['active']:
+                return voice
+        # Independent overlapping hands, menu effects and timers must not
+        # interrupt one another. Cap growth if an input gets stuck chattering.
+        if len(voices) >= 8:
+            return None
+        voice = self._open_voice(path)
+        if voice is not None:
+            voices.append(voice)
+        return voice
+
+    def _fallback_play(self, path, event):
+        # A missing/unsupported audio device must not silently swallow a
+        # gesture. Fall back only on an actual PCM output error.
+        engine = _freehand_ui_sound_engine()
+        if engine is not None:
+            engine.play(path, event)
+
+    def _run(self):
+        while True:
+            self._poll()
+            try:
+                _priority, _serial, action, path, event = self._commands.get(timeout=0.01)
+            except queue.Empty:
+                continue
+            if action == 'quit':
+                break
+            if event is not None and event.is_set():
+                continue
+            if path in self._missing:
+                if action == 'play':
+                    self._fallback_play(path, event)
+                continue
+            if action == 'warm':
+                if path not in self._channels or not self._channels[path]:
+                    voice = self._get_voice(path)
+                    if voice is None:
+                        self._missing.add(path)
+                # The first output device is open during the splash, so the
+                # first real sound only calls waveOutWrite.
+            elif action == 'play':
+                voice = self._get_voice(path)
+                if voice is None:
+                    self._fallback_play(path, event)
+                    continue
+                if event is not None and event.is_set():
+                    continue
+                # This header and its byte buffer stay pinned for the entire
+                # lifetime of the channel, including timer cancellations.
+                result = self._winmm.waveOutWrite(voice['handle'],
+                    ctypes.byref(voice['header']), ctypes.sizeof(voice['header']))
+                if result == 0:
+                    voice['active'] = True
+                    voice['stop_event'] = event
+                    voice['started'] = time.monotonic()
+                else:
+                    self._missing.add(path)
+                    self._fallback_play(path, event)
+        for voices in self._channels.values():
+            for voice in voices:
+                self._winmm.waveOutReset(voice['handle'])
+                self._winmm.waveOutUnprepareHeader(voice['handle'],
+                    ctypes.byref(voice['header']), ctypes.sizeof(voice['header']))
+                self._winmm.waveOutClose(voice['handle'])
+
+    def close(self):
+        with self._lock:
+            self._stopping = True
+            self._serial += 1
+            self._commands.put_nowait((0, self._serial, 'quit', None, None))
+
+
+_FREEHAND_PCM_SOUND_ENGINE = None
+
+
+def _freehand_pcm_sound_engine():
+    global _FREEHAND_PCM_SOUND_ENGINE
+    if os.name != 'nt':
+        return None
+    if _FREEHAND_PCM_SOUND_ENGINE is None:
+        try:
+            _FREEHAND_PCM_SOUND_ENGINE = _FreehandWindowsPCMSoundEngine()
+        except (AttributeError, OSError):
+            return None
+    return _FREEHAND_PCM_SOUND_ENGINE
+
+
 _FREEHAND_UI_SOUND_ENGINE = None
 
 
@@ -1037,15 +1332,23 @@ def _freehand_ui_sound_engine():
 
 def _freehand_prewarm_ui_sounds(filenames=None):
     requested = tuple(DEFAULT_UI_SOUNDS.values() if filenames is None else filenames)
-    engine = _freehand_ui_sound_engine()
-    if engine is not None:
-        engine.prewarm(requested)
-    # Qt must only be called on the UI thread. Prewarm also handles sounds
-    # selected later in Settings; the first play never has to decode on demand.
-    if threading.current_thread() is threading.main_thread():
-        fast = _freehand_fast_ui_sounds()
-        if fast is not None:
-            fast.prewarm(requested)
+    pcm = _freehand_pcm_sound_engine()
+    if pcm is not None:
+        pcm.prewarm(requested)
+    # Keep the historical MP3 fallback only for custom clips that have no
+    # predecoded PCM resource. Never initialise Qt's heavyweight audio decoder
+    # for the built-in sounds; it caused both delayed sounds and GUI stalls.
+    fallback_names = [name for name in requested if name and name != 'None'
+                      and not (pcm is not None and pcm.can_play(
+                          (ROOT / 'assets' / 'sounds' / str(name)).resolve()))]
+    if fallback_names:
+        engine = _freehand_ui_sound_engine()
+        if engine is not None:
+            engine.prewarm(fallback_names)
+        if threading.current_thread() is threading.main_thread():
+            fast = _freehand_fast_ui_sounds()
+            if fast is not None:
+                fast.prewarm(fallback_names)
 
 
 def play_ui_sound(filename, *, stop_event=None):
@@ -1060,12 +1363,15 @@ def play_ui_sound(filename, *, stop_event=None):
         return
     try:
         if os.name == "nt" and path.suffix.lower() in {".mp3", ".wav"}:
-            # UI buttons use already-decoded PCM for immediate tactile feedback;
-            # timed sounds retain cancellable MCI playback below.
-            if stop_event is None:
-                fast = _FREEHAND_FAST_UI_SOUNDS
-                if fast is not None and fast.play(path):
-                    return
+            # Prefer a prepared, independently cancellable waveOut voice. The
+            # original source MP3 is never decoded when this effect plays.
+            pcm = _freehand_pcm_sound_engine()
+            if pcm is not None and pcm.play(path, stop_event):
+                return
+            # Custom user MP3s without a PCM resource use the old fallback.
+            fast = _FREEHAND_FAST_UI_SOUNDS
+            if fast is not None and fast.play(path, stop_event=stop_event):
+                return
             engine = _freehand_ui_sound_engine()
             if engine is not None:
                 engine.play(path, stop_event)
@@ -1099,7 +1405,9 @@ def play_ui_sound(filename, *, stop_event=None):
 if __name__ == "__main__" and os.name == "nt":
     # Leave the camera-first startup order intact: QtMultimedia codecs are
     # initialised later, after the camera worker has already started.
-    _background_ui_audio = _freehand_ui_sound_engine()
+    # Preopen PCM output devices on the audio worker behind the splash, with
+    # no codec/media framework initialization on the gesture/painting thread.
+    _background_ui_audio = _freehand_pcm_sound_engine()
     if _background_ui_audio is not None:
         _background_ui_audio.prewarm(DEFAULT_UI_SOUNDS.values())
 
@@ -2344,6 +2652,27 @@ class _MacTouchGestureFallback:
         self._pan_accumulator = [0.0, 0.0]
 
 
+def _freehand_linux_panel_band_point(point, bounds, top_band=64, bottom_band=64):
+    """Is a physical X11 point inside a top/bottom panel interaction strip?
+
+    Bounds are X11 *root* pixels, not Qtile's reserved work area. Returning a
+    separate answer (rather than shortening the touch screen) ensures normal
+    Linux application content continues to use native two-finger multitouch.
+    """
+    try:
+        x, y = float(point[0]), float(point[1])
+        bx, by, bw, bh = (float(v) for v in bounds)
+        if not all(math.isfinite(v) for v in (x, y, bx, by, bw, bh)) or bw <= 0 or bh <= 0:
+            return False
+        if not (bx <= x < bx + bw and by <= y < by + bh):
+            return False
+        top = max(1.0, min(float(top_band), bh * 0.2))
+        bottom = max(1.0, min(float(bottom_band), bh * 0.2))
+        return y < by + top or y >= by + bh - bottom
+    except (TypeError, ValueError, IndexError, OverflowError):
+        return False
+
+
 def _create_native_touch_injector():
     """Choose the best supported OS input backend without touching D1 or gestures."""
     if sys.platform.startswith('win'):
@@ -2357,6 +2686,35 @@ def _create_native_touch_injector():
             bounds = (box.x(), box.y(), box.width(), box.height())
         else:
             bounds = (0, 0, 1920, 1080)
+        # Qtile may expose only its panel-free work area to Qt at startup.
+        # Use the same physical X11 root bounds as the rendered TPI so that
+        # touchscreen ABS coordinates include the actual top and bottom bars.
+        # Preserve the Qt geometry for Wayland or mismatched DPI/multi-monitor
+        # layouts rather than assuming the root uses identical pixel units.
+        try:
+            if QApplication.platformName().lower() in ('xcb', 'x11'):
+                x11 = ctypes.CDLL('libX11.so.6')
+                x11.XOpenDisplay.argtypes = [ctypes.c_char_p]
+                x11.XOpenDisplay.restype = ctypes.c_void_p
+                x11.XDefaultScreen.argtypes = [ctypes.c_void_p]
+                x11.XDefaultScreen.restype = ctypes.c_int
+                x11.XDisplayWidth.argtypes = [ctypes.c_void_p, ctypes.c_int]
+                x11.XDisplayWidth.restype = ctypes.c_int
+                x11.XDisplayHeight.argtypes = [ctypes.c_void_p, ctypes.c_int]
+                x11.XDisplayHeight.restype = ctypes.c_int
+                x11.XCloseDisplay.argtypes = [ctypes.c_void_p]
+                x11.XCloseDisplay.restype = ctypes.c_int
+                display = x11.XOpenDisplay(None)
+                if display:
+                    try:
+                        screen_no = x11.XDefaultScreen(display)
+                        native_size = (x11.XDisplayWidth(display, screen_no),
+                                       x11.XDisplayHeight(display, screen_no))
+                        bounds, _same_units = resolve_fullscreen_bounds(bounds, native_size)
+                    finally:
+                        x11.XCloseDisplay(display)
+        except Exception:
+            pass
         injector = _LinuxTouchInjector(bounds)
         # Register before webcam startup completes, giving libinput time to
         # discover the device before the user's first pinch.
@@ -5323,7 +5681,7 @@ class SpatialDesktop(QWidget):
         # Its PCM cache is primed once the first menu frame has been revealed.
         selected_sounds = [self.ui_preferences.get(key, "None")
                            for key, _label in SOUND_SETTING_ROWS]
-        sound_engine = _freehand_ui_sound_engine()
+        sound_engine = _freehand_pcm_sound_engine()
         if sound_engine is not None:
             sound_engine.prewarm(selected_sounds)
         self._startup_pcm_sounds = tuple(selected_sounds)
@@ -11937,6 +12295,70 @@ class SpatialDesktop(QWidget):
         self._linux_screen_geometry_cache = (now, QRect(qt_rect), QRect(result))
         return result
 
+    def _linux_qtile_panel_point(self, global_point):
+        """Detect top/bottom Qtile bar targets in physical X11 coordinates.
+
+        Qtile bars consume pointer enter/move and X11 button events, not merely
+        synthetic touchscreen contacts. Keep native multitouch everywhere else.
+        An edge band is also needed for bars that reveal themselves on hover.
+        """
+        if self.desktop_mode != "os" or not sys.platform.startswith("linux"):
+            return False
+        try:
+            if QApplication.platformName().lower() not in ("xcb", "x11"):
+                return False
+        except Exception:
+            return False
+        if global_point is None:
+            return False
+        context = self._linux_x11_screen_context()
+        if context is None:
+            return False
+        # The root display is independent of Qtile's work-area exclusion. Don't
+        # use QWidget.height(), QScreen.availableGeometry(), or TPI scale here.
+        bounds = (0, 0, context["width"], context["height"])
+        xy = ((global_point.x(), global_point.y())
+              if hasattr(global_point, "x") else global_point)
+        return _freehand_linux_panel_band_point(xy, bounds)
+
+    def _linux_hover_qtile_panel(self, cursor_points, now):
+        """Move the real X11 pointer ONLY over a Qtile bar, not across the desktop.
+
+        Multitouch remains the default on Linux; a TPI in the edge strip is the
+        exception because Qtile's bar widgets need real pointer hover events.
+        Never override peace-sign detach, grip scrolling, or modal UI gestures.
+        """
+        if (self.desktop_mode != "os" or not sys.platform.startswith("linux") or
+                self._gesture_ui_modal_open() or self._os_scroll_pointer_detached()):
+            return
+        side = self.cursor_lock_priority if self.cursor_lock_priority in ("left", "right") else "right"
+        if side not in cursor_points or self.mouse_detached_by_side.get(side, False):
+            side = "left" if side == "right" else "right"
+        if side not in cursor_points or self.mouse_detached_by_side.get(side, False):
+            return
+        global_point = self._virtual_point_to_global(cursor_points[side])
+        if global_point is not None and self._linux_qtile_panel_point(global_point):
+            previous = getattr(self, '_linux_qtile_hover_last', None)
+            if (previous is None or
+                    abs(previous[0] - global_point.x()) >= 1.5 or
+                    abs(previous[1] - global_point.y()) >= 1.5 or
+                    now - previous[2] >= 0.20):
+                self._set_os_pointer_global(global_point)
+                self._linux_qtile_hover_last = (global_point.x(), global_point.y(), now)
+            return
+        # A hidden Qtile panel needs PointerLeave to collapse again. Perform
+        # just ONE exit warp when the hand leaves the edge, never continual
+        # cursor-follow over the main desktop (which remains multitouch).
+        previous = getattr(self, '_linux_qtile_hover_last', None)
+        if previous is not None:
+            self._linux_qtile_hover_last = None
+            context = self._linux_x11_screen_context()
+            if context is not None:
+                height = context['height']
+                exit_y = 70 if previous[1] < height*0.5 else max(0, height-71)
+                exit_x = int(max(0, min(context['width']-1, previous[0])))
+                self._set_os_pointer_global(QPoint(exit_x, exit_y))
+
     def _virtual_point_to_global(self, point):
         """Convert a screen-local virtual-hand point into desktop-global coordinates."""
         if point is None:
@@ -12244,6 +12666,24 @@ class SpatialDesktop(QWidget):
             local = self.mapFromGlobal(QPoint(int(global_point[0]), int(global_point[1])))
             use_mouse = (self._is_native_taskbar_point(QPointF(local)) or
                          _windows_window_uses_native_mouse(global_point))
+        elif sys.platform.startswith('linux') and self._linux_qtile_panel_point(global_point):
+            # Qtile panels use X11 pointer/button events. A uinput touchscreen
+            # tap alone does not reliably enter/activate a bar widget.
+            injector = getattr(self, '_native_touch', None)
+            if injector is not None:
+                injector.end()
+            if pyautogui is None:
+                self.status = 'Qtile panel click unavailable: PyAutoGUI is missing'
+                return False
+            try:
+                destination = QPoint(int(global_point[0]), int(global_point[1]))
+                self._set_os_pointer_global(destination)
+                pyautogui.click(x=destination.x(), y=destination.y(),
+                                button='left', _pause=False)
+                return True
+            except Exception as exc:
+                self.status = f'Qtile panel click failed: {exc}'
+                return False
         else:
             use_mouse = False
         if use_mouse:
@@ -13196,8 +13636,11 @@ class SpatialDesktop(QWidget):
                            f"next {TPI_CALIBRATION_TARGET_NAMES[next_index].lower()}")
             return True
 
-        screen = QApplication.primaryScreen()
-        geometry = screen.geometry() if screen is not None else None
+        # The calibration overlay uses the physical screen, including Qtile
+        # panel strips. Normalize samples in that SAME coordinate system; a
+        # Qtile-clipped QScreen.geometry() here silently shortens the saved
+        # bottom-edge calibration and makes the TPI stop above the bottom bar.
+        geometry = self._interaction_screen_geometry()
         width = geometry.width() if geometry is not None else self.width()
         height = geometry.height() if geometry is not None else self.height()
         calibration = make_tpi_screen_calibration(saved_points, width, height)
@@ -15294,6 +15737,11 @@ class SpatialDesktop(QWidget):
         stop_event = self._timer_during_sound_stop_events.pop(key, None)
         if stop_event is not None:
             stop_event.set()
+            # A running QSoundEffect can stop synchronously on the same GUI
+            # frame as the gesture circle. The MCI fallback observes the event.
+            fast = _FREEHAND_FAST_UI_SOUNDS
+            if fast is not None:
+                fast.stop_timed(stop_event)
         self._timer_during_sound_played_at.pop(key, None)
 
     def _stop_inactive_timer_during_sounds(self):
@@ -15303,8 +15751,12 @@ class SpatialDesktop(QWidget):
                 self._stop_timer_during_sound(key)
         self._timer_during_sound_seen_keys.clear()
 
-    def _maybe_play_timer_during_sound(self, key, started_at, now):
-        """Play after 200 ms; keep it cancellable while this timer is visible."""
+    def _maybe_play_timer_during_sound(self, key, started_at, now, *, delay=0.2):
+        """Play once per held gesture; cancel on the exact finishing frame.
+
+        Peace-sign timers begin sound with the countdown. Other gesture timers
+        keep their existing 200 ms anti-false-positive sound buffer.
+        """
         if started_at is None:
             self._stop_timer_during_sound(key)
             return
@@ -15314,7 +15766,7 @@ class SpatialDesktop(QWidget):
         # A new hold must never inherit a sound from the previous hold.
         if key in self._timer_during_sound_stop_events:
             self._stop_timer_during_sound(key)
-        if now - float(started_at) < 0.2:
+        if now - float(started_at) < delay:
             return
         self._timer_during_sound_played_at[key] = started_at
         stop_event = threading.Event()
@@ -16259,8 +16711,11 @@ class SpatialDesktop(QWidget):
                     # mouse click even when natural hand jitter is large enough
                     # to be interpreted as a touchscreen drag. Choose once at
                     # pinch start, not on every frame or after the pointer moves.
-                    "special_native_mouse": (sys.platform.startswith('win') and
-                                             _windows_window_uses_native_mouse(point)),
+                    "special_native_mouse": (
+                        (sys.platform.startswith('win') and
+                         _windows_window_uses_native_mouse(point)) or
+                        (sys.platform.startswith('linux') and
+                         self._linux_qtile_panel_point(point))),
                 }
             elif side in self._touch_pending:
                 pending = self._touch_pending[side]
@@ -16284,6 +16739,11 @@ class SpatialDesktop(QWidget):
         # stable independent contact IDs (or macOS gesture fallback).
         if len(candidates) == 2 and not self.menu_pinch_latched.intersection({"left", "right"}):
             for side in ("left", "right"):
+                pending = self._touch_pending.get(side, {})
+                if pending.get("special_native_mouse"):
+                    # A pinch that began on a Qtile bar remains a mouse click;
+                    # never promote that contact to a two-finger touch event.
+                    continue
                 active_points[side] = candidates[side]
                 self._touch_drag_sides.add(side)
 
@@ -16336,6 +16796,8 @@ class SpatialDesktop(QWidget):
                         # Text-selection drags deliberately use a held mouse
                         # button, unlike ordinary Linux touchscreen taps.
                         if self._begin_pinch_drag(side, QPointF(origin_local), now):
+                            if sys.platform.startswith('win'):
+                                play_ui_sound(self.ui_preferences.get("sound_pinch", "None"))
                             self.pinch_drag_origin_points[side] = QPointF(origin_local)
                             self._recent_text_selection = None
                             self._touch_text_drag_sides.add(side)
@@ -16393,10 +16855,17 @@ class SpatialDesktop(QWidget):
                 self._touch_pending.pop(side, None)
             self.gesture_owner = None
             # First emit DOWN at drag origin; then UPDATE to the current point.
+            # The pre-existing quick-tap path plays on release; long touch drags
+            # and two-hand zooms used to be silent, especially on the left hand.
+            new_touch_sides = [side for side in active_points
+                               if side not in injector.active_points]
             if not injector.sync(active_points):
                 self.status = "Touch injection unavailable: " + injector.last_error
                 self._end_two_hand_touch()
                 return True
+            if sys.platform.startswith('win'):
+                for _side in new_touch_sides:
+                    play_ui_sound(self.ui_preferences.get("sound_pinch", "None"))
             final_points = dict(active_points)
             for side in self._touch_drag_sides:
                 if side in candidates:
@@ -16486,6 +16955,12 @@ class SpatialDesktop(QWidget):
         scroll_dt = max(0.0, min(0.05, now - previous_scene_time))
         self._last_update_scene_time = now
         self._maintain_native_topmost(now)
+        if sys.platform.startswith("linux") and now - getattr(
+                self, "_last_linux_fullscreen_sync", 0.0) >= 1.0:
+            # Qtile can reapply panel-strut work-area geometry long after the
+            # initial splash. Restore the full X11 paint/input surface then.
+            self._last_linux_fullscreen_sync = now
+            self._sync_linux_fullscreen_geometry()
         board = getattr(self, "whiteboard", None)
         # The standalone board owns its topmost surface until it closes. Do
         # not spin on Window.raise_(): the user's rounded-corner masks must
@@ -16663,7 +17138,8 @@ class SpatialDesktop(QWidget):
                 # disabling and re-enabling tracking. Play it once per held pose.
                 if not self.peace_toggle_latched[side]:
                     self._maybe_play_timer_during_sound(
-                        f"peace_toggle:{side}", self.peace_hold_started[side], now)
+                        f"peace_toggle:{side}", self.peace_hold_started[side], now,
+                        delay=0.0)
                 if (now - self.peace_hold_started[side] >= self.peace_toggle_hold_seconds
                         and not self.peace_toggle_latched[side]):
                     enabled = not self.gesture_tracking_enabled.get(side, True)
@@ -16936,6 +17412,9 @@ class SpatialDesktop(QWidget):
         # can take ownership. This also preserves automatic clipboard reveal
         # from selected-item pickup instead of intercepting/cancelling the drag.
         self._remember_clipboard_pinch_origin(cursor_points, poses, now)
+        # Qtile top/bottom panels need X11 pointer-enter/motion, while regular
+        # Linux windows continue receiving two-contact /dev/uinput multitouch.
+        self._linux_hover_qtile_panel(cursor_points, now)
         if (self._process_windows_task_view_input(cursor_points, poses, now) or
                 self._process_two_hand_touch(cursor_points, poses, now)):
             self.pointer_side = None
