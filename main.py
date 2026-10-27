@@ -1989,30 +1989,164 @@ def _windows_shell_preview_visible(now=None):
 
 
 
-def _windows_start_menu_active(now=None):
-    """Detect the focused Windows Start shell without scanning every HWND."""
-    if not sys.platform.startswith("win"):
-        return False
+def _windows_start_menu_window(now=None):
+    """Find the *visible* Windows Start surface, not just the foreground HWND.
+
+    Windows 11 commonly hosts Start in StartMenuExperienceHost's XAML island
+    while GetForegroundWindow() still identifies Explorer, the taskbar, or a
+    different shell window. Looking only at the foreground process therefore
+    misses a real open Start menu and leaves Freehand in touchscreen mode.
+
+    A dormant StartMenuExperienceHost process does not count: require an actual
+    visible, non-DWM-cloaked, on-screen window with a useful size. The result
+    is shared by both pointer handoff and native overlay stacking. These Win32
+    calls are throttled; they never occur for every hand landmark.
+    """
+    if not sys.platform.startswith('win'):
+        return None
     now = time.monotonic() if now is None else float(now)
-    previous = getattr(_windows_start_menu_active, "_cached", None)
-    if previous is not None and now-previous[0] < 0.09:
-        return previous[1]
-    active = False
+    cached = getattr(_windows_start_menu_window, '_cached', None)
+    if cached is not None and now - cached[0] < (0.055 if cached[1] else 0.11):
+        return cached[1]
+    found = None
     try:
         user = ctypes.windll.user32
         user.GetForegroundWindow.restype = wintypes.HWND
-        hwnd = user.GetForegroundWindow()
-        if hwnd:
-            process = _windows_process_name(hwnd)
-            active = process in ("startmenuexperiencehost.exe", "shellexperiencehost.exe")
-            if not active and process == "explorer.exe":
-                buffer = ctypes.create_unicode_buffer(128)
-                user.GetWindowTextW(wintypes.HWND(hwnd), buffer, len(buffer))
-                active = buffer.value.casefold().strip() == "start"
-    except (OSError, AttributeError, ValueError):
+        user.IsWindowVisible.argtypes = (wintypes.HWND,)
+        user.IsWindowVisible.restype = wintypes.BOOL
+        user.GetWindowRect.argtypes = (wintypes.HWND, ctypes.POINTER(wintypes.RECT))
+        user.GetWindowRect.restype = wintypes.BOOL
+        user.GetWindowTextW.argtypes = (wintypes.HWND, ctypes.c_wchar_p, ctypes.c_int)
+        user.GetWindowTextW.restype = ctypes.c_int
+        user.GetSystemMetrics.argtypes = (ctypes.c_int,)
+        user.GetSystemMetrics.restype = ctypes.c_int
+        virtual_left = user.GetSystemMetrics(76)   # SM_XVIRTUALSCREEN
+        virtual_top = user.GetSystemMetrics(77)    # SM_YVIRTUALSCREEN
+        virtual_w = max(1, user.GetSystemMetrics(78))
+        virtual_h = max(1, user.GetSystemMetrics(79))
+        # Some Wine/older Windows APIs return zero for virtual-screen metrics.
+        if virtual_w <= 1 or virtual_h <= 1:
+            virtual_left = virtual_top = 0
+            virtual_w = max(1, user.GetSystemMetrics(0))
+            virtual_h = max(1, user.GetSystemMetrics(1))
+        dwm = getattr(ctypes.windll, 'dwmapi', None)
+        get_dwm = getattr(dwm, 'DwmGetWindowAttribute', None)
+        if get_dwm is not None:
+            get_dwm.argtypes = (wintypes.HWND, wintypes.DWORD,
+                                ctypes.c_void_p, wintypes.DWORD)
+            get_dwm.restype = ctypes.c_long
+
+        def is_open_start(hwnd):
+            if not hwnd or not user.IsWindowVisible(hwnd):
+                return False
+            proc = _windows_process_name(hwnd)
+            if proc not in ('startmenuexperiencehost.exe', 'shellexperiencehost.exe',
+                            'explorer.exe'):
+                return False
+            if proc != 'startmenuexperiencehost.exe':
+                # Explorer and ShellExperienceHost have other visible windows.
+                # Do not classify the taskbar, Action Centre or Task View as Start.
+                title = ctypes.create_unicode_buffer(160)
+                user.GetWindowTextW(wintypes.HWND(hwnd), title, len(title))
+                if title.value.casefold().strip() not in ('start', 'start menu'):
+                    return False
+            rect = wintypes.RECT()
+            if not user.GetWindowRect(wintypes.HWND(hwnd), ctypes.byref(rect)):
+                return False
+            width = int(rect.right - rect.left)
+            height = int(rect.bottom - rect.top)
+            if width < 140 or height < 140:
+                return False
+            if (rect.right <= virtual_left or rect.bottom <= virtual_top or
+                    rect.left >= virtual_left + virtual_w or
+                    rect.top >= virtual_top + virtual_h):
+                return False
+            if get_dwm is not None:
+                cloaked = wintypes.DWORD(0)
+                if (get_dwm(wintypes.HWND(hwnd), 14, ctypes.byref(cloaked),
+                            ctypes.sizeof(cloaked)) == 0 and cloaked.value):
+                    return False
+            return True
+
+        foreground = user.GetForegroundWindow()
+        if is_open_start(foreground):
+            found = int(foreground)
+        else:
+            callback_type = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND,
+                                               wintypes.LPARAM)
+            @callback_type
+            def inspect(hwnd, _):
+                nonlocal found
+                if is_open_start(hwnd):
+                    found = int(hwnd)
+                    return False
+                return True
+            user.EnumWindows.argtypes = (callback_type, wintypes.LPARAM)
+            user.EnumWindows.restype = wintypes.BOOL
+            user.EnumWindows(inspect, 0)
+    except (OSError, AttributeError, TypeError, ValueError):
         pass
-    _windows_start_menu_active._cached = (now, active)
-    return active
+    _windows_start_menu_window._cached = (now, found)
+    return found
+
+
+def _windows_start_menu_active(now=None):
+    """Used for Start's topmost hand layer, identical to input detection."""
+    return _windows_start_menu_window(now) is not None
+
+
+def _windows_hand_pointer_shell_target(now=None):
+    """Return Start or foreground Task Manager for the temporary mouse mode.
+
+    Start is a *visible shell surface*, which need not own foreground focus on
+    Win11. Task Manager must still be foreground to avoid hijacking interaction
+    when its window is behind an ordinary application.
+    """
+    if not sys.platform.startswith('win'):
+        return None
+    now = time.monotonic() if now is None else float(now)
+    cached = getattr(_windows_hand_pointer_shell_target, '_cached', None)
+    if cached is not None and now - cached[0] < 0.06:
+        return cached[1]
+    target = None
+    start_hwnd = _windows_start_menu_window(now)
+    if start_hwnd:
+        target = ('start', start_hwnd)
+    else:
+        try:
+            user = ctypes.windll.user32
+            user.GetForegroundWindow.restype = wintypes.HWND
+            hwnd = user.GetForegroundWindow()
+            if hwnd:
+                proc = _windows_process_name(hwnd)
+                if proc == 'taskmgr.exe':
+                    target = ('task_manager', int(hwnd))
+                elif not proc:
+                    cls = ctypes.create_unicode_buffer(128)
+                    user.GetClassNameW(wintypes.HWND(hwnd), cls, len(cls))
+                    if cls.value.casefold() == 'taskmanagerwindow':
+                        target = ('task_manager', int(hwnd))
+        except (OSError, AttributeError, TypeError, ValueError):
+            pass
+    _windows_hand_pointer_shell_target._cached = (now, target)
+    return target
+
+
+def _windows_hand_pointer_target_contains(hwnd, point):
+    """Check that a native hand-click is within the active shell window."""
+    if not sys.platform.startswith('win') or not hwnd or point is None:
+        return False
+    try:
+        user = ctypes.windll.user32
+        user.GetWindowRect.argtypes = (wintypes.HWND, ctypes.POINTER(wintypes.RECT))
+        user.GetWindowRect.restype = wintypes.BOOL
+        rect = wintypes.RECT()
+        if not user.GetWindowRect(wintypes.HWND(hwnd), ctypes.byref(rect)):
+            return False
+        x, y = _windows_touch_screen_pixels(point)
+        return rect.left <= x < rect.right and rect.top <= y < rect.bottom
+    except (OSError, AttributeError, TypeError, ValueError):
+        return False
 
 
 def _windows_window_uses_native_mouse(screen_point):
@@ -6051,6 +6185,15 @@ class SpatialDesktop(QWidget):
         self._task_view_hotkey_last_seen = 0.0
         self._task_view_native_mode = False
         self._task_view_native_position = None
+        # Start and Task Manager temporarily use the same real-mouse follow
+        # behaviour as the Whiteboard's Save PNG dialog. Pinches in these
+        # surfaces are never forwarded to the native touchscreen backend.
+        self._shell_native_mode = False
+        self._shell_native_target = None
+        self._shell_native_pinch_side = None
+        self._shell_native_pinch_started = None
+        self._shell_native_pinch_origin = None
+        self._shell_native_wait_release = True
         # Floating clipboard history is populated from the real system clipboard. Entries
         # are kept in memory for this session and can be selected or dragged with a hand.
         self.floating_clipboard_visible = False
@@ -12655,6 +12798,7 @@ class SpatialDesktop(QWidget):
             sys.platform.startswith("win") and self.desktop_mode == "os"
             and not self.hand_tracking_paused and
             not self._windows_task_view_active() and
+            not getattr(self, '_shell_native_mode', False) and
             (self._os_fist_scroll_active() or self._os_two_fist_window_drag_active())
         )
         if should_hide == self._native_scroll_cursor_hidden:
@@ -16816,6 +16960,93 @@ class SpatialDesktop(QWidget):
             self._clear_menu_pinch_sequence(tracked)
         return True
 
+    def _process_windows_shell_hand_input(self, cursor_points, poses, now):
+        """Hand-following mouse for Start and Task Manager, like Save PNG.
+
+        Both panels can reject PT_TOUCH taps from Freehand's translucent HWND.
+        When one is foreground, move the real mouse using the calibrated hand
+        position, and turn a short, stationary pinch into a native mouse click.
+        Right hand always wins; the left is a fallback when right is absent.
+        Neither gesture attachment settings nor normal desktop input changes.
+        """
+        target = (_windows_hand_pointer_shell_target(now)
+                  if (sys.platform.startswith('win') and self.desktop_mode == 'os'
+                      and not self.hand_tracking_paused
+                      and getattr(self, '_camera_handover_dialog', None) is None)
+                  else None)
+        if target is None:
+            self._shell_native_mode = False
+            self._shell_native_target = None
+            self._shell_native_pinch_side = None
+            self._shell_native_pinch_started = None
+            self._shell_native_pinch_origin = None
+            self._shell_native_wait_release = True
+            return False
+
+        if not self._shell_native_mode or self._shell_native_target != target:
+            self._shell_native_mode = True
+            self._shell_native_target = target
+            self._shell_native_pinch_side = None
+            self._shell_native_pinch_started = None
+            self._shell_native_pinch_origin = None
+            # If Start/Task Manager appears midway through a pinch, do not
+            # reinterpret its release as a shell click.
+            self._shell_native_wait_release = any(
+                bool(p.get('pinch', False)) for p in poses.values())
+            self._end_two_hand_touch()
+            for hand in ('left', 'right'):
+                if self.pinch_drag_active.get(hand, False):
+                    self._end_pinch_drag(hand, status=False)
+                self._clear_menu_pinch_sequence(hand)
+
+        side = 'right' if 'right' in cursor_points else (
+            'left' if 'left' in cursor_points else None)
+        if side is None:
+            self._shell_native_pinch_side = None
+            self._shell_native_pinch_started = None
+            self._shell_native_pinch_origin = None
+            self._shell_native_wait_release = True
+            return True
+        point = self._virtual_point_to_global(cursor_points[side])
+        if point is None:
+            return True
+        # Identical pointer routing to the responsive Whiteboard Save picker.
+        self._set_os_pointer_global(point)
+        pressed = bool(poses.get(side, {}).get('pinch', False))
+        if side != self._shell_native_pinch_side:
+            self._shell_native_pinch_side = side
+            self._shell_native_pinch_started = None
+            self._shell_native_pinch_origin = None
+            self._shell_native_wait_release = pressed
+
+        if self._shell_native_wait_release:
+            if not pressed:
+                self._shell_native_wait_release = False
+        elif pressed:
+            if self._shell_native_pinch_started is None:
+                self._shell_native_pinch_started = float(now)
+                self._shell_native_pinch_origin = QPoint(point)
+        elif self._shell_native_pinch_started is not None:
+            elapsed = float(now)-self._shell_native_pinch_started
+            origin = self._shell_native_pinch_origin
+            self._shell_native_pinch_started = None
+            self._shell_native_pinch_origin = None
+            if (origin is not None and 0.045 <= elapsed <= 1.1 and
+                    (point.x()-origin.x())**2 +
+                    (point.y()-origin.y())**2 <= 55**2 and
+                    _windows_hand_pointer_target_contains(target[1],
+                                                           (point.x(), point.y()))):
+                if _windows_native_left_click((point.x(), point.y())):
+                    play_ui_sound(self.ui_preferences.get('sound_pinch', 'None'))
+                else:
+                    self.status = ('Windows shell click blocked — check '
+                                   'Task Manager elevation/UIAccess')
+        # The shell owns this whole gesture frame; never arm a long Pinch Menu
+        # hold, a modifier right-click, or a duplicate native touch contact.
+        for hand in ('left', 'right'):
+            self._clear_menu_pinch_sequence(hand)
+        return True
+
     def _process_two_hand_touch(self, cursor_points, poses, now):
         """Cross-platform two-hand touch via thumb-index pinches.
 
@@ -17493,7 +17724,9 @@ class SpatialDesktop(QWidget):
             if (self.menu_open and self.hub_visible and not search_surface_active and
                     not self._canvas_menu_panel_contains(cursor) and
                     not self._floating_clipboard_contains(cursor) and
-                    not clipboard_drag_in_progress):
+                    not clipboard_drag_in_progress and
+                    not (self.desktop_mode == 'os' and
+                         _windows_hand_pointer_shell_target(now) is not None)):
                 self._clear_menu_pinch_sequence(side)
                 self._reset_fist_gesture(side)
                 self.active_action[side] = None
@@ -17618,6 +17851,7 @@ class SpatialDesktop(QWidget):
         # Linux windows continue receiving two-contact /dev/uinput multitouch.
         self._linux_hover_qtile_panel(cursor_points, now)
         if (self._process_windows_task_view_input(cursor_points, poses, now) or
+                self._process_windows_shell_hand_input(cursor_points, poses, now) or
                 self._process_two_hand_touch(cursor_points, poses, now)):
             self.pointer_side = None
             self.active_push_sides.clear()
