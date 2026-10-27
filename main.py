@@ -5047,9 +5047,21 @@ class FreehandWhiteboard(QWidget):
         # Require a real release before drawing so the menu click leaves no dot.
         self._hand_ready = {"left": False, "right": False}
         self._file_dialog_open = False
+        self._save_dialog = None
+        self._save_hand_pinch_side = None
+        self._save_hand_pinch_started = None
+        self._save_hand_pinch_origin = None
+        self._save_hand_pinch_last = None
+        self._save_hand_wait_release = True
         self._hand_cursors = {}
         self._last_reassert = 0.0
         self._feedback = "Pinch and move to draw · Use the floating tools to change colour"
+        # Match the Glass Menu's highlighted button feedback, including on the
+        # custom-painted colour circles. A press flash is separate from the
+        # longer-lived selected pen/eraser/dark-mode state.
+        self._palette_pressed_control = None
+        self._palette_pressed_at = 0.0
+        self._palette_mouse_hover_control = None
         self.setGeometry(owner.geometry())
         self._ensure_canvas()
 
@@ -5211,6 +5223,14 @@ class FreehandWhiteboard(QWidget):
             return {"kind": "draw", "last": QPointF(point)}
         if control == "panel":
             return {"kind": "palette_drag", "last": QPointF(point)}
+        # Play on contact, just like the Glass Menu, so a longer held pinch
+        # never makes the sound feel late. The release still decides whether
+        # the intended control is actually activated.
+        play_ui_sound(self.owner.ui_preferences.get("sound_glass_buttons", "None"))
+        self._palette_pressed_control = control
+        self._palette_pressed_at = time.monotonic()
+        self.update()
+        QTimer.singleShot(320, self.update)
         return {"kind": "control", "control": control}
 
     def _move_stroke(self, stroke, point):
@@ -5229,8 +5249,11 @@ class FreehandWhiteboard(QWidget):
 
     def _finish_stroke(self, stroke, point):
         if stroke is not None and stroke.get("kind") == "control":
-            if point is not None and self._hit_control(point) == stroke.get("control"):
-                self._apply_control(stroke["control"])
+            control = stroke["control"]
+            if point is not None and self._hit_control(point) == control:
+                # The click sound and bright pressed highlight already fired
+                # once at contact; don't repeat either on the final release.
+                self._apply_control(control)
 
     def handle_hand_frame(self, cursor_points, poses):
         """Consume all gestures while visible; never forward touch to the OS."""
@@ -5260,6 +5283,8 @@ class FreehandWhiteboard(QWidget):
                 self._hand_strokes[side] = None
                 self._finish_stroke(stroke, cursors.get(side))
         self._hand_cursors = cursors
+        if self._file_dialog_open:
+            self._update_save_dialog_hand_input(cursor_points, poses)
         self.update()
 
     def release_all_strokes(self):
@@ -5268,35 +5293,148 @@ class FreehandWhiteboard(QWidget):
         self._mouse_stroke = None
         self._mouse_button = None
         self._hand_cursors = {}
+        self._palette_mouse_hover_control = None
+        self._palette_pressed_control = None
+        self._palette_pressed_at = 0.0
+
+    def _update_save_dialog_hand_input(self, cursor_points, poses):
+        """Keep the native pointer and pinch-taps usable while Save PNG is open.
+
+        The board normally consumes every gesture so a pinch cannot activate
+        controls underneath. Only this explicit file-picker exception routes
+        pointer movement/clicks to the OS. It never changes either hand's
+        saved detach state or enables normal desktop gestures.
+        """
+        dialog = self._save_dialog
+        if dialog is None or not dialog.isVisible():
+            return
+        # Right hand retains the usual cursor priority; the left hand is a
+        # fallback if the right is not present/has been detached by tracking.
+        side = 'right' if 'right' in cursor_points else (
+            'left' if 'left' in cursor_points else None)
+        if side is None:
+            self._save_hand_pinch_side = None
+            self._save_hand_pinch_started = None
+            self._save_hand_wait_release = True
+            return
+        global_point = self.owner._virtual_point_to_global(cursor_points[side])
+        if global_point is None:
+            return
+        # The cursor follows the hand only for this modal file picker. The
+        # whiteboard remains mouse-hidden and pinch drawing remains blocked.
+        self.owner._set_os_pointer_global(global_point)
+        pressed = bool(poses.get(side, {}).get('pinch', False))
+        if side != self._save_hand_pinch_side:
+            # Switching hands cannot release a click begun by the other hand.
+            self._save_hand_pinch_side = side
+            self._save_hand_pinch_started = None
+            self._save_hand_wait_release = pressed
+        if self._save_hand_wait_release:
+            if not pressed:
+                self._save_hand_wait_release = False
+            return
+        if pressed:
+            if self._save_hand_pinch_started is None:
+                self._save_hand_pinch_started = time.monotonic()
+                self._save_hand_pinch_origin = QPoint(global_point)
+            self._save_hand_pinch_last = QPoint(global_point)
+            return
+        if self._save_hand_pinch_started is None:
+            return
+        elapsed = time.monotonic() - self._save_hand_pinch_started
+        start = self._save_hand_pinch_origin
+        self._save_hand_pinch_started = None
+        self._save_hand_pinch_origin = None
+        # Distinguish a tap from a move/drag; don't create a click for a pinch
+        # that had already begun before opening the Save dialog.
+        if not 0.045 <= elapsed <= 1.1 or start is None:
+            return
+        if ((global_point.x()-start.x())**2 +
+                (global_point.y()-start.y())**2 > 55**2):
+            return
+        # Never click another application's window if a hand is outside the
+        # file picker. A Qt combobox popup can be slightly outside its frame;
+        # a small margin accommodates the dialog's native window decorations.
+        if not dialog.frameGeometry().adjusted(-10, -10, 10, 10).contains(global_point):
+            return
+        if sys.platform.startswith('win'):
+            _windows_native_left_click((global_point.x(), global_point.y()))
+        elif pyautogui is not None:
+            try:
+                pyautogui.click(x=global_point.x(), y=global_point.y(), _pause=False)
+            except Exception:
+                pass
+
+    def _on_save_dialog_finished(self, result):
+        """Finish the asynchronous save without blocking the tracking timer."""
+        dialog = self._save_dialog
+        if dialog is None:
+            return
+        paths = dialog.selectedFiles() if result == QDialog.Accepted else []
+        self._save_dialog = None
+        self._file_dialog_open = False
+        self._save_hand_pinch_side = None
+        self._save_hand_pinch_started = None
+        self._save_hand_pinch_origin = None
+        self._save_hand_pinch_last = None
+        self._save_hand_wait_release = True
+        self._hand_strokes = {'left': None, 'right': None}
+        self._hand_ready = {'left': False, 'right': False}
+        self.setCursor(Qt.BlankCursor)
+        dialog.deleteLater()
+        if not paths or not paths[0]:
+            self._feedback = 'Save cancelled'
+        else:
+            filename = str(paths[0])
+            if not filename.lower().endswith('.png'):
+                filename += '.png'
+            success = self._export_image().save(filename, 'PNG')
+            self._feedback = (f'Saved: {Path(filename).name}' if success else
+                              'Unable to save PNG · check the destination')
+        self.update()
 
     def save_png(self):
-        # Export ONLY the image layer, never the tools, hints or hand markers.
-        directory = Path.home() / "Pictures"
+        """Open a responsive Save PNG picker and retain hand-driven input.
+
+        QFileDialog.getSaveFileName() starts the native Windows file picker in a
+        blocking loop. That loop can starve Qt timers (including the camera/hand
+        consumer) and leave the cursor detached. A non-native QFileDialog with
+        open()/finished runs in Freehand's ordinary event loop instead.
+        """
+        if self._file_dialog_open:
+            if self._save_dialog is not None:
+                self._save_dialog.raise_()
+            return False
+        directory = Path.home() / 'Pictures'
         if not directory.is_dir():
             directory = Path.home()
-        proposed = directory / f"Freehand-whiteboard-{datetime.now():%Y%m%d-%H%M%S}.png"
+        proposed = directory / f'Freehand-whiteboard-{datetime.now():%Y%m%d-%H%M%S}.png'
+        dialog = QFileDialog(self, 'Save whiteboard as PNG', str(directory),
+                             'PNG image (*.png)')
+        # Critical: do not use the native Windows COM file picker. The Qt-based
+        # picker responds to regular Qt timers and therefore keeps the camera
+        # and hand controlled cursor updating while the save dialog is open.
+        dialog.setOption(QFileDialog.DontUseNativeDialog, True)
+        dialog.setAcceptMode(QFileDialog.AcceptSave)
+        dialog.setDefaultSuffix('png')
+        dialog.selectFile(proposed.name)
+        dialog.setWindowModality(Qt.WindowModal)
+        dialog.setWindowFlag(Qt.WindowStaysOnTopHint, True)
+        self._save_dialog = dialog
         self._file_dialog_open = True
-        # Show a normal pointer only while the native Save dialog is open so
-        # its folders, filename field, and buttons remain usable with a mouse.
-        # The drawing surface itself always keeps the pointer hidden.
-        self.setCursor(Qt.ArrowCursor)
-        # Do not reassert the fullscreen board's Z-order above the Save dialog.
-        try:
-            chosen, _ = QFileDialog.getSaveFileName(self, "Save whiteboard as PNG", str(proposed),
-                                                     "PNG image (*.png)")
-        finally:
-            self._file_dialog_open = False
-            self.setCursor(Qt.BlankCursor)
-        if not chosen:
-            self._feedback = "Save cancelled"
-            return False
-        if not chosen.lower().endswith(".png"):
-            chosen += ".png"
-        success = self._export_image().save(chosen, "PNG")
-        self._feedback = (f"Saved: {Path(chosen).name}" if success else
-                          "Unable to save PNG · check the destination")
-        self.update()
-        return bool(success)
+        self._hand_strokes = {'left': None, 'right': None}
+        self._hand_ready = {'left': False, 'right': False}
+        self._save_hand_pinch_side = None
+        self._save_hand_pinch_started = None
+        self._save_hand_pinch_origin = None
+        self._save_hand_pinch_last = None
+        self._save_hand_wait_release = True
+        dialog.finished.connect(self._on_save_dialog_finished)
+        # The board itself keeps its hidden cursor; over the picker Qt provides
+        # the normal arrow for mouse users and hand-following cursor input.
+        dialog.open()  # non-blocking; do not call exec() or getSaveFileName()
+        dialog.raise_()
+        return True
 
     def mousePressEvent(self, event):
         if event.button() == Qt.LeftButton:
@@ -5307,11 +5445,20 @@ class FreehandWhiteboard(QWidget):
         super().mousePressEvent(event)
 
     def mouseMoveEvent(self, event):
+        hover = self._hit_control(event.position())
+        if hover != self._palette_mouse_hover_control:
+            self._palette_mouse_hover_control = hover
+            self.update()
         if self._mouse_stroke is not None and self._mouse_button == Qt.LeftButton:
             self._move_stroke(self._mouse_stroke, event.position())
             event.accept()
             return
         super().mouseMoveEvent(event)
+
+    def leaveEvent(self, event):
+        self._palette_mouse_hover_control = None
+        self.update()
+        super().leaveEvent(event)
 
     def mouseReleaseEvent(self, event):
         if event.button() == Qt.LeftButton and self._mouse_stroke is not None:
@@ -5351,26 +5498,65 @@ class FreehandWhiteboard(QWidget):
         painter.setPen(QColor("#a9d0dd"))
         painter.drawText(QRectF(panel.x()+15, panel.y()+42, panel.width()-30, 20),
                          Qt.AlignLeft | Qt.AlignVCenter, "PEN COLOURS")
+        # Match the main Glass Menu: the hand's TPI hovers a custom control,
+        # and a committed pinch/click adds a brief bright cyan pressed glow.
+        hovered = {self._palette_mouse_hover_control}
+        hovered.update(self._hit_control(point) for point in self._hand_cursors.values())
+        active = {stroke.get("control") for stroke in
+                  [self._mouse_stroke, *self._hand_strokes.values()]
+                  if stroke is not None and stroke.get("kind") == "control"}
+        pressed_age = time.monotonic() - self._palette_pressed_at
+        if 0.0 <= pressed_age < 0.30:
+            active.add(self._palette_pressed_control)
         for name, rect, shade in colors:
-            painter.setBrush(QBrush(QColor(shade)))
+            over, down = name in hovered, name in active
             selected = (not self.eraser and
                         ((self._auto_ink and name == "color:0") or
                          (not self._auto_ink and QColor(shade) == self.pen_color)))
-            painter.setPen(QPen(QColor("#b9fbff") if selected else QColor("#557489"),
-                                3 if selected else 1.2))
+            if over or down:
+                painter.setBrush(Qt.NoBrush)
+                painter.setPen(QPen(QColor(100, 255, 255, 125 if over else 210), 2.5))
+                painter.drawEllipse(rect.adjusted(-4, -4, 4, 4))
+            painter.setBrush(QBrush(QColor(shade)))
+            painter.setPen(QPen(QColor("#dbffff") if down else
+                                QColor("#b9fbff") if (over or selected) else QColor("#557489"),
+                                3 if (over or down or selected) else 1.2))
             painter.drawEllipse(rect)
         for name, rect in buttons.items():
             chosen = ((name == "eraser" and self.eraser) or
                       (name == "pen" and not self.eraser) or
                       (name == "dark_mode" and self.dark_mode))
+            over, down = name in hovered, name in active
+            if over or down:
+                # The same two-stage cyan halo and light pressed border used
+                # on the Glass Menu tiles; only Close retains its red accent.
+                for expansion, alpha in ((7.0, 38), (3.5, 78)):
+                    painter.setPen(QPen(QColor(255, 105, 105, alpha) if name == "close"
+                                        else QColor(100, 255, 255, alpha), 2.3))
+                    painter.setBrush(Qt.NoBrush)
+                    painter.drawRoundedRect(rect.adjusted(-expansion, -expansion,
+                                                          expansion, expansion),
+                                            8+expansion, 8+expansion)
+            fill = QLinearGradient(rect.topLeft(), rect.bottomRight())
             if name == "close":
-                fill = QColor("#823340")
+                fill.setColorAt(0, QColor("#e64b57") if (over or down) else QColor("#a74350"))
+                fill.setColorAt(1, QColor("#802232") if (over or down) else QColor("#5c1e29"))
+            elif down:
+                fill.setColorAt(0, QColor(165, 255, 255, 245))
+                fill.setColorAt(1, QColor(20, 115, 150, 250))
+            elif over:
+                fill.setColorAt(0, QColor(165, 255, 255, 225))
+                fill.setColorAt(1, QColor(20, 100, 135, 235))
             elif chosen:
-                fill = QColor("#206d83")
+                fill.setColorAt(0, QColor("#2c8ba1"))
+                fill.setColorAt(1, QColor("#17485e"))
             else:
-                fill = QColor("#1a3448")
+                fill.setColorAt(0, QColor("#244b60"))
+                fill.setColorAt(1, QColor("#122c40"))
             painter.setBrush(QBrush(fill))
-            painter.setPen(QPen(QColor("#7edfe9") if chosen else QColor("#5b879b"), 1.2))
+            painter.setPen(QPen(QColor("#dbffff") if (over or down) else
+                                QColor("#7edfe9") if chosen else QColor("#5b879b"),
+                                2.1 if (over or down) else 1.2))
             painter.drawRoundedRect(rect, 8, 8)
             painter.setPen(QColor("#f5ffff"))
             painter.setFont(QFont("Sans", 9, QFont.DemiBold))
@@ -9770,6 +9956,11 @@ class SpatialDesktop(QWidget):
         board = self.whiteboard
         if board is None or not board.isVisible():
             return
+        # Close a pending Save PNG picker before hiding its parent board. The
+        # dialog's finished handler clears its modal/hand-pointer routing.
+        pending_save = getattr(board, '_save_dialog', None)
+        if pending_save is not None:
+            pending_save.reject()
         board.release_all_strokes()
         board.hide()
         self._end_two_hand_touch()
@@ -15698,7 +15889,18 @@ class SpatialDesktop(QWidget):
             self.left_modifier_last_fist_at = now
             self.left_modifier_release_candidate_since = None
             if self.left_modifier_fist_frames >= 2:
-                self.left_click_modifier_active = True
+                # Modifier right-click means LEFT fist first, then a fresh RIGHT
+                # pinch. If the right-hand pinch countdown is already underway,
+                # a late/flickering left-fist classification must not steal it
+                # and turn the eventual release into a native right-click.
+                right_pose = poses.get("right") or {}
+                right_pinch_in_progress = bool(
+                    right_pose.get("pinch", False) or
+                    self.menu_pinch_started.get("right") is not None or
+                    self.fist_action_menu_open.get("right", False)
+                )
+                if self.left_click_modifier_active or not right_pinch_in_progress:
+                    self.left_click_modifier_active = True
         elif left_pose.get("pinch", False) and left_pose.get("clear_left_pinch", False):
             # A real left pinch is a normal click gesture, not the fist modifier.
             self.left_click_modifier_active = False
@@ -18275,15 +18477,12 @@ class SpatialDesktop(QWidget):
                             self.right_click_mode_enabled = False
                             self.scroll_mode_enabled = False
                             self.status = "Normal mode restored — release the pinch; pinch again to open the menu"
-                        elif self._point_on_recent_selection(cursor, now):
-                            # Over highlighted text a long pinch invokes the native
-                            # editing context menu instead of our circular Pinch Menu.
-                            self._activate_canvas_right_click(QPointF(cursor), side, now)
-                            self._clear_menu_pinch_sequence(side)
-                            self.action_stop_wait_open[side] = True
-                            self.action_stop_open_since[side] = None
-                            self.status = "Native text context menu — release before next gesture"
                         else:
+                            # A completed Pinch Menu hold always opens Freehand's
+                            # menu, including when the pointer is over recently
+                            # selected text. Native right-click is an explicit
+                            # menu choice or the LEFT-fist-first modifier gesture;
+                            # selection proximity must not change the gesture.
                             self._set_pinch_menu_open(side, True, now, timer_completed=True)
                             self.fist_origin_points[side] = QPointF(cursor)
                             self.fist_arm_points[side] = QPointF(cursor)
