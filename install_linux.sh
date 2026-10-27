@@ -63,7 +63,7 @@ echo 'Freehand: Spatial Computing - Linux installer'
 echo "Project folder: $APP_DIR"
 echo '============================================================'
 
-echo '[1/9] Checking Python 3.10, 3.11, 3.12, or 3.13...'
+echo '[1/6] Checking Python 3.10, 3.11, 3.12, or 3.13...'
 PYTHON=""
 for candidate in python3.13 python3.12 python3.11 python3.10 python3; do
     if command -v "$candidate" >/dev/null 2>&1; then
@@ -78,13 +78,13 @@ if [ -z "$PYTHON" ]; then
     exit 1
 fi
 
-echo '[2/9] Checking virtual environment support...'
+echo '[2/6] Checking virtual environment support...'
 if ! "$PYTHON" -m venv --help >/dev/null 2>&1; then
     echo 'ERROR: venv support is missing. Install your distribution package (for example, python3-venv).' >&2
     exit 1
 fi
 
-echo '[3/9] Creating/reusing virtual environment...'
+echo '[3/6] Creating/reusing virtual environment...'
 if [ -x "$APP_DIR/.venv/bin/python" ]; then
     echo 'Existing virtual environment found; reusing it.'
 else
@@ -92,7 +92,7 @@ else
 fi
 VPY="$APP_DIR/.venv/bin/python"
 
-echo '[4/9] Installing Spatial Desktop and local document-search dependencies...'
+echo '[4/6] Installing Freehand hand-interaction dependencies...'
 if ! "$VPY" -c 'import pip; print("Using pip", pip.__version__)'; then
     "$VPY" -m ensurepip
 fi
@@ -103,35 +103,7 @@ if ! "$VPY" -u -m pip install -r "$APP_DIR/requirements-3d.txt"; then
     echo "Retry later with: $VPY -m pip install -r $APP_DIR/requirements-3d.txt" >&2
 fi
 
-echo '[5/9] Installing optional offline StreamTTS runtime...'
-if "$VPY" -u -m pip install --verbose -r "$APP_DIR/requirements-voice.txt"; then
-    echo '[6/9] Downloading StreamTTS voice files for offline speech...'
-    echo 'This download is only needed once and is skipped if files already exist.'
-    if ! "$VPY" -u "$APP_DIR/install_voice_models.py"; then
-        echo 'WARNING: StreamTTS model download failed. The app will still install.' >&2
-        echo "Retry later with: $VPY $APP_DIR/install_voice_models.py" >&2
-    fi
-else
-    echo 'WARNING: StreamTTS dependencies could not be installed. Hand tracking and file search will still work.' >&2
-    echo "Retry later with: $VPY -m pip install -r $APP_DIR/requirements-voice.txt" >&2
-fi
-
-echo '[7/9] Downloading optional local face welcome models...'
-echo 'YuNet/SFace run locally. Face recognition stays disabled until a user enrolls in Settings.'
-if ! "$VPY" -u "$APP_DIR/install_face_models.py"; then
-    echo 'WARNING: Face-recognition model download failed. The app will still work without Face Welcome.' >&2
-    echo "Retry later with: $VPY $APP_DIR/install_face_models.py" >&2
-fi
-
-echo '[8/9] Downloading the default quantized Liquid AI d1-omni-600M model and llama.cpp...'
-echo 'The Q8 model plus projector is about 670 MB. A llama.cpp server for this CPU architecture is installed too'
-echo '(prebuilt for x64/arm64/s390x; other architectures are compiled locally if cmake and a C++ compiler exist).'
-if ! "$VPY" -u "$APP_DIR/install_d1_model.py" 600m; then
-    echo 'WARNING: d1 setup did not complete. Spatial Desktop remains usable without d1.' >&2
-    echo "Retry later with: $VPY $APP_DIR/install_d1_model.py 600m" >&2
-fi
-
-echo '[8b/9] Configuring Linux two-hand multitouch (/dev/uinput)...'
+echo '[5/6] Configuring Linux two-hand multitouch (/dev/uinput)...'
 # Ask for privilege escalation HERE during regular installation, rather than
 # asking users to download/run another setup script after installation.
 DESKTOP_USER="$(id -un)"
@@ -169,7 +141,7 @@ else
     echo 'Linux multitouch permission configured. New group membership may require sign-out/sign-in.'
 fi
 
-echo '[9/9] Creating/updating Freehand application-menu shortcut automatically...'
+echo '[6/6] Creating/updating Freehand application-menu shortcut automatically...'
 # Use the same entry name as Freehand's built-in updater. Do not create a
 # separate repair file, or another application-menu entry on each update.
 ICON_PATH="$APP_DIR/Freehand_logo_small.png"
@@ -220,8 +192,7 @@ echo '============================================================'
 echo 'INSTALLATION COMPLETE'
 echo "Launcher: $APPS_DIR/spatial-desktop-prototype.desktop"
 echo 'Find Freehand: Spatial Computing in your app launcher.'
-echo 'Local search uses SQLite and remains available without d1. d1 is an optional local decision model.'
-echo 'D1 remains off at runtime by default; turn it on in Settings -> Engine when required.'
-echo 'StreamTTS runs offline when its runtime and voice files are installed.'
-echo 'Face Welcome is optional and local-only; enroll a user through Settings to enable it.'
+echo 'Freehand includes only hand tracking, gestures, whiteboard and virtual desktop.'
+echo 'D1, voice input/output, file search and face recognition are separate applications.'
+echo 'The MediaPipe hand model downloads automatically on first use if not cached.'
 echo '============================================================'

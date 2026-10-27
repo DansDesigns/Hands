@@ -1,7 +1,0 @@
-# Optional offline StreamTTS speech output (Piper/VITS via sherpa-onnx).
-sherpa-onnx
-sherpa-onnx-bin
-numpy
-sounddevice
-pyttsx3
-librosa

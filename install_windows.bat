@@ -7,8 +7,6 @@ if not exist "main.py" (
   echo ERROR: main.py was not found beside this installer or in the Hands subfolder.
   goto :failed
 )
-rem Keep original installer directory for bundled add-ons if main.py is in Hands.
-set "FREEHAND_INSTALLER_DIR=%~dp0"
 rem Repair a missing Start Menu shortcut without rerunning model downloads.
 rem Usage: install_windows.bat --shortcut-only
 if /I "%~1"=="--shortcut-only" goto :shortcut_step
@@ -18,7 +16,7 @@ echo Freehand: Spatial Computing - Windows installer
 echo Working directory: %CD%
 echo ============================================================
 
-echo [1/9] Checking the Python Launcher...
+echo [1/5] Checking the Python Launcher...
 where py >nul 2>&1
 if errorlevel 1 (
   call :install_python
@@ -26,7 +24,7 @@ if errorlevel 1 (
 )
 
 set "PYTHON_CMD="
-echo [2/9] Searching for Python 3.10, 3.11, or 3.12...
+echo [2/5] Searching for Python 3.10, 3.11, or 3.12...
 for %%V in (3.12 3.11 3.10) do (
     py -%%V -c "import sys; print(sys.version)" 2>nul
     if not errorlevel 1 if not defined PYTHON_CMD set "PYTHON_CMD=py -%%V"
@@ -44,7 +42,7 @@ if not defined PYTHON_CMD goto :no_supported_python
 
 echo Selected interpreter: %PYTHON_CMD%
 echo.
-echo [3/9] Creating the virtual environment (this may take a moment)...
+echo [3/5] Creating the virtual environment (this may take a moment)...
 if exist ".venv\Scripts\python.exe" (
     echo Existing virtual environment found; reusing it.
 ) else (
@@ -54,27 +52,7 @@ if exist ".venv\Scripts\python.exe" (
 
 set "VPY=%CD%\.venv\Scripts\python.exe"
 echo.
-echo [3b/9] Installing Freehand Search and Indexing modules...
-rem The distributed package includes these files. Stage them next to main.py;
-rem do not download or replace user search settings or the SQLite index.
-for %%F in (freehand_search_index.py apply_freehand_search_settings.py) do (
-  if not exist "%%F" if exist "%FREEHAND_INSTALLER_DIR%%%F" (
-    copy /Y "%FREEHAND_INSTALLER_DIR%%%F" "%%F" >nul
-    if errorlevel 1 goto :search_setup_error
-  )
-  if not exist "%%F" (
-    echo ERROR: Required bundled Search and Indexing module is missing: %%F
-    echo Extract all files from the Freehand installer package into the app folder.
-    goto :search_setup_error
-  )
-)
-"%VPY%" -u apply_freehand_search_settings.py --main main.py
-if errorlevel 1 goto :search_setup_error
-"%VPY%" -c "from freehand_search_index import SearchIndex; print('Search indexing module ready; roots default to user home')"
-if errorlevel 1 goto :search_setup_error
-
-echo.
-echo [4/9] Installing Spatial Desktop and local document-search dependencies...
+echo [4/5] Installing Freehand hand-interaction dependencies...
 "%VPY%" -c "import pip; print('Using pip', pip.__version__)"
 if errorlevel 1 (
   echo pip is missing; bootstrapping it with ensurepip...
@@ -93,53 +71,11 @@ if errorlevel 1 (
 )
 
 echo.
-echo [4c/9] Enabling optional local music tag recognition ^(Mutagen^)...
-"%VPY%" -c "import mutagen" >nul 2>&1
-if errorlevel 1 (
-  "%VPY%" -m pip install mutagen
-  if errorlevel 1 echo WARNING: Music indexing still works, but embedded artist/genre tags may not be available.
-)
-
-echo.
-echo [5/9] Installing optional offline StreamTTS runtime...
-"%VPY%" -u -m pip install --verbose -r requirements-voice.txt
-if errorlevel 1 (
-  echo WARNING: StreamTTS dependencies could not be installed. Hand tracking and file search will still work.
-  echo You can retry later with: .venv\Scripts\python.exe -m pip install -r requirements-voice.txt
-) else (
-  echo.
-  echo [6/9] Downloading StreamTTS voice files for offline speech...
-  echo This download is only needed once and is skipped if files already exist.
-  "%VPY%" -u install_voice_models.py
-  if errorlevel 1 (
-    echo WARNING: StreamTTS model download failed. The app will still install.
-    echo Retry later with: .venv\Scripts\python.exe install_voice_models.py
-  )
-)
-
-echo.
-echo [7/9] Downloading optional local face welcome models...
-echo YuNet/SFace run locally. Face recognition remains disabled until enrolled in Settings.
-"%VPY%" -u install_face_models.py
-if errorlevel 1 (
-  echo WARNING: Face-recognition model download failed. The app will still work without Face Welcome.
-  echo Retry later with: .venv\Scripts\python.exe install_face_models.py
-)
-
-echo.
-echo [8/9] Downloading the default quantized Liquid AI d1-omni-600M model...
-echo The Q8 model plus projector is about 670 MB. The installer also downloads llama.cpp for local inference.
-echo The d1-omni-600M Q8 model is the only model option enabled for now.
-"%VPY%" -u install_d1_model.py 600m
-if errorlevel 1 (
-  echo WARNING: d1 setup did not complete. Spatial Desktop remains usable without d1.
-  echo Retry later with: .venv\Scripts\python.exe install_d1_model.py 600m
-)
 
 
 :shortcut_step
 echo.
-echo [9/9] Preparing the windowless launcher and creating the Start Menu shortcut...
+echo [5/5] Preparing the windowless launcher and creating the Start Menu shortcut...
 rem The installer embeds a current launcher so a missing/outdated VBS does not
 rem prevent Start Menu installation. Existing up-to-date launchers are preserved.
 set "FREEHAND_LAUNCHER=%CD%\launch_windows.vbs"
@@ -180,11 +116,9 @@ echo ============================================================
 echo INSTALLATION COMPLETE
 echo Start Menu shortcut: Freehand - Spatial Computing
 echo Project folder: %CD%
-echo Search and Indexing is installed: home folder by default; add folders in Glass Settings - SEARCH.
-echo The index updates in the background when Freehand launches; existing indexed folders are preserved.
-echo Local search uses SQLite and remains available without d1. d1 is an optional local decision model.
-echo StreamTTS runs offline when its runtime and voice files are installed. d1 runs locally after its model is cached.
-echo Face Welcome is optional and local-only; enroll a user through Settings to enable it.
+echo Freehand installs only hand tracking, gestures, the Glass Menu and virtual desktop.
+echo D1, file search, speech input/output and face recognition are separate applications.
+echo The MediaPipe hand model downloads automatically on first use if not cached.
 echo ============================================================
 pause
 exit /b 0
@@ -252,11 +186,6 @@ where py >nul 2>&1
 if not errorlevel 1 exit /b 0
 echo ERROR: Python installation completed but no usable interpreter was found.
 exit /b 1
-
-:search_setup_error
-echo ERROR: Search and Indexing setup failed. Existing Freehand files were left as intact as possible.
-echo Check that freehand_search_index.py and apply_freehand_search_settings.py were included.
-goto :failed
 
 :shortcut_error
 echo ERROR: Package installation finished, but Start Menu shortcut creation failed.

@@ -1,2 +1,0 @@
-# d1 inference uses the bundled llama.cpp llama-server executable and GGUF files.
-# No PyTorch/Transformers stack is required for the quantized GGUF runtime.

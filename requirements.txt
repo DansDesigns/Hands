@@ -1,9 +1,7 @@
+# Freehand — hand interaction only (no D1, Vosk, TTS, face recognition or file index).
+# Install into an isolated virtual environment; keep 3D support in requirements-3d.txt.
 PySide6>=6.8
 opencv-contrib-python>=4.10
 mediapipe>=0.10.20
 numpy>=1.26
-vosk>=0.3.45
-sounddevice>=0.5
 pyautogui>=0.9.54
-pypdf>=5.0
-python-docx>=1.1

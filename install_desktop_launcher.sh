@@ -11,11 +11,11 @@ mkdir -p "$APPS_DIR"
 cat > "$APPS_DIR/spatial-desktop-prototype.desktop" <<DESKTOP
 [Desktop Entry]
 Type=Application
-Name=Spatial Desktop Prototype
-Comment=Camera-controlled spatial desktop and local search
+Name=Freehand: Spatial Computing
+Comment=Hand tracking and gesture control
 Exec="$APP_DIR/spatial_desktop_launcher.sh"
 TryExec="$APP_DIR/spatial_desktop_launcher.sh"
-Terminal=true
+Terminal=false
 Categories=Utility;
 DESKTOP
 chmod +x "$APPS_DIR/spatial-desktop-prototype.desktop"

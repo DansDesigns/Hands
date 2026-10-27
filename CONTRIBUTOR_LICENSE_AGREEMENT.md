@@ -1,8 +1,8 @@
-# Spatial Desktop Contributor License Agreement (CLA)
+# Freehand Contributor License Agreement (CLA)
 
 Please read this agreement before submitting a pull request. This agreement is
-intended to let DansDesigns maintain Spatial Desktop, publish it for free
-personal use, and offer separately licensed commercial copies.
+intended to let DansDesigns maintain Freehand as GPL-3.0-or-later open-source software and optionally
+offer paid prebuilt installers or separately licensed editions where legally permitted.
 
 By submitting a contribution, and indicating in the pull request that you agree
 to this CLA, you confirm the following:
@@ -38,8 +38,10 @@ to this CLA, you confirm the following:
 
 Please add this statement to your pull request:
 
-> I have read the Spatial Desktop Contributor License Agreement and agree to
+> I have read the Freehand Contributor License Agreement and agree to
 > its terms. I have the right to submit this contribution under those terms.
 
-This CLA is a starting point and should be reviewed by a qualified solicitor
-before the project is used commercially at scale.
+This CLA does not cancel a contributor's rights or change the GPL rights of existing recipients.
+It grants DansDesigns additional permission to use contributions under other
+licences in later distributions. Review with a qualified solicitor before
+relying on it for commercial dual licensing.
