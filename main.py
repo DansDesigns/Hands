@@ -92,7 +92,6 @@ _FREEHAND_BOOT_APP = None
 _FREEHAND_BOOT_SPLASH = None
 _FREEHAND_SPLASH_EXIT_ANIMATION = None
 _FREEHAND_SPLASH_SHOWN_AT = 0.0
-_FREEHAND_SPLASH_MIN_VISIBLE_SECONDS = 2.0
 
 # Keep the supplied Freehand_logo.png completely unchanged. These durations
 # animate only the native splash window's alpha, not the source image.
@@ -435,11 +434,8 @@ from PySide6.QtWidgets import (QApplication, QWidget, QMessageBox, QInputDialog,
 
 from user_paths import user_data_dir, user_file
 
-try:
-    import pyautogui
-    pyautogui.FAILSAFE = False
-except Exception:
-    pyautogui = None
+# pyautogui is imported below, AFTER Tracker starts its camera thread.
+# It is needed for OS input, but should not keep the camera indicator dark.
 
 # Voice services own their Vosk/audio imports; they are unused in this module.
 
@@ -448,6 +444,116 @@ MODELS = ROOT / "models"
 MODELS.mkdir(exist_ok=True)
 HAND_MODEL = MODELS / "hand_landmarker.task"
 HAND_URL = "https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task"
+
+
+# Start the hand-model load as soon as the camera/Qt dependencies have imported,
+# rather than only AFTER the camera has finished opening. On Windows the DirectShow
+# driver and MediaPipe graph can each take seconds; they can initialize in parallel
+# while the splash and Glass Menu are being prepared. The model is passed to the
+# camera worker only after construction completes and is never used concurrently.
+def download(url: str, target: Path) -> None:
+    """Download the hand model atomically, with a bounded network timeout.
+
+    This runs on a background model-preparation thread during startup,
+    never on Qt's splash/main thread. A failed download leaves no corrupt .task file behind.
+    """
+    print(f"Downloading {url}", flush=True)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    temporary = target.with_name(target.name + f".{os.getpid()}.part")
+    try:
+        with urllib.request.urlopen(url, timeout=20) as source, temporary.open("wb") as output:
+            while chunk := source.read(1024 * 1024):
+                output.write(chunk)
+        if temporary.stat().st_size == 0:
+            raise RuntimeError("Downloaded hand model is empty")
+        os.replace(temporary, target)
+    except BaseException:
+        temporary.unlink(missing_ok=True)
+        raise
+
+
+def ensure_models() -> None:
+    if not HAND_MODEL.is_file() or HAND_MODEL.stat().st_size == 0:
+        download(HAND_URL, HAND_MODEL)
+
+
+
+def _freehand_create_hand_landmarker():
+    """Build the original VIDEO-mode hand model with unchanged safety thresholds."""
+    ensure_models()
+    import mediapipe as mp
+    from mediapipe.tasks import python as mp_python
+    from mediapipe.tasks.python import vision
+    options = vision.HandLandmarkerOptions(
+        base_options=mp_python.BaseOptions(model_asset_path=str(HAND_MODEL)),
+        running_mode=vision.RunningMode.VIDEO,
+        num_hands=2,
+        min_hand_detection_confidence=0.60,
+        min_hand_presence_confidence=0.58,
+        min_tracking_confidence=0.55,
+    )
+    return mp, vision.HandLandmarker.create_from_options(options)
+
+
+class _FreehandHandModelWarmup:
+    """One background load, with transfer of ownership to the capture worker.
+
+    An early shutdown may happen while a slow model import/download is underway;
+    cancellation ensures that a model finishing after shutdown is closed rather
+    than being left alive with no tracker owning it.
+    """
+    def __init__(self):
+        self.ready = threading.Event()
+        self._lock = threading.Lock()
+        self._cancelled = False
+        self._result = None
+        self._error = None
+        self.started_at = time.monotonic()
+        self.thread = threading.Thread(target=self._prepare, name="FreehandHandModel", daemon=True)
+        self.thread.start()
+
+    def _prepare(self):
+        try:
+            result = _freehand_create_hand_landmarker()
+            with self._lock:
+                if self._cancelled:
+                    try:
+                        result[1].close()
+                    except Exception:
+                        pass
+                else:
+                    self._result = result
+        except Exception as exc:
+            with self._lock:
+                self._error = exc
+        finally:
+            self.ready.set()
+
+    def take(self):
+        """Call after ready. Transfer the landmarker to the single capture worker."""
+        with self._lock:
+            if self._error is not None:
+                raise self._error
+            if self._cancelled or self._result is None:
+                raise RuntimeError("Hand model preparation was cancelled or already consumed")
+            result, self._result = self._result, None
+            return result
+
+    def cancel(self):
+        with self._lock:
+            self._cancelled = True
+            result, self._result = self._result, None
+        if result is not None:
+            try:
+                result[1].close()
+            except Exception:
+                pass
+
+
+# Only real application launches prewarm the model. Imports by tests, tools,
+# package inspectors and third-party utilities never start native ML threads.
+_FREEHAND_EARLY_HAND_MODEL = (_FreehandHandModelWarmup()
+                              if __name__ == "__main__" else None)
 VOSK_MODEL = MODELS / "vosk-model-small-en-us-0.15"
 USER_DATA_DIR = user_data_dir()
 USER_DATA_DIR.mkdir(parents=True, exist_ok=True)
@@ -3034,32 +3140,6 @@ def load_gesture_settings() -> dict:
     return values
 
 
-def download(url: str, target: Path) -> None:
-    """Download the hand model atomically, with a bounded network timeout.
-
-    This runs on the camera worker during first-time startup, never on Qt's
-    splash/main thread. A failed download leaves no corrupt .task file behind.
-    """
-    print(f"Downloading {url}", flush=True)
-    target.parent.mkdir(parents=True, exist_ok=True)
-    temporary = target.with_name(target.name + f".{os.getpid()}.part")
-    try:
-        with urllib.request.urlopen(url, timeout=20) as source, temporary.open("wb") as output:
-            while chunk := source.read(1024 * 1024):
-                output.write(chunk)
-        if temporary.stat().st_size == 0:
-            raise RuntimeError("Downloaded hand model is empty")
-        os.replace(temporary, target)
-    except BaseException:
-        temporary.unlink(missing_ok=True)
-        raise
-
-
-def ensure_models() -> None:
-    if not HAND_MODEL.is_file() or HAND_MODEL.stat().st_size == 0:
-        download(HAND_URL, HAND_MODEL)
-
-
 def lm_xyz(landmarks, index):
     point = landmarks[index]
     return float(point.x), float(point.y), float(getattr(point, "z", 0.0))
@@ -3650,6 +3730,7 @@ class Tracker:
         # Initialize both in the existing capture worker: the glass UI can show
         # immediately, while snapshot() safely returns no hands until ready.
         self.hands = None
+        self._model_warmup = _FREEHAND_EARLY_HAND_MODEL
         self.camera_index = 0
         self.cap = None
         self.initialization_error = ""
@@ -3795,27 +3876,25 @@ class Tracker:
                     self.cap = None
                 return
 
-            # Missing hand models download here, behind the splash, rather
-            # than holding the Qt startup path at main()->ensure_models().
-            ensure_models()
-            if not self.running:
-                if self.cap is not None:
-                    self.cap.release()
-                    self.cap = None
-                return
-            import mediapipe as mp
-            from mediapipe.tasks import python as mp_python
-            from mediapipe.tasks.python import vision
-            options = vision.HandLandmarkerOptions(
-                base_options=mp_python.BaseOptions(model_asset_path=str(HAND_MODEL)),
-                running_mode=vision.RunningMode.VIDEO,
-                num_hands=2,
-                # Keep the established thresholds; never trade safety for startup speed.
-                min_hand_detection_confidence=0.60,
-                min_hand_presence_confidence=0.58,
-                min_tracking_confidence=0.55,
-            )
-            landmark_model = vision.HandLandmarker.create_from_options(options)
+            # The MediaPipe graph began loading in parallel with the webcam and
+            # main-window setup. Keep DirectShow capture on this SAME thread;
+            # only transfer the fully constructed, idle landmarker when ready.
+            warmup = self._model_warmup
+            if warmup is not None:
+                while self.running and not warmup.ready.wait(0.05):
+                    pass
+                if not self.running:
+                    warmup.cancel()
+                    if self.cap is not None:
+                        self.cap.release()
+                        self.cap = None
+                    return
+                mp, landmark_model = warmup.take()
+                self._model_warmup = None
+            else:
+                # Fallback for imported/test-created trackers: do the same
+                # setup on the capture worker without running another model.
+                mp, landmark_model = _freehand_create_hand_landmarker()
             if not self.running:
                 landmark_model.close()
                 if self.cap is not None:
@@ -3824,8 +3903,12 @@ class Tracker:
                 return
             self.hands = landmark_model
             self.model_ready = True
+            print(f"Freehand hand model ready after {time.monotonic() - self.started_at:.2f}s", flush=True)
         except Exception as exc:
             self.initialization_error = str(exc)
+            if self._model_warmup is not None:
+                self._model_warmup.cancel()
+                self._model_warmup = None
             print("Hand tracker could not initialize:", exc, flush=True)
             # An unusable model should not leave the webcam held indefinitely.
             old, self.cap = self.cap, None
@@ -3848,6 +3931,7 @@ class Tracker:
         paused_frame_interval = 1.0 / 2.0
         idle_after_seconds = 1.0
         last_hand_seen = 0.0
+        initial_detection_until = time.monotonic() + 2.0
         last_wall, last_mono = time.time(), time.monotonic()
         failing_since = None        # first failed grab/retrieve of the current run
         frozen_since = None         # first repeat of an identical frame
@@ -3962,7 +4046,7 @@ class Tracker:
             if ok:
                 if not self.hand_tracking_enabled:
                     interval = paused_frame_interval
-                elif now - last_hand_seen > idle_after_seconds:
+                elif now - last_hand_seen > idle_after_seconds and now >= initial_detection_until:
                     interval = idle_frame_interval
                 else:
                     interval = 1.0 / max(1, self.capture_fps)
@@ -4100,6 +4184,9 @@ class Tracker:
 
     def close(self):
         self.running = False
+        if self._model_warmup is not None:
+            self._model_warmup.cancel()
+            self._model_warmup = None
         self.thread.join(timeout=1.2)
         # If a slow driver is still opening, avoid closing resources underneath it.
         if self.thread.is_alive():
@@ -4122,6 +4209,15 @@ if __name__ == "__main__":
             capture_fps=_early_settings.get("hand_capture_fps", 15))
     except Exception as _camera_start_error:
         print("Early hand camera initialization failed:", _camera_start_error, flush=True)
+
+# Preserve existing native mouse/keyboard handling, but load it after the
+# webcam has begun opening on its own worker. This usually hides its import
+# cost behind camera and hand-model startup instead of serialising the two.
+try:
+    import pyautogui
+    pyautogui.FAILSAFE = False
+except Exception:
+    pyautogui = None
 
 
 class UpdateCheckSignals(QObject):
@@ -4982,6 +5078,100 @@ class _FreehandHandVisualOverlay(QWidget):
         self.setAttribute(Qt.WA_TransparentForMouseEvents, True)
         self.setAttribute(Qt.WA_ShowWithoutActivating, True)
         self.setGeometry(owner.geometry())
+        # Only the transparent hand HWND watches Explorer's z-order. Raising the
+        # fullscreen HUD would cover native Start/taskbar controls and can make
+        # shell clicks fail even when the hand layer itself is click-through.
+        self._shell_stack_hooks = []
+        self._shell_stack_callback = None  # Keep WINFUNCTYPE callback alive.
+        self._shell_raise_queued = False
+        self._last_shell_restack_event = 0.0
+        self._shell_hook_failure_reported = False
+
+    def showEvent(self, event):
+        super().showEvent(event)
+        self.make_native_click_through()
+        self._watch_windows_shell_stacking()
+
+    def closeEvent(self, event):
+        self._unwatch_windows_shell_stacking()
+        super().closeEvent(event)
+
+    def _watch_windows_shell_stacking(self):
+        """React to Start/preview creation, not just a 30-FPS frame timer.
+
+        A WinEvent out-of-context hook is delivered on this Qt GUI thread. It
+        does not inject code into Explorer or require administrator privileges.
+        The callback posts a Qt action instead of restacking inside Explorer's
+        window-event callback (which can cause feedback/reentrancy).
+        """
+        if not sys.platform.startswith('win') or self._shell_stack_hooks:
+            return
+        try:
+            user = ctypes.windll.user32
+            callback_type = ctypes.WINFUNCTYPE(
+                None, ctypes.c_void_p, wintypes.DWORD, wintypes.HWND,
+                ctypes.c_long, ctypes.c_long, wintypes.DWORD, wintypes.DWORD)
+            user.SetWinEventHook.argtypes = (
+                wintypes.DWORD, wintypes.DWORD, wintypes.HMODULE,
+                callback_type, wintypes.DWORD, wintypes.DWORD, wintypes.DWORD)
+            user.SetWinEventHook.restype = ctypes.c_void_p
+            self_ref = self
+
+            @callback_type
+            def shell_event(_hook, event, hwnd, object_id, child_id, _thread, _ms):
+                if object_id != 0 or child_id != 0 or not hwnd:
+                    return
+                now = time.monotonic()
+                if now - self_ref._last_shell_restack_event < 0.03:
+                    return
+                # Filtering by window owner avoids expensive repeated restacks
+                # for unrelated application windows, camera frames or our HUD.
+                process = _windows_process_name(hwnd)
+                if process not in ('explorer.exe', 'startmenuexperiencehost.exe',
+                                   'shellexperiencehost.exe', 'searchhost.exe'):
+                    return
+                self_ref._last_shell_restack_event = now
+                if not self_ref._shell_raise_queued:
+                    self_ref._shell_raise_queued = True
+                    QTimer.singleShot(0, self_ref._restack_after_shell_event)
+
+            self._shell_stack_callback = shell_event
+            # EVENT_SYSTEM_FOREGROUND, EVENT_OBJECT_SHOW,
+            # EVENT_OBJECT_REORDER, EVENT_OBJECT_LOCATIONCHANGE.
+            # WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS.
+            for event_id in (0x0003, 0x8002, 0x8004, 0x800B):
+                handle = user.SetWinEventHook(event_id, event_id, None,
+                                              shell_event, 0, 0, 0x0002)
+                if handle:
+                    self._shell_stack_hooks.append(handle)
+            if not self._shell_stack_hooks:
+                self._shell_stack_callback = None
+                if not self._shell_hook_failure_reported:
+                    print('Freehand: shell stack notifications unavailable; using timer fallback')
+                    self._shell_hook_failure_reported = True
+        except (OSError, AttributeError, TypeError, ValueError) as exc:
+            self._unwatch_windows_shell_stacking()
+            if not self._shell_hook_failure_reported:
+                print('Freehand: shell stack watcher unavailable:', exc)
+                self._shell_hook_failure_reported = True
+
+    def _unwatch_windows_shell_stacking(self):
+        if self._shell_stack_hooks and sys.platform.startswith('win'):
+            try:
+                user = ctypes.windll.user32
+                user.UnhookWinEvent.argtypes = (ctypes.c_void_p,)
+                user.UnhookWinEvent.restype = wintypes.BOOL
+                for handle in self._shell_stack_hooks:
+                    user.UnhookWinEvent(handle)
+            except (OSError, AttributeError, TypeError, ValueError):
+                pass
+        self._shell_stack_hooks.clear()
+        self._shell_stack_callback = None
+
+    def _restack_after_shell_event(self):
+        self._shell_raise_queued = False
+        if self.isVisible() and self.owner is not None:
+            self.owner._raise_windows_hand_visual_only()
 
     def make_native_click_through(self):
         if not sys.platform.startswith("win"):
@@ -4996,8 +5186,12 @@ class _FreehandHandVisualOverlay(QWidget):
             set_long.argtypes = (wintypes.HWND, ctypes.c_int, ctypes.c_ssize_t)
             set_long.restype = ctypes.c_ssize_t
             extended = get_long(hwnd, -20)
-            # TOOLWINDOW | TRANSPARENT | LAYERED | NOACTIVATE
-            set_long(hwnd, -20, extended | 0x80 | 0x20 | 0x80000 | 0x08000000)
+            # TOOLWINDOW | TRANSPARENT | LAYERED | NOACTIVATE. Never activate
+            # the hands window or intercept native Start/thumbnail mouse input.
+            wanted = extended | 0x80 | 0x20 | 0x80000 | 0x08000000
+            if wanted != extended:
+                set_long(hwnd, -20, wanted)
+            self.owner._raise_windows_hand_visual_only()
         except (OSError, AttributeError, ValueError):
             pass
 
@@ -5123,11 +5317,16 @@ class SpatialDesktop(QWidget):
                     self.ui_preferences[sound_key] = default_file
             self.ui_preferences["sound_defaults_v1_applied"] = True
             save_ui_preferences(self.ui_preferences)
-        # Pre-open user-selected audio too; settings can choose custom files.
-        # Runs on the persistent audio worker, never on the Qt startup thread.
+        # Keep the lightweight, persistent MCI prewarm asynchronous from the
+        # first startup. Creating QtMultimedia/QAudioDecoder here is expensive
+        # on Windows and used to delay the Glass Menu and first camera frames.
+        # Its PCM cache is primed once the first menu frame has been revealed.
         selected_sounds = [self.ui_preferences.get(key, "None")
                            for key, _label in SOUND_SETTING_ROWS]
-        _freehand_prewarm_ui_sounds(selected_sounds)
+        sound_engine = _freehand_ui_sound_engine()
+        if sound_engine is not None:
+            sound_engine.prewarm(selected_sounds)
+        self._startup_pcm_sounds = tuple(selected_sounds)
         self.ui_font_scale = float(self.ui_preferences.get("ui_font_scale", 1.2))
         self.show_gesture_disabled_indicator = bool(
             self.ui_preferences.get("show_gesture_disabled_indicator", True))
@@ -5318,6 +5517,10 @@ class SpatialDesktop(QWidget):
         self.floating_clipboard_position = None
         self.floating_clipboard_drag_state = {"left": None, "right": None}
         self.floating_clipboard_drag_running = False
+        # Keep origin ownership for the duration of a pinch. If the floating
+        # clipboard appears mid-drag, that same pinch is NOT a new press on
+        # the clipboard header. It must open/release before it can grab it.
+        self._clipboard_pinch_ownership = {"left": None, "right": None}
         self.floating_clipboard_temp_dir = Path(tempfile.gettempdir()) / "FreehandClipboard"
         self.floating_clipboard_temp_dir.mkdir(parents=True, exist_ok=True)
         self._clipboard_last_signature = None
@@ -5381,7 +5584,7 @@ class SpatialDesktop(QWidget):
         self._glass_fade_to = 1.0
         self._glass_startup_released = (_FREEHAND_BOOT_SPLASH is None)
         # Notifications start alongside the first glass-menu reveal, not during
-        # the two-second branded splash. This animation is startup-only: later
+        # the branded splash. This animation is startup-only: later
         # glass-menu toggles NEVER dim the existing notification layer.
         self._startup_notification_fade_started_at = None
         self._glass_deferred_reset_settings = False
@@ -8841,8 +9044,8 @@ class SpatialDesktop(QWidget):
     def _glass_menu_opacity_at(self, now=None):
         """Reversible alpha for the *painted menu only*, never the hand overlay.
 
-        During the initial boot the splash holds this at zero until Freehand's
-        first glass-menu frame is prepared AND the two-second minimum has passed.
+        During initial boot, the splash holds this at zero until Freehand's
+        first glass-menu frame has finished painting (no fixed delay).
         """
         if not getattr(self, "_glass_startup_released", True):
             return 0.0
@@ -11219,6 +11422,54 @@ class SpatialDesktop(QWidget):
         return bool((getattr(self, "menu_open", False) and getattr(self, "hub_visible", False))
                     or getattr(self, "settings_open", False))
 
+    def _glass_click_sound_target(self, point, cx, cy, scale):
+        """Use actual Glass Menu hit targets, not the panel backdrop, for button audio.
+
+        ``toggle`` is the Close tile: _set_menu_open() plays its own sound.
+        A pinch on glass with no interactive control is still an ordinary pinch.
+        Keep this geometry aligned with the existing click handlers below.
+        """
+        if not self.settings_open:
+            if self._main_menu_close_rect(cx, cy, scale).contains(point):
+                return "toggle"
+            if (self._main_menu_exit_rect(cx, cy, scale).contains(point) or
+                    self._main_menu_whiteboard_rect(cx, cy, scale).contains(point) or
+                    any(rect.contains(point) for _, rect, _, _ in
+                        self._main_menu_action_tiles(cx, cy, scale))):
+                return "button"
+            return "pinch"
+
+        if self.settings_page == "gestures" and self.custom_gesture_dropdown is not None:
+            layout = self._custom_gesture_dropdown_layout(cx, cy, scale)
+            if (layout["close"].contains(point) or
+                    any(rect.contains(point) for _, rect in layout["items"])):
+                return "button"
+            return "pinch"
+
+        if self.settings_page == "sounds":
+            if any(rect.contains(point) for _, rect in
+                   self._sound_dropdown_layout(cx, cy, scale)["items"]):
+                return "button"
+
+        if (self._settings_back_rect(cx, cy, scale).contains(point) or
+                any(rect.contains(point) for rect in
+                    self._settings_tab_rects(cx, cy, scale).values()) or
+                self._canvas_slider_name_at(point) is not None or
+                any(rect.contains(point) for rect in
+                    self._settings_control_rects(cx, cy, scale).values())):
+            return "button"
+
+        if self.settings_page == "gestures":
+            layout = self._custom_gesture_layout(cx, cy, scale)
+            if (layout["record_left"].contains(point) or
+                    layout["record_right"].contains(point)):
+                return "button"
+            for row in layout["rows"][:len(self.custom_gestures)]:
+                if any(row[key].contains(point) for key in
+                       ("side", "timer", "action", "capture", "delete")):
+                    return "button"
+        return "pinch"
+
     def _activate_canvas_click(self, point, side, now):
         """Route a discrete gesture click to glass controls or the native OS pointer."""
         if point is None:
@@ -11231,12 +11482,15 @@ class SpatialDesktop(QWidget):
         # An open glass menu is modal for gesture clicks: a pinch outside its panel
         # must not click an underlying application or the desktop.
         if self.menu_open and self.hub_visible and not self._canvas_menu_panel_contains(point):
+            play_ui_sound(self.ui_preferences.get("sound_pinch", "None"))
             return
         # The reference images are modal to the OS, but the Glass Menu remains
         # available below them. A press on an image must never click the desktop.
         if self.gesture_map_overlay_visible:
             image_panel, image_close, _ = self._gesture_map_overlay_layout()
             if image_panel.contains(point):
+                play_ui_sound(self.ui_preferences.get(
+                    "sound_glass_buttons" if image_close.contains(point) else "sound_pinch", "None"))
                 if image_close.contains(point):
                     self._hide_gesture_map_overlay()
                 return
@@ -11250,20 +11504,19 @@ class SpatialDesktop(QWidget):
         scale = self.menu_ui_scale()
         in_glass_panel = self._canvas_menu_panel_contains(point)
         if in_glass_panel:
-            # The close tile plays the glass-toggle sound in _set_menu_open().
-            # For other menu controls, play ONLY the button clip: playing the
-            # pinch MP3 first made the real button sound seem late/overlapped.
-            if self.settings_open or not self._main_menu_close_rect(cx, cy, scale).contains(point):
-                play_ui_sound(self.ui_preferences.get("sound_glass_buttons", "None"))
-        else:
-            play_ui_sound(self.ui_preferences.get("sound_pinch", "None"))
-
-        if in_glass_panel:
             self._glass_pressed_point = QPointF(point)
             self._glass_pressed_at = now
             self.update()
             if now < self.menu_input_block_until:
+                # A blocked press has not activated any Glass Menu control.
+                play_ui_sound(self.ui_preferences.get("sound_pinch", "None"))
                 return
+            sound_target = self._glass_click_sound_target(point, cx, cy, scale)
+            if sound_target == "button":
+                play_ui_sound(self.ui_preferences.get("sound_glass_buttons", "None"))
+            elif sound_target == "pinch":
+                play_ui_sound(self.ui_preferences.get("sound_pinch", "None"))
+            # "toggle": _set_menu_open() plays sound_glass_toggle itself.
             if not self.settings_open:
                 if self._main_menu_close_rect(cx, cy, scale).contains(point):
                     self._set_menu_open(False, now, reset_settings=True)
@@ -11491,6 +11744,7 @@ class SpatialDesktop(QWidget):
 
             return
 
+        play_ui_sound(self.ui_preferences.get("sound_pinch", "None"))
         # Virtual desktop app controls remain interactive without forwarding clicks to OS apps.
         if self.desktop_mode == "virtual" and self._handle_virtual_dock_click(point):
             return
@@ -15414,6 +15668,35 @@ class SpatialDesktop(QWidget):
                 self.gesture_owner = None
         return True
 
+    def _raise_windows_hand_visual_only(self):
+        """Restack only the non-activating, click-through hands/TPI window.
+
+        Explorer Start and taskbar previews may themselves be topmost. Moving
+        the fullscreen Glass Menu here would obscure the shell and harm clicks;
+        this dedicated layer is the only Freehand HWND allowed to overtake it.
+        """
+        if not sys.platform.startswith('win'):
+            return False
+        layer = getattr(self, '_hand_visual_layer', None)
+        if layer is None or not layer.isVisible():
+            return False
+        if (self.whiteboard is not None and self.whiteboard.isVisible()) or (
+                getattr(self, '_camera_handover_dialog', None) is not None):
+            return False
+        try:
+            user32 = ctypes.windll.user32
+            user32.SetWindowPos.argtypes = (wintypes.HWND, wintypes.HWND,
+                                            ctypes.c_int, ctypes.c_int,
+                                            ctypes.c_int, ctypes.c_int, wintypes.UINT)
+            user32.SetWindowPos.restype = wintypes.BOOL
+            # HWND_TOPMOST, SWP_NOSIZE|NOMOVE|NOACTIVATE|NOOWNERZORDER|
+            # NOSENDCHANGING. The last flag avoids spurious stack notifications.
+            flags = 0x0001 | 0x0002 | 0x0010 | 0x0200 | 0x0400
+            return bool(user32.SetWindowPos(wintypes.HWND(int(layer.winId())),
+                                            wintypes.HWND(-1), 0, 0, 0, 0, flags))
+        except (OSError, AttributeError, TypeError, ValueError):
+            return False
+
     def _maintain_native_topmost(self, now=None):
         """Keep the visual hands above fullscreen launchers without taking focus.
 
@@ -15464,13 +15747,20 @@ class SpatialDesktop(QWidget):
             self._sync_linux_fullscreen_geometry()
         search = None
         reassert_interval = 0.40 if search is not None and search.isVisible() else 0.12
-        if sys.platform.startswith('win') and (
-                _windows_shell_preview_visible(now) or _windows_start_menu_active(now)):
-            # Start and grouped-taskbar preview windows can enter a higher
-            # stacking position after Freehand is already running. Raise only
-            # our transparent hand surface promptly, without stealing focus.
+        shell_surface_visible = (sys.platform.startswith('win') and
+                                 (_windows_shell_preview_visible(now) or
+                                  _windows_start_menu_active(now)))
+        if shell_surface_visible:
+            # The shell watcher responds to show/reorder events immediately;
+            # polling remains as a fallback for missed/XAML-only transitions.
             reassert_interval = 0.045
         if now-self._last_native_topmost_reassert <= reassert_interval:
+            return
+        if shell_surface_visible and layer is not None and layer.isVisible():
+            # Do not compete with Explorer by repeatedly raising the fullscreen
+            # Glass Menu. Only the independent hand surface should be above it.
+            self._raise_windows_hand_visual_only()
+            self._last_native_topmost_reassert = now
             return
 
         if sys.platform.startswith("linux"):
@@ -15602,11 +15892,9 @@ class SpatialDesktop(QWidget):
                                         wintypes.HWND(-1), 0, 0, 0, 0, flags)
             user32.SetWindowPos(wintypes.HWND(int(target.winId())),
                                 wintypes.HWND(-1), 0, 0, 0, 0, flags)
-            # Raise hands LAST, above Freehand's menu, without raising the
-            # full-size transparent HUD over Explorer's interactive surfaces.
-            if layer is not None and layer.isVisible():
-                user32.SetWindowPos(wintypes.HWND(int(layer.winId())),
-                                    wintypes.HWND(-1), 0, 0, 0, 0, flags)
+            # Raise hands LAST, using the same click-through hand-only path
+            # used by the Explorer show/reorder event watcher.
+            self._raise_windows_hand_visual_only()
             self._last_native_topmost_reassert = now
         except Exception:
             pass
@@ -15781,6 +16069,38 @@ class SpatialDesktop(QWidget):
             self._touch_pending.clear()
             self._touch_last_pose_at.clear()
             self._touch_drag_sides.clear()
+
+    def _remember_clipboard_pinch_origin(self, cursor_points, poses, now):
+        """Latch pinch ownership at its START, never when it enters a new panel.
+
+        Crucially this runs even when the clipboard is hidden: a pinch dragging
+        a file can reveal the clipboard later without magically becoming a
+        clipboard-header drag on the next frame. Fist-based selected-item pickup
+        is intentionally separate and is not intercepted here.
+        """
+        for side in ("left", "right"):
+            point = cursor_points.get(side)
+            pinched = bool(poses.get(side, {}).get("pinch", False))
+            state = self._clipboard_pinch_ownership.get(side)
+            if pinched and point is not None:
+                # Any new pinch after a released frame is a new grab, even if
+                # the release was shorter than the jitter debounce.
+                if state is None or state.get("release_since") is not None:
+                    self._clipboard_pinch_ownership[side] = {
+                        "started_outside": not self._floating_clipboard_contains(point),
+                        "release_since": None,
+                    }
+                else:
+                    state["release_since"] = None
+            elif state is not None:
+                if state["release_since"] is None:
+                    state["release_since"] = now
+                elif now - state["release_since"] >= 0.14:
+                    self._clipboard_pinch_ownership[side] = None
+
+    def _clipboard_pinch_is_external(self, side):
+        state = self._clipboard_pinch_ownership.get(side)
+        return bool(state and state.get("started_outside"))
 
     def _process_windows_task_view_input(self, cursor_points, poses, now):
         """While Win+Tab is open, use the REAL mouse for moving and selecting.
@@ -16612,6 +16932,10 @@ class SpatialDesktop(QWidget):
             self._stop_inactive_timer_during_sounds()
             return
 
+        # Record where the pinch STARTED before native-touch and panel handlers
+        # can take ownership. This also preserves automatic clipboard reveal
+        # from selected-item pickup instead of intercepting/cancelling the drag.
+        self._remember_clipboard_pinch_origin(cursor_points, poses, now)
         if (self._process_windows_task_view_input(cursor_points, poses, now) or
                 self._process_two_hand_touch(cursor_points, poses, now)):
             self.pointer_side = None
@@ -16953,6 +17277,12 @@ class SpatialDesktop(QWidget):
                 else:
                     continue
             elif self.floating_clipboard_visible and self._floating_clipboard_contains(cursor):
+                # A pinch started outside belongs to its original OS drag or
+                # selection. Never turn that SAME held pinch into a new header
+                # grab merely because the floating clipboard was revealed or
+                # moved beneath the hand. A fresh pinch on the panel is required.
+                if is_pinch and self._clipboard_pinch_is_external(side):
+                    continue
                 # This panel is an application-owned gesture surface, regardless
                 # of whether an unrelated fist/menu/pinch timer was armed first.
                 # Never let a new pinch/fist fall through to native OS input.
@@ -19295,24 +19625,9 @@ class SpatialDesktop(QWidget):
         painter.end()
         # The main overlay has completed a paint pass. On first startup the glass
         # panel is open and has been prepared for its synced reveal; if a gesture
-        # closed it before the splash minimum elapsed, the successful frame must
-        # still release the splash instead of trapping it permanently on-screen.
+        # closed it before the first successful paint, this frame must still
+        # release the splash instead of trapping it permanently on-screen.
         self._startup_glass_frame_painted = True
-
-
-def _freehand_camera_ready_to_reveal(tracker, now=None):
-    """Wait for a real inference frame but never strand the splash on hardware.
-
-    Empty camera view is normal: no physical hand needs to be in sight. A
-    separate app owning the camera, a failed driver/model, or more than seven
-    seconds spent starting it are all valid reasons to reveal the usable UI
-    and allow Freehand's background camera retries to continue.
-    """
-    now = time.monotonic() if now is None else float(now)
-    return bool(
-        tracker.first_frame_ready or tracker.camera_yielded or
-        tracker.initialization_error or now - tracker.started_at >= 7.0
-    )
 
 
 def main():
@@ -19340,22 +19655,29 @@ def main():
         except Exception as exc:
             print("Freehand hand layer unavailable; continuing with main HUD:", exc)
 
+    # Source launches without the optional logo must still warm the fast
+    # button sounds, but never at the expense of the first menu paint.
+    if _FREEHAND_BOOT_SPLASH is None:
+        QTimer.singleShot(650, lambda: _freehand_prewarm_ui_sounds(
+            getattr(window, "_startup_pcm_sounds", ())))
+
     def _dismiss_splash_after_glass_ready():
         global _FREEHAND_BOOT_SPLASH, _FREEHAND_SPLASH_EXIT_ANIMATION
         splash = _FREEHAND_BOOT_SPLASH
         if splash is None or _FREEHAND_SPLASH_EXIT_ANIMATION is not None:
             return
-        elapsed = time.monotonic() - _FREEHAND_SPLASH_SHOWN_AT
-        # A successful inference frame means the camera AND landmark model
-        # are ready. If the camera is unavailable, fall back rather than
-        # hiding the UI behind a forever-running splash screen.
+        # The Glass Menu's completed paint is the only readiness gate. Webcam
+        # opening and MediaPipe inference already run in the capture worker;
+        # neither is permitted to keep a usable UI behind a splash for seconds.
         if (window.isVisible()
-                and getattr(window, "_startup_glass_frame_painted", False)
-                and elapsed >= _FREEHAND_SPLASH_MIN_VISIBLE_SECONDS
-                and _freehand_camera_ready_to_reveal(window.tracker)):
+                and getattr(window, "_startup_glass_frame_painted", False)):
             # The rendered glass is ready *before* revealing it; synchronise
             # both opacity transitions within the same GUI event-loop turn.
             window._release_startup_glass_menu()
+            # Codec/PCM prewarm happens after the first fade starts, not in
+            # SpatialDesktop.__init__ where it delayed the visible first frame.
+            QTimer.singleShot(650, lambda: _freehand_prewarm_ui_sounds(
+                getattr(window, "_startup_pcm_sounds", ())))
             layer = getattr(window, "_hand_visual_layer", None)
             if layer is not None and not layer.isVisible():
                 try:
