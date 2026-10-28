@@ -1923,7 +1923,7 @@ def _windows_shell_preview_visible(now=None):
         return False
     now = time.monotonic() if now is None else float(now)
     cached = getattr(_windows_shell_preview_visible, '_cached', None)
-    if cached and now-cached[0] < (0.065 if cached[1] else 0.20):
+    if cached and now-cached[0] < (0.15 if cached[1] else 0.50):
         return cached[1]
     found = False
     try:
@@ -2006,7 +2006,7 @@ def _windows_start_menu_window(now=None):
         return None
     now = time.monotonic() if now is None else float(now)
     cached = getattr(_windows_start_menu_window, '_cached', None)
-    if cached is not None and now - cached[0] < (0.055 if cached[1] else 0.11):
+    if cached is not None and now - cached[0] < (0.15 if cached[1] else 0.45):
         return cached[1]
     found = None
     try:
@@ -5763,6 +5763,7 @@ class _FreehandHandVisualOverlay(QWidget):
         self._shell_stack_callback = None  # Keep WINFUNCTYPE callback alive.
         self._shell_raise_queued = False
         self._last_shell_restack_event = 0.0
+        self._last_shell_event_check = 0.0
         self._shell_hook_failure_reported = False
 
     def showEvent(self, event):
@@ -5800,10 +5801,20 @@ class _FreehandHandVisualOverlay(QWidget):
                 if object_id != 0 or child_id != 0 or not hwnd:
                     return
                 now = time.monotonic()
-                if now - self_ref._last_shell_restack_event < 0.03:
+                # Explorer produces large bursts of accessibility events during
+                # animations, scrolling and window movement. Querying its process
+                # on every event (and raising our layered HWND repeatedly) can
+                # consume an entire CPU core. Coalesce BEFORE the process lookup.
+                if now - self_ref._last_shell_event_check < 0.30:
                     return
-                # Filtering by window owner avoids expensive repeated restacks
-                # for unrelated application windows, camera frames or our HUD.
+                self_ref._last_shell_event_check = now
+                # With no tracked hands there is no reason to raise the
+                # transparent visual layer above Explorer's animations.
+                if not any(self_ref.owner.hand_positions.get(side)
+                           for side in ('left', 'right')):
+                    return
+                if now - self_ref._last_shell_restack_event < 0.30:
+                    return
                 process = _windows_process_name(hwnd)
                 if process not in ('explorer.exe', 'startmenuexperiencehost.exe',
                                    'shellexperiencehost.exe', 'searchhost.exe'):
@@ -5814,10 +5825,12 @@ class _FreehandHandVisualOverlay(QWidget):
                     QTimer.singleShot(0, self_ref._restack_after_shell_event)
 
             self._shell_stack_callback = shell_event
-            # EVENT_SYSTEM_FOREGROUND, EVENT_OBJECT_SHOW,
-            # EVENT_OBJECT_REORDER, EVENT_OBJECT_LOCATIONCHANGE.
+            # Watch only foreground and show events. Explorer's REORDER and
+            # LOCATIONCHANGE events can fire continuously and repeatedly
+            # re-stack a fullscreen layered window, increasing CPU use and heat.
+            # The existing low-rate timer handles any missed transitions.
             # WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS.
-            for event_id in (0x0003, 0x8002, 0x8004, 0x800B):
+            for event_id in (0x0003, 0x8002):
                 handle = user.SetWinEventHook(event_id, event_id, None,
                                               shell_event, 0, 0, 0x0002)
                 if handle:
@@ -6225,6 +6238,9 @@ class SpatialDesktop(QWidget):
         self._applied_menu_state = None
         self._last_native_topmost_reassert = 0.0
         self._hand_visual_layer = None  # Windows-only transparent topmost hand layer
+        self._hand_visual_last_frame = -1
+        self._hand_visual_last_present = False
+        self._hand_visual_last_paint_at = 0.0
         self._windows_virtual_desktop_pinned = False
         self._windows_virtual_desktop_pin_last_attempt = 0.0
         self._windows_virtual_desktop_pin_warning_reported = False
@@ -16519,7 +16535,31 @@ class SpatialDesktop(QWidget):
                     layer.setGeometry(self.geometry())
                     layer.show()
                     layer.make_native_click_through()
-                layer.update()
+                    # Force one fresh frame after remapping the window.
+                    self._hand_visual_last_frame = -1
+                # The camera and Qt timer run independently. Repainting a
+                # fullscreen transparent QWidget on EVERY UI tick (even with
+                # unchanged/no hands) was needlessly heating CPUs on Windows.
+                # Update on camera samples, or while a timed ring is animating.
+                frame_id = getattr(self.tracker, 'frame_id', -1)
+                present = any(bool(self.hand_positions.get(side))
+                              for side in ('left', 'right'))
+                animating = bool(getattr(self, 'custom_gesture_rings', None)) or any(
+                    (self.peace_hold_started.get(side) is not None and
+                     not self.peace_toggle_latched.get(side, False))
+                    for side in ('left', 'right'))
+                changed = (frame_id != self._hand_visual_last_frame or
+                           present != self._hand_visual_last_present)
+                if ((present or self._hand_visual_last_present or animating) and
+                        (changed or animating) and
+                        now is not None and
+                        now - self._hand_visual_last_paint_at >= 1.0 / 30.0):
+                    self._hand_visual_last_frame = frame_id
+                    self._hand_visual_last_present = present
+                    self._hand_visual_last_paint_at = now
+                    layer.update()
+                elif not present and not animating:
+                    self._hand_visual_last_frame = frame_id
         if getattr(self, "_capturing_glass_backdrop", False):
             return
         if getattr(self, "_camera_handover_dialog", None) is not None:
@@ -16544,14 +16584,25 @@ class SpatialDesktop(QWidget):
             self._last_linux_geometry_sync_check = now
             self._sync_linux_fullscreen_geometry()
         search = None
-        reassert_interval = 0.40 if search is not None and search.isVisible() else 0.12
-        shell_surface_visible = (sys.platform.startswith('win') and
-                                 (_windows_shell_preview_visible(now) or
-                                  _windows_start_menu_active(now)))
+        reassert_interval = (0.40 if search is not None and search.isVisible()
+                             else 0.30 if sys.platform.startswith('win') else 0.12)
+        # No need to enumerate Explorer HWNDs at tracking FPS. Freehand's own
+        # glass/settings menu must keep input ownership while it is visible.
+        # Scan only when the OS desktop is active and the native hand layer
+        # actually has tracked hands to place over another application.
+        shell_surface_visible = (
+            sys.platform.startswith('win') and self.desktop_mode == 'os'
+            and not (self.menu_open and self.hub_visible)
+            and any(self.hand_positions.get(side) for side in ('left', 'right'))
+            and (_windows_shell_preview_visible(now) or _windows_start_menu_active(now))
+        )
         if shell_surface_visible:
-            # The shell watcher responds to show/reorder events immediately;
-            # polling remains as a fallback for missed/XAML-only transitions.
-            reassert_interval = 0.045
+            # A modest fallback, rather than 22 fullscreen restacks per second.
+            # The throttled shell watcher handles visible show/foreground changes.
+            reassert_interval = 0.30
+        if (sys.platform.startswith('win') and
+                not any(self.hand_positions.get(side) for side in ('left', 'right'))):
+            reassert_interval = max(reassert_interval, 1.0)
         if now-self._last_native_topmost_reassert <= reassert_interval:
             return
         if shell_surface_visible and layer is not None and layer.isVisible():
