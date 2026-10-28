@@ -16,6 +16,7 @@ import math
 import random
 import threading
 import queue
+import socket
 import urllib.request
 import re
 import ctypes
@@ -3089,8 +3090,20 @@ def _create_native_touch_injector():
 
 
 # Hand render styles, in the order shown by the Settings -> Hands switch.
-HAND_RENDER_STYLES = ("skeleton", "flat", "3d")
-HAND_RENDER_STYLE_LABELS = {"skeleton": "SKELETON", "flat": "FLAT", "3d": "3D"}
+HAND_RENDER_STYLES = ("skeleton", "flat", "3d", "glow")
+HAND_RENDER_STYLE_LABELS = {"skeleton": "SKELETON", "flat": "FLAT", "3d": "3D", "glow": "GLOW"}
+# Independent of the TPI/skeleton colours. Presets are selected directly in
+# Settings -> Hands; no modal colour picker can interrupt hand input.
+HAND_GLOW_PALETTE = (
+    "#26d9ff",  # cyan, as in the user's example
+    "#5091ff",  # blue
+    "#a287ff",  # violet
+    "#ef74eb",  # pink
+    "#ff6378",  # red
+    "#ffba54",  # amber
+    "#70f19a",  # green
+    "#ffffff",  # white
+)
 # Settings -> Notify rows: (ui preference key, label, default position).
 NOTIFICATION_SETTING_ROWS = (
     ("paused_notice_position", "GESTURE LEGEND LOCATION", "bottom-center"),
@@ -3667,7 +3680,8 @@ def save_gesture_settings(values: dict) -> None:
         "# skin_tone_darkness: 0 to 100 percent extra warm darkening of the skin-like hand mesh.",
         "# finger_thickness: rounded finger segment thickness multiplier, 0.8 to 10.0; default 4.24.",
         "# palm_width_scale: palm contour width multiplier, 0.65 to 1.80; default 1.26.",
-        "# hand_render_style: skeleton (lines), flat (painted 2D hand) or 3d (rigged 3D hand mesh).",
+        "# hand_render_style: skeleton, flat, 3d (rigged mesh) or glow (soft luminous hand silhouette).",
+        "# hand_glow_colour: HTML #RRGGBB colour of the glowing hand silhouette.",
         "# hand_skin_effect: kept for older versions; true unless hand_render_style is skeleton.",
         "# TPI calibration: Hand Settings -> Calibrate Left/Right TPI; the live hand and transformed TPI are redrawn above the target and hit-tested at the same point.",
         "# Each TPI calibration stores the pinch midpoint in normalized palm-local 3D coordinates in tli_calibration.json.",
@@ -3708,6 +3722,7 @@ def save_gesture_settings(values: dict) -> None:
         f"palm_width_scale={clamped('palm_width_scale', 0.65, 1.8, 1.26):.2f}",
         f"hand_skin_effect={str(bool(values.get('hand_skin_effect', True))).lower()}",
         f"hand_render_style={values.get('hand_render_style') if values.get('hand_render_style') in HAND_RENDER_STYLES else ('flat' if values.get('hand_skin_effect', True) else 'skeleton')}",
+        f"hand_glow_colour={values.get('hand_glow_colour', HAND_GLOW_PALETTE[0]) if re.fullmatch(r'#[0-9a-fA-F]{6}', str(values.get('hand_glow_colour', ''))) else HAND_GLOW_PALETTE[0]}",
         f"skin_use_skeleton_color={str(bool(values.get('skin_use_skeleton_color', False))).lower()}",
         f"hand_transparency={clamped('hand_transparency', 10.0, 100.0, 75.0):.1f}",
         f"tli_glow_enabled={str(bool(values.get('tli_glow_enabled', False))).lower()}",
@@ -3759,6 +3774,7 @@ def load_gesture_settings() -> dict:
         # New installations default to the rigged 3D mesh. Legacy files that
         # only specify hand_skin_effect continue to use their previous style.
         "hand_render_style": "3d",
+        "hand_glow_colour": HAND_GLOW_PALETTE[0],
         "skin_use_skeleton_color": False,
         "hand_transparency": 75.0,
         "tli_glow_enabled": False,
@@ -3850,7 +3866,7 @@ def load_gesture_settings() -> dict:
             explicit_hand_render_style = True
         elif key == "cursor_lock_priority" and value.lower() in ("left", "right"):
             values[key] = value.lower()
-        elif key in ("left_click_color", "right_click_color") and re.fullmatch(r"#[0-9a-fA-F]{6}", value):
+        elif key in ("left_click_color", "right_click_color", "hand_glow_colour") and re.fullmatch(r"#[0-9a-fA-F]{6}", value):
             values[key] = value.lower()
     # A legacy config explicitly using hand_skin_effect but lacking the newer
     # three-way option keeps its old flat/skeleton interpretation.
@@ -4440,6 +4456,195 @@ def _camera_external_priority_owner(camera_index):
     if sys.platform == 'darwin':
         return _mac_foreground_camera_app()
     return None
+
+
+# Spatial Workspace hand-pose bridge (v2). This is *telemetry*, not another
+# tracker or input injector. The separate Workspace continues to receive
+# ordinary OS press/move/release from Freehand; measurements cannot start an
+# interaction and never leave this computer (127.0.0.1 only).
+_FREEHAND_WORKSPACE_HAND_POSE_TARGET = ("127.0.0.1", 42715)
+
+
+def _freehand_workspace_is_foreground():
+    """Fail closed: publish only when the separate Spatial Workspace has focus.
+
+    Avoid generic 'workspace' / 'desktop' matches: those can mistake Qtile,
+    Explorer, or Freehand itself for the 3D application. Do not inspect the
+    window tree or run child processes in the camera/gesture hot path.
+    """
+    def matches(*names):
+        return any('spatialworkspace' in re.sub(r'[^a-z0-9]', '', str(name).casefold())
+                   for name in names if name)
+
+    if sys.platform.startswith('win'):
+        try:
+            user32 = ctypes.windll.user32
+            user32.GetForegroundWindow.restype = wintypes.HWND
+            hwnd = user32.GetForegroundWindow()
+            if not hwnd:
+                return False
+            title = ctypes.create_unicode_buffer(512)
+            user32.GetWindowTextW.argtypes = (wintypes.HWND, ctypes.c_wchar_p, ctypes.c_int)
+            user32.GetWindowTextW(hwnd, title, len(title))
+            # Require an explicit Workspace title or executable, not a generic
+            # main-window class shared by Qt apps.
+            return matches(title.value, _windows_process_name(hwnd))
+        except (OSError, AttributeError, TypeError, ValueError):
+            return False
+
+    if sys.platform.startswith('linux') and os.environ.get('DISPLAY'):
+        # Alternix/Qtile uses X11. xprop reads the WM's *active* window, not
+        # the pointer position or Freehand's topmost transparent overlay.
+        if not shutil.which('xprop'):
+            return False
+        try:
+            active = subprocess.run(
+                ['xprop', '-root', '_NET_ACTIVE_WINDOW'], capture_output=True,
+                text=True, timeout=0.45, check=False)
+            match = re.search(r'window id # (0x[0-9a-fA-F]+)', active.stdout)
+            if active.returncode != 0 or not match or int(match.group(1), 16) == 0:
+                return False
+            detail = subprocess.run(
+                ['xprop', '-id', match.group(1), 'WM_CLASS', '_NET_WM_NAME', 'WM_NAME'],
+                capture_output=True, text=True, timeout=0.45, check=False)
+            return detail.returncode == 0 and matches(detail.stdout)
+        except (OSError, subprocess.TimeoutExpired, ValueError):
+            return False
+
+    if sys.platform == 'darwin':
+        try:
+            from AppKit import NSWorkspace
+            active = NSWorkspace.sharedWorkspace().frontmostApplication()
+            return bool(active and matches(active.localizedName(),
+                                           active.bundleIdentifier()))
+        except (ImportError, AttributeError, RuntimeError):
+            return False
+    # Wayland does not expose a generic, reliable foreground-window query.
+    return False
+
+
+def _freehand_workspace_palm_width(landmarks, image_aspect=270.0/480.0):
+    """Camera-image width units from index/pinky MCP (landmarks 5 and 17).
+
+    MediaPipe normalizes X by image width and Y by image height. Multiply the
+    Y difference by height / width before taking Euclidean distance, otherwise
+    a vertically rotated palm reports a different 'depth'. Do not scale the
+    points by Freehand's on-screen hand rendering size or use landmark Z.
+    """
+    if landmarks is None or len(landmarks) < 21:
+        return None
+    try:
+        def xy(point):
+            if hasattr(point, 'x'):
+                return float(point.x), float(point.y)
+            return float(point[0]), float(point[1])
+        ax, ay = xy(landmarks[5])
+        bx, by = xy(landmarks[17])
+        width = math.hypot(ax-bx, (ay-by)*float(image_aspect))
+        return width if math.isfinite(width) and 0.014 <= width <= 0.35 else None
+    except (TypeError, AttributeError, ValueError, IndexError):
+        return None
+
+
+class _FreehandSpatialWorkspaceTelemetry:
+    """Small, non-blocking localhost UDP sender, gated by foreground focus.
+
+    A single lightweight watcher determines which application is foreground;
+    the existing Qt gesture update publishes at most once per *new camera
+    frame*. Never loads MediaPipe, opens a webcam, or produces OS input.
+    """
+    def __init__(self):
+        self._stop = threading.Event()
+        self._focused = False
+        self._last_frame_id = None
+        self._continuity = {'left': 0, 'right': 0}
+        self._previous_palm = {'left': None, 'right': None}
+        self._socket = None
+        try:
+            sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            sock.setblocking(False)
+            self._socket = sock
+        except OSError:
+            pass  # Freehand never fails to start because Workspace is absent.
+        self._watcher = threading.Thread(target=self._watch_focus, daemon=True,
+                                         name='FreehandWorkspaceFocus')
+        self._watcher.start()
+
+    def _watch_focus(self):
+        while not self._stop.is_set():
+            try:
+                self._focused = bool(_freehand_workspace_is_foreground())
+            except Exception:
+                self._focused = False
+            # Keep process lookups / X11 subprocesses out of the frame loop.
+            self._stop.wait(0.55 if self._focused else 0.85)
+
+    def publish(self, frame_id, hands_by_side, cursor_points, poses,
+                screen_width, screen_height, *, enabled=True,
+                camera_look=False):
+        if self._socket is None or not self._focused or not enabled:
+            self._continuity = {'left': 0, 'right': 0}
+            self._previous_palm = {'left': None, 'right': None}
+            return
+        if frame_id == self._last_frame_id:
+            return
+        self._last_frame_id = frame_id
+        width = max(1.0, float(screen_width))
+        height = max(1.0, float(screen_height))
+        for side in ('left', 'right'):
+            entry = hands_by_side.get(side)
+            point = cursor_points.get(side)
+            pose = poses.get(side)
+            if entry is None or point is None or pose is None or (
+                    camera_look and side == 'right'):
+                self._continuity[side] = 0
+                self._previous_palm[side] = None
+                continue
+            landmarks, _handedness_score = entry
+            palm = _freehand_workspace_palm_width(landmarks)
+            try:
+                x, y = float(point.x()), float(point.y())
+            except (AttributeError, TypeError, ValueError):
+                continue
+            if (palm is None or not math.isfinite(x) or not math.isfinite(y) or
+                    x < -2 or y < -2 or x > width+2 or y > height+2):
+                self._continuity[side] = 0
+                self._previous_palm[side] = None
+                continue
+            prev = self._previous_palm[side]
+            if prev is not None and not (0.50*prev <= palm <= 2.00*prev):
+                # Side-on/occluded MCPs can create a one-frame fake depth jump.
+                self._continuity[side] = 0
+                self._previous_palm[side] = None
+                continue
+            self._previous_palm[side] = palm
+            self._continuity[side] = min(8, self._continuity[side]+1)
+            # The tracker provides a handedness score, not an independent model
+            # tracking-confidence score. Report a conservative continuity-based
+            # quality measure, never mislabel handedness as detection certainty.
+            confidence = min(0.80, 0.56 + 0.04*self._continuity[side])
+            message = {
+                'v': 2, 'gesture': 'hand_pose', 'hand': side,
+                'x': round(max(0.0, min(1.0, x/width)), 5),
+                'y': round(max(0.0, min(1.0, y/height)), 5),
+                'palm_size': round(palm, 6),
+                'confidence': round(confidence, 3),
+                'pinch': bool(pose.get('pinch', False)),
+            }
+            try:
+                self._socket.sendto(json.dumps(message, separators=(',', ':')).encode('utf-8'),
+                                    _FREEHAND_WORKSPACE_HAND_POSE_TARGET)
+            except (OSError, ValueError):
+                pass  # No listener is fine; UDP never blocks hand input.
+
+    def close(self):
+        self._stop.set()
+        try:
+            if self._socket is not None:
+                self._socket.close()
+        except OSError:
+            pass
+        self._socket = None
 
 
 class Tracker:
@@ -5952,6 +6157,11 @@ class FreehandWhiteboard(QWidget):
                 points = owner.hand_positions.get(side, [])
                 if points:
                     owner._paint_hand_skeleton(painter, points, side)
+                    # Match the normal Freehand overlay: a peace-sign-detached
+                    # hand stays visible with its red disabled badge. Draw in
+                    # this same translated coordinate space so the badge sits
+                    # directly on the hand, regardless of board/owner origin.
+                    owner._paint_gesture_disabled_indicator(painter, points, side)
             painter.restore()
         # Cursor indicators are drawn above the canvas, not included in exports.
         for side, point in self._hand_cursors.items():
@@ -6167,11 +6377,12 @@ class SpatialDesktop(QWidget):
         self.finger_thickness = settings.get("finger_thickness", 4.24)
         self.palm_width_scale = settings.get("palm_width_scale", 1.26)
         self.hand_skin_effect_enabled = bool(settings.get("hand_skin_effect", True))
-        # Skeleton, flat (painted 2D) or 3d (rigged mesh). Older settings files only
+        # Skeleton, flat, 3d (rigged mesh), or glow. Older settings files only
         # have hand_skin_effect, which maps to flat/skeleton.
         style = settings.get("hand_render_style")
         self.hand_render_style = (style if style in HAND_RENDER_STYLES else
                                   ("flat" if self.hand_skin_effect_enabled else "skeleton"))
+        self.hand_glow_colour = QColor(settings.get("hand_glow_colour", HAND_GLOW_PALETTE[0]))
         self._hand_mesh_renderer = None
         self._hand_mesh_frame_cache = {}
         # Stable landmarks and finger-tuck filtering only need to run ONCE per
@@ -6530,6 +6741,7 @@ class SpatialDesktop(QWidget):
         self.settings_page_transition_from_size = None
         self.settings_page_pending = None
 
+        self._workspace_hand_telemetry = _FreehandSpatialWorkspaceTelemetry()
         self.hand_positions = {"left": [], "right": []}
         self.tli_calibrations = load_tli_calibrations()  # Legacy palm-local anchor calibration
         self.tpi_screen_calibrations = load_tpi_screen_calibrations(TPI_SCREEN_CALIBRATION_FILE)
@@ -6787,6 +6999,7 @@ class SpatialDesktop(QWidget):
             "palm_width_scale": self.palm_width_scale,
             "hand_skin_effect": self.hand_render_style != "skeleton",
             "hand_render_style": self.hand_render_style,
+            "hand_glow_colour": self.hand_glow_colour.name(),
             "skin_use_skeleton_color": self.skin_use_skeleton_color,
             "hand_transparency": self.hand_transparency,
             "tli_glow_enabled": self.tli_glow_enabled,
@@ -9738,6 +9951,7 @@ class SpatialDesktop(QWidget):
             stack("start_on_login_toggle")
         elif page == "hands":
             stack("render_style")
+            stack("glow_colour")
             stack("skin_tint")
             stack("disabled_indicator_toggle")
             y += group
@@ -9833,11 +10047,19 @@ class SpatialDesktop(QWidget):
     RENDER_SWITCH_CAPTION = 0.30
 
     def _render_style_segments(self, rect, scale):
-        """(style, rect) for each segment of the SKELETON | FLAT | 3D switch (draw + click)."""
+        """(style, rect) for each virtual-hand renderer switch segment."""
         area = rect.adjusted(rect.width()*self.RENDER_SWITCH_CAPTION, 3*scale, -3*scale, -3*scale)
         width = area.width()/len(HAND_RENDER_STYLES)
         return [(style, QRectF(area.left()+i*width, area.top(), width, area.height()))
                 for i, style in enumerate(HAND_RENDER_STYLES)]
+
+    def _glow_colour_segments(self, rect, scale):
+        """Same rectangular hit targets for painting and pinch/mouse selection."""
+        area = rect.adjusted(rect.width()*0.30, 3*scale, -4*scale, -3*scale)
+        segment_width = area.width()/len(HAND_GLOW_PALETTE)
+        return [(colour, QRectF(area.left()+index*segment_width, area.top(),
+                                segment_width, area.height()))
+                for index, colour in enumerate(HAND_GLOW_PALETTE)]
 
     def _virtual_scene_segments(self, rect, scale):
         """Matching three-way scene selector, with the same hit boxes as its painting."""
@@ -12636,6 +12858,18 @@ class SpatialDesktop(QWidget):
                         self.schedule_gesture_settings_save()
                     self.status = "Hand rendering: " + HAND_RENDER_STYLE_LABELS[style].lower()
                     return
+                if pressed("glow_colour"):
+                    segments = self._glow_colour_segments(controls["glow_colour"], scale)
+                    colour = next((colour for colour, rect in segments if rect.contains(point)), None)
+                    if colour is None:  # tapping the caption cycles through the palette
+                        choices = [c.lower() for c in HAND_GLOW_PALETTE]
+                        old = self.hand_glow_colour.name().lower()
+                        colour = choices[(choices.index(old)+1) % len(choices)] if old in choices else choices[0]
+                    self.hand_glow_colour = QColor(colour)
+                    self.schedule_gesture_settings_save()
+                    self.status = "Hand glow colour: " + self.hand_glow_colour.name()
+                    self.update()
+                    return
                 if pressed("skin_tint"):
                     self.skin_use_skeleton_color = not self.skin_use_skeleton_color
                     self.schedule_gesture_settings_save()
@@ -15201,7 +15435,7 @@ class SpatialDesktop(QWidget):
         _paint_hand_skeleton, and stores the result as display landmarks only.
         """
         style = getattr(self, "hand_render_style", "flat")
-        if style not in ("3d", "flat"):
+        if style not in ("3d", "flat", "glow"):
             return
         displays = getattr(self, "hand_display_positions", {})
         screen, palms, scales = {}, {}, {}
@@ -15227,7 +15461,7 @@ class SpatialDesktop(QWidget):
             scales[side] = user_scale
         thickness = min(10.0, max(0.8, float(getattr(self, "finger_thickness", 4.24))))/4.24
         offsets = hand_contact_offsets(screen["left"], screen["right"], palms["left"], palms["right"],
-                                       style, thickness)
+                                       "flat" if style == "glow" else style, thickness)
         # These landmarks are already in primary-screen coordinates. Use the same
         # physical screen dimensions for the contact correction; QWidget.height()
         # can reflect Qtile's reserved work area and truncate the lower screen band.
@@ -15477,7 +15711,7 @@ class SpatialDesktop(QWidget):
             x, y = scale_hand_point((q.x(), q.y()), (scale_origin.x(), scale_origin.y()), user_scale)
             return QPointF(x+off_x, y+off_y)
 
-        # The flat and 3D hands show fingertips the camera can't see as tucked in, instead
+        # Flat, 3D and glowing hands tuck fingertips that the camera cannot see, instead
         # of MediaPipe's guess; the skeleton style keeps showing the raw tracking.
         style = getattr(self, "hand_render_style", "flat")
         display = getattr(self, "hand_display_positions", {}).get(side) if side in ("left", "right") else None
@@ -15550,6 +15784,12 @@ class SpatialDesktop(QWidget):
             painter.restore()
             return
 
+        if style == "glow":
+            self._paint_hand_glow(painter, points, joints, width_scale,
+                                  finger_thickness, side)
+            painter.restore()
+            return
+
         base_skin = skin_color(225, 174, 143, 255)
         if style == "3d" and self._paint_hand_mesh_3d(painter, points, joints, side, user_scale, base_skin):
             painter.restore()
@@ -15557,6 +15797,98 @@ class SpatialDesktop(QWidget):
         palm_width_scale = min(1.8, max(0.65, float(getattr(self, "palm_width_scale", 1.0))))
         self._paint_hand_skin_3d(painter, points, joints, width_scale, finger_thickness,
                                  palm_width_scale, base_skin)
+        painter.restore()
+
+    def _paint_hand_glow(self, painter, points, joints, width_scale, finger_thickness, side):
+        """Dark hand silhouette with a subtle coloured outer glow.
+
+        The outline encloses the *whole hand* rather than tracing a skeleton:
+        combine a rounded palm and tapered finger capsules into one path. Glow
+        uses four inexpensive QPainter strokes; it never blurs a screen-sized
+        layer or requires an extra render thread, webcam pass, or GPU context.
+        """
+        palm_width = math.hypot(joints[5].x()-joints[17].x(),
+                                joints[5].y()-joints[17].y())
+        palm_length = math.hypot(joints[0].x()-joints[9].x(),
+                                 joints[0].y()-joints[9].y())
+        if palm_width < 2.0 or palm_length < 2.0:
+            return
+        # Widths follow Freehand's existing hand-scale, finger-thickness and
+        # distance corrections; these settings never modify pinch recognition.
+        size = max(0.55, 0.125/4.3*palm_length*
+                   (finger_thickness/4.24)*
+                   self._landmark_foreshortening(points, 0, 9))
+        radii = {}
+        for _name, chain, base_radii in self.HAND_FINGER_CHAINS:
+            for index, radius in zip(chain, base_radii):
+                radii[index] = max(0.8, radius*size)
+
+        centre = QPointF((joints[5].x()+joints[17].x())*0.5,
+                         (joints[5].y()+joints[17].y())*0.5)
+        lateral_x = (joints[5].x()-joints[17].x())/max(1e-5, palm_width)
+        lateral_y = (joints[5].y()-joints[17].y())/max(1e-5, palm_width)
+        broadness = min(1.8, max(0.65, float(getattr(self, "palm_width_scale", 1.26))))
+
+        def widened(index):
+            point = joints[index]
+            lateral = ((point.x()-centre.x())*lateral_x +
+                       (point.y()-centre.y())*lateral_y)
+            return QPointF(point.x()+lateral*lateral_x*(broadness-1.0),
+                           point.y()+lateral*lateral_y*(broadness-1.0))
+
+        vx = joints[9].x()-joints[0].x()
+        vy = joints[9].y()-joints[0].y()
+        norm = max(1e-5, math.hypot(vx, vy))
+        half_wrist = 0.40*math.hypot(widened(5).x()-widened(17).x(),
+                                     widened(5).y()-widened(17).y())
+        cx = joints[0].x()+vx*0.04
+        cy = joints[0].y()+vy*0.04
+        wrist_points = [QPointF(cx-vy/norm*half_wrist, cy+vx/norm*half_wrist),
+                        QPointF(cx+vy/norm*half_wrist, cy-vx/norm*half_wrist)]
+        web = QPointF(joints[2].x()*0.45+joints[5].x()*0.4+joints[1].x()*0.15,
+                      joints[2].y()*0.45+joints[5].y()*0.4+joints[1].y()*0.15)
+        hull = self._convex_hull(wrist_points + [joints[0], joints[1], web] +
+                                 [widened(index) for index in (5, 9, 13, 17)])
+        if len(hull) < 3:
+            return
+        palm = QPainterPath()
+        palm.addPolygon(QPolygonF(hull))
+        palm.closeSubpath()
+        rounded = QPainterPathStroker()
+        rounded.setWidth(max(1.0, 2.4*radii[9]))
+        rounded.setJoinStyle(Qt.RoundJoin)
+        rounded.setCapStyle(Qt.RoundCap)
+        palm = palm.united(rounded.createStroke(palm))
+
+        fingers = QPainterPath()
+        fingers.setFillRule(Qt.WindingFill)
+        for _name, chain, _radii in self.HAND_FINGER_CHAINS:
+            for first, second in zip(chain, chain[1:]):
+                fingers.addPath(self._tapered_capsule(joints[first], radii[first],
+                                                     joints[second], radii[second]))
+        # One union gives the glow a continuous outer boundary with no internal
+        # finger/palm borders. Never stroke individual bones as a skeleton.
+        outline = palm.united(fingers)
+        if outline.isEmpty():
+            return
+        colour = QColor(getattr(self, "hand_glow_colour", HAND_GLOW_PALETTE[0]))
+        outer = max(0.8, min(1.8, width_scale))
+        painter.save()
+        painter.setRenderHint(QPainter.Antialiasing, True)
+        painter.setBrush(Qt.NoBrush)
+        for width, alpha in ((19.0, 18), (12.0, 31), (6.5, 55)):
+            painter.setPen(QPen(QColor(colour.red(), colour.green(), colour.blue(), alpha),
+                                width*outer, Qt.SolidLine, Qt.RoundCap, Qt.RoundJoin))
+            painter.drawPath(outline)
+        # Dark semi-transparent glove body like the supplied image; redraw last
+        # to keep outer illumination on the edge rather than inside the palm.
+        painter.setPen(Qt.NoPen)
+        painter.setBrush(QBrush(QColor(5, 19, 29, 215)))
+        painter.drawPath(outline)
+        painter.setBrush(Qt.NoBrush)
+        painter.setPen(QPen(QColor(colour.red(), colour.green(), colour.blue(), 190),
+                            max(1.25, 1.9*outer), Qt.SolidLine, Qt.RoundCap, Qt.RoundJoin))
+        painter.drawPath(outline)
         painter.restore()
 
     @staticmethod
@@ -18355,6 +18687,30 @@ class SpatialDesktop(QWidget):
 
         self._update_hand_contact_display()
 
+        # Publish camera-derived relative reach to the separate Spatial Workspace.
+        # Reuse the *actual calibrated TPI* and existing effective pinch state,
+        # on new tracker frames only. Ordinary OS touch/mouse injection below
+        # stays authoritative for press, drag, and release.
+        if not calibration_modal_frame:
+            _workspace_bounds = self._interaction_screen_geometry()
+            self._workspace_hand_telemetry.publish(
+                _frame_id, hands_by_side,
+                {side: point for side, point in cursor_points.items()
+                 if self.gesture_tracking_enabled.get(side, True)},
+                poses, _workspace_bounds.width(), _workspace_bounds.height(),
+                enabled=(self.desktop_mode == 'os' and
+                         not self.hand_tracking_paused and not self.tracker.camera_yielded and
+                         not self._gesture_ui_modal_open() and
+                         not any(self.fist_action_menu_open.values()) and
+                         not (self.whiteboard is not None and self.whiteboard.isVisible()) and
+                         getattr(self, '_camera_handover_dialog', None) is None),
+                # Camera-look has priority over object dragging; never publish
+                # a right-hand pinch grab concurrently with that modifier.
+                camera_look=bool(poses.get('right', {}).get('pinch', False) and
+                                 (self.left_click_modifier_active or
+                                  poses.get('left', {}).get('fist', False))),
+            )
+
         # A pinch outside the visible Search launcher dismisses it, and is consumed so
         # it cannot activate anything underneath the window.
         search_dialog = None
@@ -19694,6 +20050,7 @@ class SpatialDesktop(QWidget):
         self._request_scene_repaint(now)
 
     def closeEvent(self, event):
+        self._workspace_hand_telemetry.close()
         self._release_modifier_right_mouse_hold()
         if self.whiteboard is not None:
             self.whiteboard.release_all_strokes()
@@ -20504,7 +20861,7 @@ class SpatialDesktop(QWidget):
                             align=Qt.AlignLeft | Qt.AlignTop)
 
                     elif self.settings_page == "hands":
-                        # Three-way RENDER STYLE switch: SKELETON | FLAT | 3D.
+                        # Four-way RENDER STYLE switch: SKELETON | FLAT | 3D | GLOW.
                         switch = controls["render_style"]
                         painter.setBrush(QBrush(QColor(10, 37, 55, 225)))
                         painter.setPen(QPen(QColor(125, 235, 245, 210), 1.5*scale))
@@ -20525,6 +20882,29 @@ class SpatialDesktop(QWidget):
                             painter.setPen(QColor(245, 255, 250) if selected else QColor(175, 210, 220))
                             self._draw_fitted_button_label(painter, seg, HAND_RENDER_STYLE_LABELS[seg_style],
                                                            base_size=label_size, min_size=6, inset=4*scale)
+
+                        glow_picker = controls["glow_colour"]
+                        painter.setBrush(QBrush(QColor(10, 37, 55, 225)))
+                        painter.setPen(QPen(QColor(125, 235, 245, 210), 1.5*scale))
+                        painter.drawRoundedRect(glow_picker, 10*scale, 10*scale)
+                        caption_width = glow_picker.width()*0.30
+                        painter.setPen(QColor(200, 240, 248))
+                        self._draw_fitted_button_label(
+                            painter,
+                            QRectF(glow_picker.left(), glow_picker.top(), caption_width, glow_picker.height()),
+                            "GLOW COLOUR", base_size=label_size, min_size=6, inset=4*scale)
+                        for colour, swatch_rect in self._glow_colour_segments(glow_picker, scale):
+                            chosen = colour.lower() == self.hand_glow_colour.name().lower()
+                            center = swatch_rect.center()
+                            radius = min(swatch_rect.width()*0.32, 10.0*scale)
+                            if chosen:
+                                painter.setBrush(Qt.NoBrush)
+                                painter.setPen(QPen(QColor(175, 250, 255, 195), 2.1*scale))
+                                painter.drawEllipse(center, radius+4.0*scale, radius+4.0*scale)
+                            painter.setPen(QPen(QColor(245, 255, 255, 230) if chosen else
+                                                QColor(80, 118, 138, 185), 1.3*scale))
+                            painter.setBrush(QBrush(QColor(colour)))
+                            painter.drawEllipse(center, radius, radius)
 
                         tint_toggle = controls["skin_tint"]
                         painter.setBrush(QBrush(QColor(55, 145, 82, 225) if self.skin_use_skeleton_color else QColor(75, 80, 89, 205)))
