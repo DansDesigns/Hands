@@ -2095,12 +2095,86 @@ def _windows_start_menu_active(now=None):
     return _windows_start_menu_window(now) is not None
 
 
-def _windows_hand_pointer_shell_target(now=None):
-    """Return Start or foreground Task Manager for the temporary mouse mode.
 
-    Start is a *visible shell surface*, which need not own foreground focus on
-    Win11. Task Manager must still be foreground to avoid hijacking interaction
-    when its window is behind an ordinary application.
+def _windows_native_popup_menu_window(now=None):
+    """Find a real visible Win32 #32768 popup menu, never an arbitrary XAML pane.
+
+    Reuse the HWND for native cursor-follow clicks while a Windows context menu
+    is open. The cached, class-specific lookup is bounded; it does not run in
+    the MediaPipe camera worker and cannot falsely classify the Glass Menu.
+    """
+    if not sys.platform.startswith('win'):
+        return None
+    now = time.monotonic() if now is None else float(now)
+    cached = getattr(_windows_native_popup_menu_window, '_cached', None)
+    if cached is not None and now - cached[0] < (0.12 if cached[1] else 0.30):
+        return cached[1]
+    found = None
+    try:
+        user = ctypes.windll.user32
+        user.IsWindowVisible.argtypes = (wintypes.HWND,)
+        user.IsWindowVisible.restype = wintypes.BOOL
+        user.GetClassNameW.argtypes = (wintypes.HWND, ctypes.c_wchar_p, ctypes.c_int)
+        user.GetClassNameW.restype = ctypes.c_int
+        user.GetWindowRect.argtypes = (wintypes.HWND, ctypes.POINTER(wintypes.RECT))
+        user.GetWindowRect.restype = wintypes.BOOL
+        user.GetSystemMetrics.argtypes = (ctypes.c_int,)
+        user.GetSystemMetrics.restype = ctypes.c_int
+        virtual_left = user.GetSystemMetrics(76)
+        virtual_top = user.GetSystemMetrics(77)
+        virtual_width = max(1, user.GetSystemMetrics(78))
+        virtual_height = max(1, user.GetSystemMetrics(79))
+        if virtual_width <= 1 or virtual_height <= 1:
+            virtual_left = virtual_top = 0
+            virtual_width = max(1, user.GetSystemMetrics(0))
+            virtual_height = max(1, user.GetSystemMetrics(1))
+        dwm = getattr(ctypes.windll, 'dwmapi', None)
+        dwm_attribute = getattr(dwm, 'DwmGetWindowAttribute', None)
+        if dwm_attribute is not None:
+            dwm_attribute.argtypes = (wintypes.HWND, wintypes.DWORD,
+                                      ctypes.c_void_p, wintypes.DWORD)
+            dwm_attribute.restype = ctypes.c_long
+
+        callback_type = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
+        @callback_type
+        def inspect(hwnd, _):
+            nonlocal found
+            if not user.IsWindowVisible(hwnd):
+                return True
+            class_name = ctypes.create_unicode_buffer(48)
+            if not user.GetClassNameW(hwnd, class_name, len(class_name)):
+                return True
+            if class_name.value != '#32768':
+                return True
+            rect = wintypes.RECT()
+            if not user.GetWindowRect(hwnd, ctypes.byref(rect)):
+                return True
+            if (rect.right - rect.left < 30 or rect.bottom - rect.top < 18 or
+                    rect.right <= virtual_left or rect.left >= virtual_left + virtual_width or
+                    rect.bottom <= virtual_top or rect.top >= virtual_top + virtual_height):
+                return True
+            if dwm_attribute is not None:
+                cloaked = wintypes.DWORD()
+                if (dwm_attribute(hwnd, 14, ctypes.byref(cloaked),
+                                  ctypes.sizeof(cloaked)) == 0 and cloaked.value):
+                    return True
+            found = int(hwnd)
+            return False
+
+        user.EnumWindows.argtypes = (callback_type, wintypes.LPARAM)
+        user.EnumWindows.restype = wintypes.BOOL
+        user.EnumWindows(inspect, 0)
+    except (OSError, AttributeError, TypeError, ValueError):
+        pass
+    _windows_native_popup_menu_window._cached = (now, found)
+    return found
+
+
+def _windows_hand_pointer_shell_target(now=None):
+    """Identify a real Start, foreground Task Manager or native popup menu.
+
+    Do not use broad process-name heuristics or accessibility-tree matching:
+    those previously stole input from the Glass Menu and broke its buttons.
     """
     if not sys.platform.startswith('win'):
         return None
@@ -2128,6 +2202,10 @@ def _windows_hand_pointer_shell_target(now=None):
                         target = ('task_manager', int(hwnd))
         except (OSError, AttributeError, TypeError, ValueError):
             pass
+    if target is None:
+        popup = _windows_native_popup_menu_window(now)
+        if popup:
+            target = ('context_menu', popup)
     _windows_hand_pointer_shell_target._cached = (now, target)
     return target
 
@@ -2523,6 +2601,11 @@ class _LinuxTouchInjector:
         self.unavailable = False
         self.last_error = ""
         self._next_tracking_id = 1
+        # Keep quick X11/libinput taps down for a real frame interval. A DOWN
+        # followed immediately by UP in one Python call can be coalesced before
+        # applications observe a touch, especially on Qtile/XLibre.
+        self._pending_taps = set()
+        self._tap_serial = dict.fromkeys(self.IDS, 0)
         self._open_device = open_device or os.open
         self._ioctl = ioctl
         self._write = write or os.write
@@ -2637,15 +2720,36 @@ class _LinuxTouchInjector:
         self.active_points = new
         return True
 
+    def release_pending_tap(self, side):
+        if side not in self._pending_taps:
+            return
+        self._pending_taps.discard(side)
+        self._tap_serial[side] += 1
+        if side in self.active_points:
+            self.sync({key: value for key, value in self.active_points.items()
+                       if key != side})
+
     def tap(self, side, point):
-        if side not in self.IDS or side in self.active_points:
+        if self.unavailable or side not in self.IDS:
+            return False
+        self.release_pending_tap(side)
+        if side in self.active_points:
             return False
         if not self.sync({**self.active_points, side: point}):
             return False
-        return self.sync({key: value for key, value in self.active_points.items()
-                          if key != side})
+        self._pending_taps.add(side)
+        self._tap_serial[side] += 1
+        serial = self._tap_serial[side]
+        # Single-shot is processed by the existing Qt GUI event loop, leaving
+        # the camera worker and both hands free to continue tracking.
+        QTimer.singleShot(75, lambda s=side, token=serial:
+                          self.release_pending_tap(s) if self._tap_serial[s] == token else None)
+        return True
 
     def end(self):
+        self._pending_taps.clear()
+        for side in self._tap_serial:
+            self._tap_serial[side] += 1
         if self.active_points and self.fd is not None:
             self.sync({})
         self.active_points = {}
@@ -2667,6 +2771,122 @@ class _LinuxTouchInjector:
                 pass
             self.fd = None
             self._device_created = False
+
+
+class _LinuxX11TouchFallback:
+    """X11 fallback when the kernel virtual touchscreen is not seen by XInput.
+
+    Only enabled after a failed uinput registration check, or explicitly by
+    FREEHAND_LINUX_INPUT_MODE=mouse. No global cursor-follow. A moving single
+    pinch sends scroll-wheel movement at its point; a quick pinch sends a click.
+    The original two-finger kernel touch remains the default when recognised.
+    """
+    IDS = {"left": 0, "right": 1}
+
+    def __init__(self, controller=None):
+        self.controller = controller if controller is not None else pyautogui
+        self.unavailable = self.controller is None
+        self.last_error = ('X11 pointer fallback unavailable: PyAutoGUI not installed'
+                           if self.unavailable else '')
+        self.active_points = {}
+        self._pending_taps = set()
+        self._scroll_remainder = 0.0
+        self._horizontal_remainder = 0.0
+        self._zoom_remainder = 0.0
+        self._last_reported_error = False
+
+    @property
+    def active(self):
+        return bool(self.active_points)
+
+    def _invoke(self, method, *args, **kwargs):
+        try:
+            return getattr(self.controller, method)(*args, **kwargs)
+        except Exception as exc:
+            # An unavailable X server must never leave the application emitting
+            # mouse commands forever. Report it and let the normal gesture path run.
+            self.last_error = f'X11 fallback {method} failed: {exc}'
+            self.unavailable = True
+            self.active_points.clear()
+            return None
+
+    def sync(self, points):
+        if self.unavailable:
+            return False
+        new = {side: (int(round(pos[0])), int(round(pos[1])))
+               for side, pos in points.items() if side in self.IDS}
+        old = self.active_points
+        if new == old:
+            return True
+        if len(new) == 1 and len(old) == 1:
+            side, point = next(iter(new.items()))
+            if side in old:
+                dy = point[1] - old[side][1]
+                dx = point[0] - old[side][0]
+                # Touch-style panning: pull down -> content comes down / wheel up.
+                # Moderate granularity keeps small natural hand jitter silent.
+                self._scroll_remainder += dy / 32.0
+                ticks = int(self._scroll_remainder)
+                if ticks:
+                    if self._invoke('scroll', ticks, x=point[0], y=point[1], _pause=False) is None and self.unavailable:
+                        return False
+                    self._scroll_remainder -= ticks
+                self._horizontal_remainder += dx / 45.0
+                hticks = int(self._horizontal_remainder)
+                if hticks and hasattr(self.controller, 'hscroll'):
+                    if self._invoke('hscroll', -hticks, _pause=False) is None and self.unavailable:
+                        return False
+                    self._horizontal_remainder -= hticks
+        elif len(new) == 2 and len(old) == 2 and set(new) == set(old):
+            before = math.dist(old['left'], old['right'])
+            after = math.dist(new['left'], new['right'])
+            if min(before, after) > 25:
+                self._zoom_remainder += math.log(after/before) * 6.0
+                ticks = int(self._zoom_remainder)
+                if ticks:
+                    try:
+                        self.controller.keyDown('ctrl', _pause=False)
+                        self.controller.scroll(ticks, _pause=False)
+                    except Exception as exc:
+                        self.last_error = f'X11 pinch zoom failed: {exc}'
+                        self.unavailable = True
+                        return False
+                    finally:
+                        try:
+                            self.controller.keyUp('ctrl', _pause=False)
+                        except Exception:
+                            pass
+                    self._zoom_remainder -= ticks
+        if not new:
+            self._scroll_remainder = 0.0
+            self._horizontal_remainder = 0.0
+            self._zoom_remainder = 0.0
+        self.active_points = new
+        return True
+
+    def tap(self, side, point):
+        if self.unavailable or side not in self.IDS or side in self.active_points:
+            return False
+        try:
+            x, y = int(point[0]), int(point[1])
+            self.controller.click(x=x, y=y, button='left', _pause=False)
+            return True
+        except Exception as exc:
+            self.last_error = f'X11 fallback click failed: {exc}'
+            self.unavailable = True
+            return False
+
+    def release_pending_tap(self, side):
+        return None
+
+    def end(self):
+        self.active_points.clear()
+        self._scroll_remainder = 0.0
+        self._horizontal_remainder = 0.0
+        self._zoom_remainder = 0.0
+
+    def close(self):
+        self.end()
 
 
 class _MacTouchGestureFallback:
@@ -2844,7 +3064,9 @@ def _create_native_touch_injector():
                         screen_no = x11.XDefaultScreen(display)
                         native_size = (x11.XDisplayWidth(display, screen_no),
                                        x11.XDisplayHeight(display, screen_no))
-                        bounds, _same_units = resolve_fullscreen_bounds(bounds, native_size)
+                        bounds, _same_units = resolve_fullscreen_bounds(
+                            bounds, native_size,
+                            max_reserved_pixels=max(200, int(native_size[1] * 0.30)))
                     finally:
                         x11.XCloseDisplay(display)
         except Exception:
@@ -2852,8 +3074,14 @@ def _create_native_touch_injector():
         injector = _LinuxTouchInjector(bounds)
         # Register before webcam startup completes, giving libinput time to
         # discover the device before the user's first pinch.
+        prefer_mouse = (os.environ.get('FREEHAND_LINUX_INPUT_MODE', '').strip().lower()
+                        in ('mouse', 'x11', 'scroll'))
+        if prefer_mouse and QApplication.platformName().lower() in ('xcb', 'x11'):
+            return _LinuxX11TouchFallback()
         if not injector._ensure_api():
             print('Freehand Linux multitouch:', injector.last_error, flush=True)
+            if QApplication.platformName().lower() in ('xcb', 'x11'):
+                return _LinuxX11TouchFallback()
         return injector
     if sys.platform == 'darwin':
         return _MacTouchGestureFallback()
@@ -12639,11 +12867,55 @@ class SpatialDesktop(QWidget):
             pass
         qt_bounds = (qt_rect.x(), qt_rect.y(), qt_rect.width(), qt_rect.height())
         resolved, native_compatible = resolve_fullscreen_bounds(
-            qt_bounds, (context["width"], context["height"]))
+            qt_bounds, (context["width"], context["height"]),
+            max_reserved_pixels=max(200, int(context["height"] * 0.30)))
         self._linux_native_pointer_warp_compatible = bool(native_compatible)
         result = QRect(*resolved)
         self._linux_screen_geometry_cache = (now, QRect(qt_rect), QRect(result))
         return result
+
+    def _verify_linux_touch_registration(self):
+        """Once after startup: confirm X11 actually recognises Freehand uinput.
+
+        A successful write to /dev/uinput means the kernel accepted the events,
+        NOT that XOrg/libinput attached a touchscreen to the desktop. Without an
+        XInput device the old implementation sent gestures into a black hole.
+        """
+        if not sys.platform.startswith('linux') or self.desktop_mode != 'os':
+            return
+        injector = getattr(self, '_native_touch', None)
+        if not isinstance(injector, _LinuxTouchInjector):
+            return
+        if os.environ.get('FREEHAND_LINUX_INPUT_MODE', '').strip().lower() in ('touch', 'native'):
+            return
+        try:
+            if QApplication.platformName().lower() not in ('xcb', 'x11'):
+                return
+            import shutil
+            if not shutil.which('xinput'):
+                # No reliable XInput observation; preserve native touch.
+                return
+            proc = subprocess.run(['xinput', '--list', '--name-only'],
+                                  capture_output=True, text=True, timeout=0.7,
+                                  check=False)
+            if proc.returncode != 0:
+                return
+            if 'Freehand Virtual Multitouch Screen' in proc.stdout:
+                return
+        except (OSError, subprocess.TimeoutExpired, AttributeError):
+            return
+        # No X11 touch consumer registered. Use mouse-wheel emulation for a
+        # single held pinch and real X11 clicks; the user can restore kernel
+        # multitouch explicitly using FREEHAND_LINUX_INPUT_MODE=touch.
+        self._end_two_hand_touch()
+        try:
+            injector.close()
+        except OSError:
+            pass
+        self._native_touch = _LinuxX11TouchFallback()
+        self.status = ('X11 did not register Freehand virtual touchscreen; '
+                       'using compatible pinch scrolling/clicks')
+        print('Freehand Linux:', self.status, flush=True)
 
     def _linux_qtile_panel_point(self, global_point):
         """Detect top/bottom Qtile bar targets in physical X11 coordinates.
@@ -12681,13 +12953,20 @@ class SpatialDesktop(QWidget):
         if (self.desktop_mode != "os" or not sys.platform.startswith("linux") or
                 self._gesture_ui_modal_open() or self._os_scroll_pointer_detached()):
             return
-        side = self.cursor_lock_priority if self.cursor_lock_priority in ("left", "right") else "right"
-        if side not in cursor_points or self.mouse_detached_by_side.get(side, False):
-            side = "left" if side == "right" else "right"
-        if side not in cursor_points or self.mouse_detached_by_side.get(side, False):
-            return
-        global_point = self._virtual_point_to_global(cursor_points[side])
-        if global_point is not None and self._linux_qtile_panel_point(global_point):
+        preferred = self.cursor_lock_priority if self.cursor_lock_priority in ("left", "right") else "right"
+        secondary = "left" if preferred == "right" else "right"
+        # The other hand must be able to activate a bar even while the
+        # preferred hand remains tracked somewhere in the desktop. Preserve
+        # right-hand priority when *both* hands are over a bar.
+        valid = []
+        for side in (preferred, secondary):
+            if side in cursor_points and not self.mouse_detached_by_side.get(side, False):
+                pos = self._virtual_point_to_global(cursor_points[side])
+                if pos is not None:
+                    valid.append((side, pos))
+        global_point = next((pos for _side, pos in valid
+                             if self._linux_qtile_panel_point(pos)), None)
+        if global_point is not None:
             previous = getattr(self, '_linux_qtile_hover_last', None)
             if (previous is None or
                     abs(previous[0] - global_point.x()) >= 1.5 or
@@ -12985,15 +13264,17 @@ class SpatialDesktop(QWidget):
             self._task_view_hotkey_last_seen = now
         # Don't stop following the hand merely because Win11's animation has
         # temporarily hidden its window title or foreground owner.
+        # Explorer's taskbar/desktop can retain foreground *while Task View is
+        # visible*. That is not evidence of closing the switcher: the old code
+        # detached the cursor one second after Win+Tab. A genuine application
+        # becoming foreground, Esc, or a second Win+Tab ends the latch instead.
         hotkey_grace = (now < self._task_view_hotkey_grace_until and
                         (now - self._task_view_hotkey_opened_at < 1.0 or
-                         not (foreground_is_app or foreground_is_exit_surface)))
+                         not foreground_is_app))
         visible = native_view or hotkey_grace
-        if ((foreground_is_app or foreground_is_exit_surface) and
+        if (foreground_is_app and
                 now - self._task_view_hotkey_opened_at >= 1.0):
             self._task_view_hotkey_grace_until = 0.0
-            # The old shell HWND can stay visible during its exit animation.
-            # If a regular application has focus, Task View is no longer interactive.
             visible = False
         self._task_view_visible_cached = bool(visible)
         return bool(visible)
@@ -16570,9 +16851,20 @@ class SpatialDesktop(QWidget):
         # translucent fullscreen HUD or SearchHandOverlay above its palette.
         if self.whiteboard is not None and self.whiteboard.isVisible():
             return
-        if (self._native_context_menu_visual_guard() or
-                self._windows_task_view_active(now)):
-            return  # Preserve native context menus and Win+Tab Task View z-order.
+        if sys.platform.startswith('win') and self.desktop_mode == 'os' and (
+                self._native_context_menu_visual_guard(now) or
+                self._windows_task_view_active(now) or
+                _windows_native_popup_menu_window(now)):
+            # A previous regression stopped raising *both* transparent windows
+            # during native popup menus and Task View, hiding the hands behind
+            # the very Shell interfaces people need to interact with. Raise
+            # ONLY the click-through hand layer, never the fullscreen HUD.
+            # Keep the CPU fix: limit restacks to one every 300 ms.
+            now = time.monotonic() if now is None else float(now)
+            if now - self._last_native_topmost_reassert >= 0.30:
+                if self._raise_windows_hand_visual_only():
+                    self._last_native_topmost_reassert = now
+            return
         # A native wake-word training popup must remain above the fullscreen
         # click-through owner (and must keep keyboard/mouse focus for Cancel).
         training = getattr(self, '_wake_word_training_dialog', None)
@@ -16594,7 +16886,8 @@ class SpatialDesktop(QWidget):
             sys.platform.startswith('win') and self.desktop_mode == 'os'
             and not (self.menu_open and self.hub_visible)
             and any(self.hand_positions.get(side) for side in ('left', 'right'))
-            and (_windows_shell_preview_visible(now) or _windows_start_menu_active(now))
+            and (_windows_shell_preview_visible(now) or
+                 _windows_hand_pointer_shell_target(now) is not None)
         )
         if shell_surface_visible:
             # A modest fallback, rather than 22 fullscreen restacks per second.
@@ -16749,12 +17042,11 @@ class SpatialDesktop(QWidget):
             pass
 
     def _sync_linux_fullscreen_geometry(self):
-        """Keep the XLibre/X11 overlay aligned to the full physical screen rectangle.
+        """Match the *native* X11 overlay and touch coordinates to the root screen.
 
-        When Qt reports only the Qtile work area, _interaction_screen_geometry() uses
-        matching native X11 root dimensions to recover the missing bottom strip. The
-        fullscreen paint surface, hand coordinates and pointer warping then share that
-        same corrected screen rectangle.
+        Qtile can shrink an X11 override-redirect window independently of Qt's
+        cached QWidget geometry. Compare both; don't assume the full Qt geometry
+        implies the native paint surface still covers the bottom bar.
         """
         if not sys.platform.startswith("linux"):
             return
@@ -16766,33 +17058,60 @@ class SpatialDesktop(QWidget):
             reported_origin = self.mapToGlobal(QPoint(0, 0))
         except Exception:
             reported_origin = screen_rect.topLeft()
-        origin_matches = reported_origin == screen_rect.topLeft()
-        size_matches = self.size() == screen_rect.size()
-        geometry_matches = self.geometry() == screen_rect
-        if not (origin_matches and size_matches and geometry_matches):
-            # Qtile/XLibre can reapply the work-area bounds after startup. Restore the
-            # QWidget geometry first, then also resize the unmanaged X11 window itself
-            # to the full physical screen. This ensures its paint surface extends over
-            # a bottom bar even if the WM leaves the native window at work-area height.
+        qt_needs_resize = (reported_origin != screen_rect.topLeft() or
+                           self.size() != screen_rect.size() or
+                           self.geometry() != screen_rect)
+        if qt_needs_resize:
             self.setGeometry(screen_rect)
+
+        context = self._linux_x11_screen_context()
+        if context is not None and getattr(self, "_linux_native_pointer_warp_compatible", False):
+            x11, display = context["lib"], context["display"]
+            hwnd = ctypes.c_ulong(int(self.winId()))
+            native_needs_resize = qt_needs_resize
             try:
-                context = self._linux_x11_screen_context()
-                if context is not None and getattr(self, "_linux_native_pointer_warp_compatible", False):
-                    x11 = context["lib"]
+                x11.XGetGeometry.argtypes = [
+                    ctypes.c_void_p, ctypes.c_ulong,
+                    ctypes.POINTER(ctypes.c_ulong), ctypes.POINTER(ctypes.c_int),
+                    ctypes.POINTER(ctypes.c_int), ctypes.POINTER(ctypes.c_uint),
+                    ctypes.POINTER(ctypes.c_uint), ctypes.POINTER(ctypes.c_uint),
+                    ctypes.POINTER(ctypes.c_uint),
+                ]
+                x11.XGetGeometry.restype = ctypes.c_int
+                root = ctypes.c_ulong(0)
+                x, y = ctypes.c_int(), ctypes.c_int()
+                width, height = ctypes.c_uint(), ctypes.c_uint()
+                border, depth = ctypes.c_uint(), ctypes.c_uint()
+                if x11.XGetGeometry(display, hwnd, ctypes.byref(root), ctypes.byref(x),
+                                    ctypes.byref(y), ctypes.byref(width), ctypes.byref(height),
+                                    ctypes.byref(border), ctypes.byref(depth)):
+                    native_needs_resize |= (
+                        x.value != screen_rect.x() or y.value != screen_rect.y() or
+                        width.value != screen_rect.width() or height.value != screen_rect.height())
+            except (OSError, AttributeError, TypeError, ValueError):
+                # Qt geometry was already restored if necessary.
+                pass
+            if native_needs_resize:
+                try:
                     x11.XMoveResizeWindow.argtypes = [
                         ctypes.c_void_p, ctypes.c_ulong, ctypes.c_int, ctypes.c_int,
                         ctypes.c_uint, ctypes.c_uint,
                     ]
                     x11.XMoveResizeWindow.restype = ctypes.c_int
                     x11.XMoveResizeWindow(
-                        context["display"], ctypes.c_ulong(int(self.winId())),
-                        ctypes.c_int(screen_rect.x()), ctypes.c_int(screen_rect.y()),
-                        ctypes.c_uint(screen_rect.width()), ctypes.c_uint(screen_rect.height()),
-                    )
-                    x11.XFlush(context["display"])
-            except Exception:
-                # QWidget geometry remains the portable fallback on unsupported sessions.
-                pass
+                        display, hwnd, ctypes.c_int(screen_rect.x()),
+                        ctypes.c_int(screen_rect.y()), ctypes.c_uint(screen_rect.width()),
+                        ctypes.c_uint(screen_rect.height()))
+                    x11.XFlush(display)
+                except (OSError, AttributeError, TypeError, ValueError):
+                    pass
+        # uinput's axes remain 0..65535; only the current global screen bounds
+        # need to follow physical display geometry when panels/rotation change.
+        injector = getattr(self, '_native_touch', None)
+        if isinstance(injector, _LinuxTouchInjector):
+            injector.bounds = (screen_rect.x(), screen_rect.y(),
+                               screen_rect.width(), screen_rect.height())
+        if qt_needs_resize:
             self.update()
 
     # Repaint interval used while nothing on screen is moving (see _scene_is_idle).
@@ -16965,6 +17284,14 @@ class SpatialDesktop(QWidget):
             self._task_view_pinch_since = None
             self._task_view_wait_release = False
             return False
+        # Freehand controls must never become click-through again if Windows
+        # leaves a stale Task View surface in its window enumeration.
+        if (self._gesture_ui_modal_open() or any(self.fist_action_menu_open.values()) or
+                self._glass_menu_opacity_at(now) > 0.01):
+            self._task_view_native_mode = False
+            self._task_view_pinch_since = None
+            self._task_view_wait_release = True
+            return False
         if not getattr(self, '_task_view_native_mode', False):
             self._task_view_native_mode = True
             self._task_view_pinch_since = None
@@ -16974,22 +17301,14 @@ class SpatialDesktop(QWidget):
         injector = getattr(self, '_native_touch', None)
         if injector is not None and (injector.active or self._touch_pending):
             self._end_two_hand_touch()
-        side = self.cursor_lock_priority
-        if side not in cursor_points:
-            side = 'left' if side == 'right' else 'right'
+        side = 'right' if 'right' in cursor_points else 'left'
         if side in cursor_points:
             position = self._virtual_point_to_global(cursor_points[side])
-            # Task View temporarily reattaches the mouse *regardless* of normal
-            # touch mode or peace-sign detach. That preference is not modified.
             if position is not None:
-                physical = _windows_touch_screen_pixels((position.x(), position.y()))
-                try:
-                    user = ctypes.windll.user32
-                    user.SetCursorPos.argtypes = (ctypes.c_int, ctypes.c_int)
-                    user.SetCursorPos.restype = wintypes.BOOL
-                    user.SetCursorPos(*physical)
-                except (OSError, AttributeError, ValueError, TypeError):
-                    self._set_os_pointer_global(position)
+                # Use the SAME routine as the working Save PNG dialog. It
+                # follows the calibrated pointer with QCursor.setPos, avoids
+                # a second DPI transform, and preserves right-hand priority.
+                self._set_os_pointer_global(position)
                 self._task_view_native_position = (int(position.x()), int(position.y()))
         pinched = bool(poses.get(side, {}).get('pinch', False))
         if self._task_view_wait_release:
@@ -17012,9 +17331,9 @@ class SpatialDesktop(QWidget):
         return True
 
     def _process_windows_shell_hand_input(self, cursor_points, poses, now):
-        """Hand-following mouse for Start and Task Manager, like Save PNG.
+        """Hand-following mouse for Start, Task Manager and native context menus.
 
-        Both panels can reject PT_TOUCH taps from Freehand's translucent HWND.
+        These surfaces can reject PT_TOUCH taps from Freehand's translucent HWND.
         When one is foreground, move the real mouse using the calibrated hand
         position, and turn a short, stationary pinch into a native mouse click.
         Right hand always wins; the left is a fallback when right is absent.
@@ -17389,7 +17708,11 @@ class SpatialDesktop(QWidget):
                 if side in candidates:
                     final_points[side] = candidates[side]
             if final_points != active_points:
-                injector.sync(final_points)
+                # X11/libinput needs to observe a contact DOWN before the
+                # first MOVE for a reliable drag/scroll. On Linux the next
+                # capture frame sends MOVE; Windows keeps its prior behaviour.
+                if not sys.platform.startswith('linux'):
+                    injector.sync(final_points)
             return True
 
         if injector.active:
@@ -20645,6 +20968,8 @@ def main():
     QTimer.singleShot(0, window._sync_linux_fullscreen_geometry)
     QTimer.singleShot(250, window._sync_linux_fullscreen_geometry)
     window.apply_desktop_mode()
+    if sys.platform.startswith('linux'):
+        QTimer.singleShot(1750, window._verify_linux_touch_registration)
     if sys.platform.startswith("win"):
         try:
             # Prepared behind the splash; map it only when the menu is ready.
