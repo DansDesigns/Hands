@@ -3588,15 +3588,16 @@ def snap_hand_display_fps(value, default=30):
 
 
 def effective_hand_visual_fps(display_fps, capture_fps):
-    """Avoid painting duplicate camera poses at 90/120 Hz.
+    """Cap routine painting to the camera cadence, not a hard-coded 30 FPS.
 
-    The visual setting remains a *ceiling*: high-rate cameras can still reach
-    high-rate visual updates, while ordinary 15/30 FPS cameras avoid redrawing
-    full-screen transparent windows eight times for the same hand pose.
-    Reserve 30 Hz for progressing gesture rings and UI hover feedback.
+    The previous 30-FPS minimum repainted full-screen translucent windows
+    six times for every camera sample with capture set to 5 FPS.  Ten Hz is
+    sufficient for inactive UI/unchanged hand poses; gesture countdown rings,
+    menu fades, and virtual-desktop transitions have independent animation
+    refresh paths and are not limited by this routine frame rate.
     """
     return min(snap_hand_display_fps(display_fps),
-               max(30, clamp_hand_capture_fps(capture_fps)))
+               max(10, clamp_hand_capture_fps(capture_fps)))
 
 
 def save_gesture_settings(values: dict) -> None:
@@ -3624,8 +3625,8 @@ def save_gesture_settings(values: dict) -> None:
         "# ACTIVE GESTURES — no depth calibration or forward-push activation is used.",
         "# POINTER/TPI: saved palm-relative calibration point when calibrated; otherwise thumb/index fingertip midpoint.",
         "# QUICK CLICK: quick fist/grip -> open OR quick thumb/index pinch -> release clicks at the starting TPI point.",
-        "# LEFT MODIFIER: hold LEFT fist; quick RIGHT pinch/release = right-click/context menu; held RIGHT grip = drag a native window (OS) or virtual canvas/app (3D).",
-        "# Modifier gestures suppress the regular Pinch Menu timer; open RIGHT hand to release a modifier drag.",
+        "# LEFT MODIFIER: hold LEFT fist; RIGHT pinch holds the native RIGHT mouse button until release (OS), RIGHT grip drags a window. Virtual desktop keeps the contextual pinch action.",
+        "# Modifier gestures suppress the regular Pinch Menu timer; open RIGHT pinch or LEFT fist to release the right-button hold.",
         "# DOUBLE-CLICK: two quick thumb/index pinches near the same point are snapped to one target for a native double-click.",
         "# PINCH MENU: hold thumb/index pinch continuously for pinch_buffer_seconds (default 0.8s); then the circle fills for the hold timer.",
         "# PINCH MENU: while open, a fresh pinch/grab outside the popup closes it without clicking through.",
@@ -4758,28 +4759,30 @@ class Tracker:
                 reopen("is unavailable")
                 time.sleep(0.2)
                 continue
-            # grab() waits for the next camera frame without decoding it; frames that
-            # are skipped below are never decoded/converted, which saves CPU.
+            # Throttle the CAMERA DEVICE as well as MediaPipe inference.  The
+            # former loop called cap.grab() before checking the capture interval:
+            # at 5 FPS inference it could still poll/dequeue 30-60+ camera
+            # frames per second, or spin faster on non-blocking camera drivers.
+            # This wasted CPU and kept laptops hot even with capture FPS low.
+            now = time.monotonic()
+            if not self.hand_tracking_enabled:
+                interval = paused_frame_interval
+            elif now - last_hand_seen > idle_after_seconds and now >= initial_detection_until:
+                interval = max(idle_frame_interval, 1.0 / max(1, self.capture_fps))
+            else:
+                interval = 1.0 / max(1, self.capture_fps)
+            remaining = interval - (now - last_frame_time)
+            if remaining > 0.0:
+                # Short sleeps preserve prompt shutdown, camera handover, and
+                # camera-recovery checks. We DO NOT open/dequeue a frame here.
+                time.sleep(min(remaining, 0.05))
+                continue
+            # Request and decode only frames that will actually be processed.
+            # The driver is already asked to retain a one-frame queue above.
             ok = self.cap.grab()
             frame = None
             now = time.monotonic()
             if ok:
-                if not self.hand_tracking_enabled:
-                    interval = paused_frame_interval
-                elif now - last_hand_seen > idle_after_seconds and now >= initial_detection_until:
-                    interval = idle_frame_interval
-                else:
-                    interval = 1.0 / max(1, self.capture_fps)
-                elapsed = now - last_frame_time
-                if elapsed < interval:
-                    # Do not busy-spin while waiting for the next inference slot.
-                    # Camera reads can return much faster than the inference cadence;
-                    # without yielding here this loop can consume a full CPU core even
-                    # when gesture handling is disabled. Use a longer bounded sleep to
-                    # avoid a high-frequency grab/sleep spin on cameras whose grab() does
-                    # not block for a fresh frame; shutdown remains responsive.
-                    time.sleep(min(interval - elapsed, 0.02))
-                    continue
                 ok, frame = self.cap.retrieve()
             if not ok or frame is None:
                 # A camera read failure must not leave the previous frame's hands on screen.
@@ -6706,8 +6709,8 @@ class SpatialDesktop(QWidget):
         self.pinch_recovery_frames = {side: 0 for side in sides}
         self.fist_release_buffer_started_at = {side: None for side in sides}
         self.menu_pinch_sequence_gap_seconds = 0.80  # FIXED 0.8s soft gap for repeated pinch/re-arm
-        # LEFT fist acts like a keyboard modifier: RIGHT pinch/grip is a click-only input
-        # while held, independent of the Pinch Menu's repeated-pinch timer sequence.
+        # LEFT fist modifies a RIGHT pinch into a native held right mouse button
+        # in OS mode; RIGHT fist/grip retains the existing window-drag behaviour.
         self.left_click_modifier_active = False
         # Per-hand status cards brighten for five seconds when their displayed state changes.
         self._status_card_signatures = {"left": None, "right": None}
@@ -6722,6 +6725,8 @@ class SpatialDesktop(QWidget):
         self.modifier_click_release_since = {side: None for side in sides}
         self.modifier_click_last_pose_at = {side: None for side in sides}
         self.modifier_click_armed = {side: True for side in sides}
+        # Only one native right mouse button exists; never send repeated downs.
+        self._modifier_right_mouse_down = False
         # Background snapshots are blurred once when the glass menu is opened in OS mode;
         # virtual mode gets a blurred version of its own grid canvas.
         self._glass_backdrop_image = None
@@ -13713,6 +13718,7 @@ class SpatialDesktop(QWidget):
         self.hand_tracking_paused = paused
         self.tracker.set_hand_tracking_enabled(not paused)
         if paused:
+            self._clear_modifier_click("right")
             # End any active click/drag/scroll and release native mouse buttons so pausing
             # in the middle of a gesture cannot leave an action or held button stuck.
             for side in ("left", "right"):
@@ -13788,6 +13794,7 @@ class SpatialDesktop(QWidget):
 
     def apply_desktop_mode(self):
         """Configure a fullscreen overlay; OS mode passes physical mouse input through."""
+        self._release_modifier_right_mouse_hold()
         if self.ui_preferences.get("last_desktop_mode") != self.desktop_mode:
             self.ui_preferences["last_desktop_mode"] = self.desktop_mode
             save_ui_preferences(self.ui_preferences)
@@ -16343,12 +16350,24 @@ class SpatialDesktop(QWidget):
                 if self.left_click_modifier_active or not right_pinch_in_progress:
                     self.left_click_modifier_active = True
         elif left_pose.get("pinch", False) and left_pose.get("clear_left_pinch", False):
-            # A real left pinch is a normal click gesture, not the fist modifier.
-            self.left_click_modifier_active = False
-            self.left_modifier_fist_frames = 0
-            self.left_modifier_open_frames = 0
-            self.left_modifier_last_fist_at = None
-            self.left_modifier_release_candidate_since = None
+            # An intentional left pinch is never a *new* modifier. Once the
+            # modifier is active, however, one mislabelled fingertip frame must
+            # not release held RMB. Require a stable pinch for 100 ms; a clearly
+            # open LEFT hand still releases the modifier via the branch below.
+            if not self.left_click_modifier_active:
+                self.left_modifier_fist_frames = 0
+                self.left_modifier_open_frames = 0
+                self.left_modifier_last_fist_at = None
+                self.left_modifier_release_candidate_since = None
+            else:
+                if self.left_modifier_release_candidate_since is None:
+                    self.left_modifier_release_candidate_since = now
+                elif now-self.left_modifier_release_candidate_since >= 0.10:
+                    self.left_click_modifier_active = False
+                    self.left_modifier_fist_frames = 0
+                    self.left_modifier_open_frames = 0
+                    self.left_modifier_last_fist_at = None
+                    self.left_modifier_release_candidate_since = None
         elif left_pose.get("open", False) and not left_pose.get("pinch", False):
             self.left_modifier_fist_frames = 0
             self.left_modifier_open_frames = min(3, self.left_modifier_open_frames+1)
@@ -16359,7 +16378,14 @@ class SpatialDesktop(QWidget):
                 self.left_modifier_last_fist_at = None
                 self.left_modifier_release_candidate_since = None
         else:
-            self.left_modifier_fist_frames = 0
+            # A curled left fist often has one noisy landmark frame between
+            # valid fist frames, especially when the thumb rests on the index.
+            # Requiring two *consecutive* fist frames meant the modifier never
+            # armed on some cameras. Keep a short confirmation window without
+            # interpreting an actual left pinch or open palm as a fist.
+            if (self.left_modifier_last_fist_at is None or
+                    now-self.left_modifier_last_fist_at > 0.24):
+                self.left_modifier_fist_frames = 0
             self.left_modifier_open_frames = 0
             if (self.left_click_modifier_active and self.left_modifier_last_fist_at is not None and
                     now-self.left_modifier_last_fist_at > 0.24):
@@ -16367,7 +16393,52 @@ class SpatialDesktop(QWidget):
                 self.left_modifier_release_candidate_since = None
         return self.left_click_modifier_active
 
+    def _release_modifier_right_mouse_hold(self):
+        """Release the real right button on EVERY modifier exit or interruption."""
+        if not getattr(self, "_modifier_right_mouse_down", False):
+            return
+        # Clear the latch before calling OS input (which can raise on disconnect).
+        self._modifier_right_mouse_down = False
+        if pyautogui is not None:
+            try:
+                pyautogui.mouseUp(button="right", _pause=False)
+            except Exception as exc:
+                self.status = f"Native right-button release failed: {exc}"
+
+    def _start_modifier_right_mouse_hold(self, cursor):
+        """Hold RMB natively, without changing the Pinch Menu or normal touch mode."""
+        if self._modifier_right_mouse_down:
+            return True
+        if (self.desktop_mode != "os" or pyautogui is None or cursor is None
+                or self.mouse_detached_by_side.get("right", False)
+                or self._gesture_ui_modal_open() or self._floating_clipboard_contains(cursor)
+                or self._native_context_menu_block_active()):
+            return False
+        target = self._virtual_point_to_global(cursor)
+        if target is None:
+            return False
+        try:
+            self._end_two_hand_touch()
+            self._set_os_pointer_global(target)
+            pyautogui.mouseDown(button="right", _pause=False)
+            self._modifier_right_mouse_down = True
+            self.status = "Right mouse button held — open RIGHT pinch or LEFT fist to release"
+            return True
+        except Exception as exc:
+            self.status = f"Native right-button hold failed: {exc}"
+            return False
+
+    def _move_modifier_right_mouse_hold(self, cursor):
+        """Move the mouse while RMB remains held (games/3D viewport orbit)."""
+        if not self._modifier_right_mouse_down or cursor is None:
+            return
+        target = self._virtual_point_to_global(cursor)
+        if target is not None:
+            self._set_os_pointer_global(target)
+
     def _clear_modifier_click(self, side):
+        if side == "right":
+            self._release_modifier_right_mouse_hold()
         self.modifier_click_started_at[side] = None
         self.modifier_click_origin[side] = None
         self.modifier_click_kind[side] = None
@@ -16656,7 +16727,7 @@ class SpatialDesktop(QWidget):
         return False
 
     def _handle_modifier_click_frame(self, side, is_pinch, is_fist, is_open, cursor, now):
-        """Left fist modifies a right pinch into right-click and a right grip into drag."""
+        """LEFT fist + RIGHT pinch holds RMB in OS mode; grip still moves windows."""
         if side == "left":
             self._suppress_hand_for_modifier("left")
             self._clear_modifier_click("left")
@@ -16697,15 +16768,27 @@ class SpatialDesktop(QWidget):
                 self.modifier_click_armed[side] = True
             self.modifier_click_release_since[side] = None
             self.modifier_click_last_pose_at[side] = now
-            started = self.modifier_click_started_at[side]
-            if started is not None and now-started > self.fist_quick_click_max_seconds:
-                self.modifier_click_armed[side] = False
+            if self.desktop_mode == "os":
+                # A true down event on the first recognised pinch, continuous
+                # motion while pinched, and a matching up at release. Do not
+                # disarm a long hold as the old quick-right-click path did.
+                if self.modifier_click_armed[side]:
+                    if self._start_modifier_right_mouse_hold(cursor):
+                        self._move_modifier_right_mouse_hold(cursor)
+            else:
+                # The virtual desktop and secret-action lesson still use a
+                # quick modifier action on release, not a native mouse button.
+                started = self.modifier_click_started_at[side]
+                if started is not None and now-started > self.fist_quick_click_max_seconds:
+                    self.modifier_click_armed[side] = False
             self.gesture_owner = side
             self.canvas_active_side = side
             self.active_push_sides.add(side)
             return True
 
         if is_fist:
+            # Changing from pinch to grip ends any held native RMB first.
+            self._release_modifier_right_mouse_hold()
             if (self.modifier_click_started_at[side] is None or
                     self.modifier_click_kind[side] != "grip_drag"):
                 self._clear_modifier_click(side)
@@ -16739,13 +16822,17 @@ class SpatialDesktop(QWidget):
             return True
 
         if is_open:
+            # Mouse-up must happen on the first clear open-hand frame, not at
+            # the end of the old quick-click release debounce.
+            self._release_modifier_right_mouse_hold()
             if self.modifier_click_release_since[side] is None:
                 self.modifier_click_release_since[side] = now
             release_for = now-self.modifier_click_release_since[side]
             if release_for >= 0.07:
                 elapsed = self.modifier_click_release_since[side]-started
                 origin = self.modifier_click_origin[side]
-                if (kind == "pinch_right_click" and self.modifier_click_armed[side] and
+                if (self.desktop_mode != "os" and kind == "pinch_right_click" and
+                        self.modifier_click_armed[side] and
                         self.click_debounce_seconds <= elapsed <= self.fist_quick_click_max_seconds):
                     self._activate_modifier_right_click(origin if origin is not None else cursor, now)
                 self._clear_modifier_click(side)
@@ -16753,7 +16840,10 @@ class SpatialDesktop(QWidget):
                     self.gesture_owner = None
             return True
 
-        # Ambiguous frames are tolerated briefly, but cannot turn a long held pinch into a click.
+        # Tolerate a brief MediaPipe classification glitch while both fingertips
+        # are transitioning. A clearly OPEN or FIST pose released RMB above;
+        # an ambiguous pose without a new pinch expires after 160 ms below.
+        # Ambiguous frames cannot turn a long held pinch into a click.
         last_pose = self.modifier_click_last_pose_at[side]
         if last_pose is None:
             self.modifier_click_last_pose_at[side] = now
@@ -16877,7 +16967,10 @@ class SpatialDesktop(QWidget):
             self._sync_linux_fullscreen_geometry()
         search = None
         reassert_interval = (0.40 if search is not None and search.isVisible()
-                             else 0.30 if sys.platform.startswith('win') else 0.12)
+                             else 0.30 if sys.platform.startswith('win') else 0.30)
+        if (sys.platform.startswith('linux') and
+                not any(self.hand_positions.get(side) for side in ('left', 'right'))):
+            reassert_interval = 1.0  # No visible hands: avoid waking the X11 compositor.
         # No need to enumerate Explorer HWNDs at tracking FPS. Freehand's own
         # glass/settings menu must keep input ownership while it is visible.
         # Scan only when the OS desktop is active and the native hand layer
@@ -17167,6 +17260,33 @@ class SpatialDesktop(QWidget):
             return False
         return True
 
+    def _scene_has_live_animation(self, now):
+        """Gestures/fades retain smooth 30-Hz feedback at low camera FPS."""
+        if getattr(self, '_scene_transition', None) is not None:
+            return True
+        if now - self.menu_transition_started < self.menu_transition_duration + 0.05:
+            return True
+        if any(started is not None and not self.peace_toggle_latched.get(side, False)
+               for side, started in self.peace_hold_started.items()):
+            return True
+        if any(started is not None for started in self.menu_pinch_started.values()):
+            return True
+        if any(started is not None for started in self.fist_started_at.values()):
+            return True
+        if bool(getattr(self, 'custom_gesture_rings', None)):
+            return True
+        if any(effect and now-float(effect.get('started_at', 0.0)) < 0.4
+               for effect in self.gesture_timer_fade.values()):
+            return True
+        if any(now-float(effect.get('started_at', 0.0)) <
+               float(effect.get('duration', 0.2))+0.04
+               for effect in self.pinch_menu_animation.values()):
+            return True
+        if (self.settings_open and self.settings_page_transition_started and
+                self._settings_page_transition_progress(now) < 1.0):
+            return True
+        return False
+
     def _request_scene_repaint(self, now):
         # Camera and GUI rates are independent. Don't redraw a fullscreen
         # translucent window repeatedly for the same MediaPipe pose, especially
@@ -17182,8 +17302,9 @@ class SpatialDesktop(QWidget):
             minimum_interval = 0.12
         elif self._scene_is_idle(now):
             minimum_interval = self.IDLE_REPAINT_INTERVAL
-        elif self._scene_transition is not None:
-            # The Garden/Space slide is a real animation with cached scene images.
+        elif self._scene_has_live_animation(now):
+            # Timed gesture rings, menu fades and Garden/Space slides must
+            # still animate smoothly even when inference runs at 5 FPS.
             minimum_interval = 1.0 / 30.0
         elif (self.desktop_mode == "virtual" and self.virtual_garden_mode and
               not any(now-float(seen or 0.0) < 0.6 for seen in self.hand_last_seen.values())):
@@ -17224,6 +17345,11 @@ class SpatialDesktop(QWidget):
             # Search has a dedicated independently refreshed hand layer.
             # Maintain gestures at ~30Hz without needlessly redrawing the HUD.
             desired_ms = max(33, desired_ms)
+        if self._scene_has_live_animation(now):
+            # The camera may run at 5-10 FPS, but countdown rings and menu
+            # transitions still need their own fast animation clock.  Return
+            # to the low-rate timer as soon as the gesture/transition ends.
+            desired_ms = min(desired_ms, 33)
         timer = getattr(self, "timer", None)
         if timer is not None and timer.interval() != desired_ms:
             timer.setInterval(desired_ms)
@@ -17785,6 +17911,14 @@ class SpatialDesktop(QWidget):
         self._remember_external_foreground_window()
         now = time.monotonic()
         self._sync_camera_handover_prompt()
+        if (getattr(self, "_modifier_right_mouse_down", False) and
+                (self.desktop_mode != "os" or self._gesture_ui_modal_open()
+                 or self.hand_tracking_paused
+                 or (self.whiteboard is not None and self.whiteboard.isVisible())
+                 or getattr(self, "_task_view_native_mode", False)
+                 or getattr(self, "_shell_native_mode", False))):
+            self._release_modifier_right_mouse_hold()
+            self.modifier_click_armed["right"] = False
         if self.desktop_mode == "os" and self._native_context_menu_block_active(now):
             # The right-click was already emitted; never reinterpret its held
             # selection pinch as a click on (and instant dismissal of) Explorer.
@@ -17869,6 +18003,16 @@ class SpatialDesktop(QWidget):
             if side not in hands_by_side or score > hands_by_side[side][1]:
                 hands_by_side[side] = (landmarks, score)
         self._adjust_scene_timer_cadence(bool(hands_by_side), now)
+        if getattr(self, "_modifier_right_mouse_down", False):
+            for required_side in ("left", "right"):
+                last_seen = self.hand_last_seen.get(required_side)
+                if (required_side not in hands_by_side and
+                        (last_seen is None or now - last_seen >= 0.20)):
+                    self._release_modifier_right_mouse_hold()
+                    # Require a fresh pinch, not an automatically resumed hold,
+                    # after tracking has disappeared.
+                    self.modifier_click_armed["right"] = False
+                    break
 
         # Full-screen-modal onboarding keeps live inference/rendering available but stops
         # all normal pointer, click, drag, scroll, peace-toggle and menu gesture paths.
@@ -18121,9 +18265,13 @@ class SpatialDesktop(QWidget):
             if (self.gesture_tracking_enabled.get(side, True) and not peace and
                     self._fist_closing_blocks_pinch(side, landmarks, now, edge_tolerant)):
                 raw_pinch = False
-            # Confirm that a pinch persists with at least two other fingers
-            # actually extended. Do this before the left-hand pinch exception.
-            raw_pinch = self._confirm_intentional_pinch(side, raw_pinch, landmarks)
+            # A real clenched fist with its thumb folded over the index can
+            # satisfy the thumb/index proximity test. Never let that proximity
+            # turn a recognised fist into a pinch (or steal the LEFT modifier).
+            # The stale-fist-latch release exception below still permits real
+            # left pinches when the *current* raw pose is not a fist.
+            raw_pinch = self._confirm_intentional_pinch(
+                side, raw_pinch and not raw_fist, landmarks)
             # Treat the open glass menu/settings as a gesture-modal surface. A hand
             # outside the visible panel may still be tracked/rendered, but its pose
             # cannot start a pinch timer, drag, scroll, or click through to an app.
@@ -18144,10 +18292,11 @@ class SpatialDesktop(QWidget):
                 self.update()
                 continue
             clear_left_pinch = False
-            if side == "left" and raw_pinch:
-                # A tight thumb/index contact is the left-hand click pose even when the
-                # broad fist classifier overlaps it. It also clears a stale fist latch
-                # from prior noisy frames; the right-hand fist-scroll priority is untouched.
+            if side == "left" and raw_pinch and not raw_fist:
+                # A genuine left pinch clears a *stale previous-fist latch*,
+                # but never overrides a fist recognised in the current frame.
+                # The older proximity-only exception classified tucked thumbs
+                # on closed LEFT fists as pinches, disabling the modifier.
                 pinch_gap = _real_thumb_index_gap(landmarks)
                 clear_left_pinch = should_prefer_clear_left_pinch_over_fist(
                     is_pinch=raw_pinch, normalized_gap=pinch_gap)
@@ -18275,11 +18424,14 @@ class SpatialDesktop(QWidget):
         if not clipboard_interacting:
             self._process_custom_gestures(hands_by_side, cursor_points, poses, now)
 
-        if clipboard_interacting:
-            # A left fist manipulating the floating clipboard is a grab,
-            # NOT the left-hand right-click modifier. Without this override
-            # the modifier arms after two camera frames, steals gesture
-            # ownership and can reset the other hand's clipboard press.
+        clipboard_modifier_conflict = bool(self.floating_clipboard_visible and (
+            any(self.floating_clipboard_drag_state.values()) or
+            ("left" in cursor_points and
+             self._floating_clipboard_contains(cursor_points["left"]))))
+        if clipboard_modifier_conflict:
+            # Only an actual clipboard drag or the LEFT hand over the panel
+            # blocks the fist modifier. A RIGHT hand merely hovering the
+            # clipboard must not disable a left-fist / right-pinch gesture.
             self.left_click_modifier_active = False
             self.left_modifier_fist_frames = 0
             self.left_modifier_open_frames = 0
@@ -19542,6 +19694,7 @@ class SpatialDesktop(QWidget):
         self._request_scene_repaint(now)
 
     def closeEvent(self, event):
+        self._release_modifier_right_mouse_hold()
         if self.whiteboard is not None:
             self.whiteboard.release_all_strokes()
             self.whiteboard.close()
