@@ -194,9 +194,6 @@ from gesture_rules import (
     quick_pinch_reentry_eligible,
     align_double_click_point,
     hand_apparent_size_scale,
-    hand_contact_gap,
-    shared_contact_weight,
-    shared_contact_origins,
     ease_toward,
     pinch_drag_should_start,
     thumb_sticking_out,
@@ -205,7 +202,6 @@ from gesture_rules import (
     opposite_diagonal_corner_assignment,
 )
 from hand_occlusion import TuckSmoother
-from hand_contact import contact_offsets as hand_contact_offsets
 from custom_gestures import (
     ACTION_IDS as CUSTOM_GESTURE_ACTION_IDS, ACTION_LABELS as CUSTOM_GESTURE_ACTION_LABELS,
     ACTION_GROUPS as CUSTOM_GESTURE_ACTION_GROUPS,
@@ -427,7 +423,7 @@ except (AttributeError, cv2.error):
 # Loading it at module import used to delay the first visible Qt window.
 
 from PySide6.QtCore import Qt, QTimer, QPoint, QPointF, QRect, QRectF, QObject, Signal, QMimeData, QBuffer, QIODevice
-from PySide6.QtGui import QPainter, QColor, QPen, QBrush, QFont, QFontMetricsF, QCursor, QLinearGradient, QImage, QPainterPath, QPainterPathStroker, QRadialGradient, QGradient, QPolygonF, QDrag, QPixmap
+from PySide6.QtGui import QPainter, QColor, QPen, QBrush, QFont, QFontMetricsF, QCursor, QLinearGradient, QImage, QImageReader, QPainterPath, QPainterPathStroker, QRadialGradient, QGradient, QPolygonF, QDrag, QPixmap
 from PySide6.QtCore import QUrl
 from PySide6.QtWidgets import (QApplication, QWidget, QMessageBox, QInputDialog,
                                QLineEdit, QDialog, QCheckBox, QLabel, QPushButton,
@@ -3447,6 +3443,7 @@ def load_ui_preferences() -> dict:
         "garden_onboarding_completed": False,
         "garden_onboarding_progress": [],
         "garden_onboarding_bonus_xp": 0,
+        "whiteboard_folder": "",
         "sound_defaults_v1_applied": False,
         **{key: DEFAULT_UI_SOUNDS.get(key, "None") for key, _label in SOUND_SETTING_ROWS},
     }
@@ -3475,6 +3472,9 @@ def load_ui_preferences() -> dict:
             elif key == "garden_onboarding_bonus_xp":
                 if type(value) is int:
                     result[key] = max(0, min(1000, value))
+            elif key == "whiteboard_folder":
+                if isinstance(value, str) and len(value) <= 4096:
+                    result[key] = value
             elif key == "sound_defaults_v1_applied":
                 if isinstance(value, bool):
                     result[key] = value
@@ -3507,6 +3507,9 @@ def save_ui_preferences(values: dict) -> None:
         elif key == "garden_onboarding_bonus_xp":
             if type(value) is int:
                 current[key] = max(0, min(1000, value))
+        elif key == "whiteboard_folder":
+            if isinstance(value, str) and len(value) <= 4096:
+                current[key] = value
         elif key == "sound_defaults_v1_applied":
             if isinstance(value, bool):
                 current[key] = value
@@ -3675,8 +3678,7 @@ def save_gesture_settings(values: dict) -> None:
         "# hand_visual_scale: skeleton/TPI scale, 0.1 to 1.0.",
         "# hand_display_fps: visual refresh targets 30/60/90/120 FPS, default 30. Camera inference runs independently.",
         "# hand_capture_fps: camera/MediaPipe inference target 5 to 120 FPS, in steps of 5; default 15. Hardware/performance may limit the achieved rate.",
-        "# hand_contact_band_ratio: palm attraction distance beyond touch, in palm widths; 0.0 to 0.9; default 0.02.",
-        "# palm_attract_acceleration: speed multiplier for the virtual hands blending toward shared contact alignment; 0.2 to 5.0x; default 0.33x.",
+        "# HAND POSITIONING: each hand scales uniformly around a wrist/index-knuckle reference; finger articulation cannot drag the palm. No cross-hand attraction.",
         "# skin_tone_darkness: 0 to 100 percent extra warm darkening of the skin-like hand mesh.",
         "# finger_thickness: rounded finger segment thickness multiplier, 0.8 to 10.0; default 4.24.",
         "# palm_width_scale: palm contour width multiplier, 0.65 to 1.80; default 1.26.",
@@ -3685,8 +3687,8 @@ def save_gesture_settings(values: dict) -> None:
         "# hand_skin_effect: kept for older versions; true unless hand_render_style is skeleton.",
         "# TPI calibration: Hand Settings -> Calibrate Left/Right TPI; the live hand and transformed TPI are redrawn above the target and hit-tested at the same point.",
         "# Each TPI calibration stores the pinch midpoint in normalized palm-local 3D coordinates in tli_calibration.json.",
-        "# HAND ONBOARDING: on first run, extend an arm and touch below the camera, then capture a palm-facing pose and a two-hand contact pose.",
-        "# Hand scale/proximity calibration is saved in hand_calibration.json and can be repeated from Settings -> Hands.",
+        "# HAND ONBOARDING: on first run, calibrate the screen anchor and palm size, then check two-hand proximity.",
+        "# Hand calibration is saved in hand_calibration.json and can be repeated from Settings -> Hands; the old contact-attraction calibration is not applied.",
         "# Scroll input is injected as native wheel input at the live cursor so Explorer/Office controls receive it, not a posted event to the wrong top-level window.",
         "# pinch_buffer_seconds: Pinch Menu confirmation buffer before the circle starts, 0.3 to 2.0 seconds; default 0.8. Releasing early cancels the sequence (or clicks, if quick).",
         "# hand_tracking_sensitivity: drag movement gain and gentle scroll gain, 0.5 to 1.5; higher moves faster.",
@@ -3715,8 +3717,6 @@ def save_gesture_settings(values: dict) -> None:
         f"hand_display_fps={snap_hand_display_fps(values.get('hand_display_fps'))}",
         f"hand_capture_fps={clamp_hand_capture_fps(values.get('hand_capture_fps', 15))}",
         f"hand_recognition_threshold={clamped('hand_recognition_threshold', 0.30, 0.90, 0.60):.2f}",
-        f"hand_contact_band_ratio={clamped('hand_contact_band_ratio', 0.0, 0.9, 0.02):.2f}",
-        f"palm_attract_acceleration={clamped('palm_attract_acceleration', 0.2, 5.0, 0.33):.2f}",
         f"skin_tone_darkness={clamped('skin_tone_darkness', 0.0, 100.0, 0.0):.1f}",
         f"finger_thickness={clamped('finger_thickness', 0.8, 10.0, 4.24):.2f}",
         f"palm_width_scale={clamped('palm_width_scale', 0.65, 1.8, 1.26):.2f}",
@@ -3765,8 +3765,6 @@ def load_gesture_settings() -> dict:
         "hand_display_fps": 30.0,
         "hand_capture_fps": 15.0,
         "hand_recognition_threshold": 0.60,
-        "hand_contact_band_ratio": 0.02,
-        "palm_attract_acceleration": 0.33,
         "skin_tone_darkness": 0.0,
         "finger_thickness": 4.24,
         "palm_width_scale": 1.26,
@@ -3809,8 +3807,6 @@ def load_gesture_settings() -> dict:
         "hand_display_fps": (5.0, 120.0),
         "hand_capture_fps": (5.0, 120.0),
         "hand_recognition_threshold": (0.30, 0.90),
-        "hand_contact_band_ratio": (0.0, 0.9),
-        "palm_attract_acceleration": (0.2, 5.0),
         "skin_tone_darkness": (0.0, 100.0),
         "finger_thickness": (0.8, 10.0),
         "palm_width_scale": (0.65, 1.8),
@@ -4090,6 +4086,47 @@ def is_thumb_index_menu_pinch(landmarks, edge_tolerant=False):
     return True
 
 
+def _freehand_palm_index_origin(projected):
+    """Pose-stable, predicted index reach from the wrist/index knuckle.
+
+    Unlike the *live* index tip (8), both of these joints belong to the palm
+    reference. Bending the index towards the thumb may change the finger shape,
+    but must never translate the whole hand or its screen interaction anchor.
+    Calculation is affine, so it works in either camera or screen coordinates.
+    """
+    if projected is None or len(projected) < 6:
+        return 0.0, 0.0
+
+    def xy(point):
+        if hasattr(point, "x") and hasattr(point, "y"):
+            return float(point.x), float(point.y)
+        return float(point[0]), float(point[1])
+
+    wrist_x, wrist_y = xy(projected[0])
+    index_x, index_y = xy(projected[5])
+    # An extended index usually projects about three-quarters of the
+    # wrist->MCP reach beyond the MCP. Use the same pivot for every pose.
+    # Never sample a moving thumb or fingertip into the whole-hand position.
+    return (index_x + 0.75 * (index_x - wrist_x),
+            index_y + 0.75 * (index_y - wrist_y))
+
+
+def _freehand_correct_finger_chain(joints, chain, target, strengths):
+    """Bring a fingertip to its independent camera projection without moving palm.
+
+    Correcting distal joints rather than translating the entire hand prevents
+    thumb articulation from dragging the wrist/TPI around. This is deliberately
+    a local visual deformation, never an input or gesture-recognition change.
+    """
+    tip = joints[chain[-1]]
+    dx = float(target[0]) - float(tip[0])
+    dy = float(target[1]) - float(tip[1])
+    for index, fraction in zip(chain, strengths):
+        px, py = joints[index]
+        joints[index] = (float(px) + dx * fraction, float(py) + dy * fraction)
+    return joints
+
+
 class _HandVisualMotionFilter:
     """Suppress single-frame joint distortion without delaying whole-hand movement.
 
@@ -4168,14 +4205,17 @@ class _HandVisualMotionFilter:
                     difference[index, 2] = max(-z_limit, min(z_limit, difference[index, 2]))
                 output = predicted + response*difference
 
-                # Guard impossible one-frame bone stretching. This is generous
-                # enough for foreshortening and naturally opening the fingers.
+                # A finger bone has a fixed length. Previous code permitted a
+                # 75% increase in one capture frame; while moving a hand this
+                # produced visibly elongated fingers that missed real pinches.
+                # Follow the same measured palm-scale change as every other bone,
+                # allowing a modest margin for noisy MediaPipe Z/occlusion.
                 for chain in self._CHAINS:
                     for parent, child in zip(chain, chain[1:]):
                         old_length = float(np.linalg.norm(previous[child]-previous[parent]))
                         new_bone = output[child]-output[parent]
                         new_length = float(np.linalg.norm(new_bone))
-                        limit = max(0.27*palm_size, old_length*ratio*1.75)
+                        limit = max(0.20*palm_size, old_length*ratio*1.20)
                         if new_length > limit and new_length > 1e-9:
                             output[child] = output[parent] + new_bone*(limit/new_length)
 
@@ -5363,9 +5403,9 @@ class HandCalibrationWizard(QWidget):
             "to the screen just below the camera, then capture the pose."),
         2: ("2 · PALM SIZE REFERENCE", "Keep one or both hands in front of the camera.",
             "Tilt your wrist up so the palm faces the camera, then capture."),
-        3: ("3 · TWO-HAND PROXIMITY", "Show both hands and gently bring fingertips together.",
-            "Hold them near contact and capture their relative distance."),
-        4: ("CALIBRATION COMPLETE", "Your hand and proximity references have been saved.",
+        3: ("3 · TWO-HAND POSITION CHECK", "Show both hands and gently bring their pinch points together.",
+            "Capture the pose to check tracking; hands will never attract each other."),
+        4: ("CALIBRATION COMPLETE", "Your hand-size and screen-anchor references have been saved.",
             "You can rerun this calibration from Settings → Hands."),
     }
 
@@ -5599,8 +5639,14 @@ class FreehandWhiteboard(QWidget):
         # the board automatically restores the pointer in normal applications.
         self.setCursor(Qt.BlankCursor)
         self.setWindowTitle("Freehand Whiteboard")
-        self.dark_mode = False
-        self.background = QColor("#ffffff")
+        # Follow the operating system's LOCAL clock; do not change the OS theme.
+        # The manual dark-mode button overrides automatic mode for this session.
+        self._theme_override = None
+        self.dark_mode = self._night_by_local_time()
+        self.background = QColor("#000000" if self.dark_mode else "#ffffff")
+        self._theme_timer = QTimer(self)
+        self._theme_timer.setInterval(30000)
+        self._theme_timer.timeout.connect(self._sync_clock_theme)
         self.pen_color = QColor("#152535")
         self._auto_ink = True  # Default ink remains readable on either background.
         self.pen_size = 5
@@ -5609,6 +5655,23 @@ class FreehandWhiteboard(QWidget):
         # composited beneath it at paint/export time, never baked into erasures.
         self._image = QImage()
         self._stroke_segments = []  # Rebuild adaptive dark/light ink when toggled.
+        # Previously saved PNGs are flattened snapshots. Keep the original
+        # pixels as a separate underlay; newly drawn marks remain transparent.
+        self._loaded_board = QImage()
+        self._browser_open = False
+        default_dir = Path.home() / "Pictures"
+        if not default_dir.is_dir():
+            default_dir = Path.home()
+        candidate = owner.ui_preferences.get("whiteboard_folder", "")
+        saved_dir = Path(candidate).expanduser() if candidate else default_dir
+        self._browser_folder = saved_dir if saved_dir.is_dir() else default_dir
+        self._browser_files = []
+        self._browser_page = 0
+        self._browser_selected = None
+        self._browser_thumbnails = {}
+        self._browser_open_confirmation = None
+        self._browser_open_confirmation_at = 0.0
+        self._dialog_purpose = None
         self._toolbar_position = None  # Floating palette can be dragged by its background.
         self._mouse_stroke = None
         self._mouse_button = None
@@ -5635,6 +5698,79 @@ class FreehandWhiteboard(QWidget):
         self.setGeometry(owner.geometry())
         self._ensure_canvas()
 
+    @staticmethod
+    def _night_by_local_time(now=None):
+        """Local day/night, accounting for British GMT/BST and seasonal sunset.
+
+        A fixed 18:00 switch stays light well after sunset in an English winter.
+        For systems set to UK time, estimate sunrise/sunset for central Britain
+        from the calendar date and the *system-provided* UTC offset. No network,
+        device location, Windows-only API or extra dependency is required. Other
+        time zones retain the original 06:00-18:00 schedule.
+        """
+        now = datetime.now().astimezone() if now is None else now
+        minute = now.hour * 60 + now.minute + now.second / 60.0
+        zone_key = str(getattr(now.tzinfo, "key", "") or "").casefold()
+        system_zones = tuple(str(name).casefold() for name in time.tzname)
+        is_uk = (zone_key in ("europe/london", "europe/belfast", "europe/guernsey",
+                              "europe/jersey", "europe/isle_of_man") or
+                 any(name in ("bst", "british summer time") or
+                     "gmt standard time" in name or "gmt daylight time" in name
+                     for name in system_zones))
+        if not is_uk:
+            return minute >= 18 * 60 or minute < 6 * 60
+
+        # NOAA's compact solar equations; coordinates represent central UK,
+        # not the user's position. The actual horizon differs by UK location
+        # by a few tens of minutes; daylight-saving is handled by utcoffset().
+        day = now.timetuple().tm_yday
+        gamma = 2.0 * math.pi * (day - 1) / 365.0
+        eot = 229.18 * (0.000075 + 0.001868 * math.cos(gamma)
+                        - 0.032077 * math.sin(gamma)
+                        - 0.014615 * math.cos(2 * gamma)
+                        - 0.040849 * math.sin(2 * gamma))
+        decl = (0.006918 - 0.399912 * math.cos(gamma)
+                + 0.070257 * math.sin(gamma) - 0.006758 * math.cos(2 * gamma)
+                + 0.000907 * math.sin(2 * gamma) - 0.002697 * math.cos(3 * gamma)
+                + 0.00148 * math.sin(3 * gamma))
+        latitude, longitude = math.radians(52.0), -1.5
+        cos_hour_angle = (math.cos(math.radians(90.833)) /
+                          (math.cos(latitude) * math.cos(decl)) -
+                          math.tan(latitude) * math.tan(decl))
+        hour_angle = math.degrees(math.acos(max(-1.0, min(1.0, cos_hour_angle))))
+        offset = now.utcoffset()
+        if offset is None:
+            offset = datetime.now().astimezone().utcoffset()
+        utc_offset_hours = (offset.total_seconds() / 3600.0) if offset is not None else 0.0
+        solar_noon = 720.0 - 4.0 * longitude - eot + utc_offset_hours * 60.0
+        return minute < solar_noon - 4.0 * hour_angle or minute >= solar_noon + 4.0 * hour_angle
+
+    def _set_board_theme(self, enabled):
+        enabled = bool(enabled)
+        if self.dark_mode == enabled:
+            return
+        self.dark_mode = enabled
+        self.background = QColor("#000000" if enabled else "#ffffff")
+        if self._auto_ink:
+            self.pen_color = QColor("#ffffff" if enabled else "#152535")
+        self._rebuild_canvas()
+
+    def _sync_clock_theme(self):
+        if self._theme_override is None:
+            self._set_board_theme(self._night_by_local_time())
+
+    def showEvent(self, event):
+        # Opening the board begins in automatic mode again. The clock is
+        # rechecked during long sessions, including after suspend/resume.
+        self._theme_override = None
+        self._sync_clock_theme()
+        self._theme_timer.start()
+        super().showEvent(event)
+
+    def hideEvent(self, event):
+        self._theme_timer.stop()
+        super().hideEvent(event)
+
     def _ensure_canvas(self):
         w, h = max(1, self.width()), max(1, self.height())
         if not self._image.isNull() and self._image.width() == w and self._image.height() == h:
@@ -5652,10 +5788,9 @@ class FreehandWhiteboard(QWidget):
         super().resizeEvent(event)
 
     def _toolbar(self):
-        # Dock the floating palette on the right, keeping the added mode toggle
-        # inside its hit region and reachable when the board is moved/resized.
+        # Dock the floating palette on the right; include the saved-board toggle.
         width = min(270, max(190, self.width()-26))
-        height = 390
+        height = 443
         if self._toolbar_position is None:
             x, y = self.width()-width-22, 20.0
         else:
@@ -5683,11 +5818,301 @@ class FreehandWhiteboard(QWidget):
             "save": QRectF(left+pad, top+271, (w-3*pad)/2, 42),
             "clear": QRectF(left+2*pad+(w-3*pad)/2, top+271, (w-3*pad)/2, 42),
             "dark_mode": QRectF(left+pad, top+327, w-2*pad, 42),
+            "browser": QRectF(left+pad, top+380, w-2*pad, 42),
             "close": QRectF(left+w-42, top+11, 30, 30),
         }
         return panel, colors, buttons
 
+    def _loaded_board_rect(self):
+        """Letterbox a previously saved PNG; never distort its aspect ratio."""
+        if self._loaded_board.isNull():
+            return QRectF()
+        scale = min(self.width() / max(1, self._loaded_board.width()),
+                    self.height() / max(1, self._loaded_board.height()))
+        w, h = self._loaded_board.width() * scale, self._loaded_board.height() * scale
+        return QRectF((self.width()-w)/2, (self.height()-h)/2, w, h)
+
+    def _choose_browser_folder(self, directory, refresh=True):
+        if not directory.is_dir():
+            return
+        self._browser_folder = directory
+        self._browser_page = 0
+        self._browser_selected = None
+        self.owner.ui_preferences["whiteboard_folder"] = str(directory)
+        save_ui_preferences(self.owner.ui_preferences)
+        if refresh:
+            self._refresh_browser()
+
+    def _refresh_browser(self):
+        """List images without decoding them on the gesture/paint hot path."""
+        folder = self._browser_folder
+        if not folder.is_dir():
+            self._browser_files = []
+        else:
+            try:
+                self._browser_files = sorted(
+                    (entry for entry in folder.iterdir()
+                     if entry.is_file() and entry.suffix.lower() == '.png'),
+                    key=lambda entry: entry.stat().st_mtime_ns, reverse=True)[:1000]
+            except OSError:
+                self._browser_files = []
+        self._browser_page = min(self._browser_page, max(0, (len(self._browser_files)-1)//6))
+        if self._browser_selected not in self._browser_files:
+            self._browser_selected = None
+        self._browser_open_confirmation = None
+        self._browser_thumbnails.clear()
+        self.update()
+
+    def _browser_rect(self):
+        tools = self._toolbar()
+        right_limit = max(255.0, tools.left()-18.0)
+        width = min(610.0, right_limit-14.0)
+        height = min(620.0, max(350.0, self.height()-32.0))
+        return QRectF(14.0, min(16.0, max(0, self.height()-height)), width, height)
+
+    def _browser_layout(self):
+        panel = self._browser_rect()
+        x, y, w, h = panel.x(), panel.y(), panel.width(), panel.height()
+        button_h = 35.0
+        controls = {
+            'browser:close': QRectF(x+w-49, y+11, 34, 32),
+            'browser:folder': QRectF(x+15, y+71, w-30, button_h),
+            'browser:prev': QRectF(x+15, y+h-87, 88, 34),
+            'browser:next': QRectF(x+w-103, y+h-87, 88, 34),
+            'browser:open': QRectF(x+15, y+h-45, w-30, 33),
+        }
+        gap = 10.0
+        grid_top = y+119.0
+        grid_bottom = y+h-100.0
+        cell_w = (w-30.0-2*gap)/3.0
+        cell_h = max(66.0, (grid_bottom-grid_top-gap)/2.0)
+        cells = [(i, QRectF(x+15+(i%3)*(cell_w+gap),
+                            grid_top+(i//3)*(cell_h+gap), cell_w, cell_h))
+                 for i in range(6)]
+        return panel, controls, cells
+
+    def _browser_hit(self, point):
+        panel, controls, cells = self._browser_layout()
+        if not panel.contains(point):
+            return None
+        for name, rect in controls.items():
+            if rect.contains(point):
+                return name
+        for slot, rect in cells:
+            if rect.contains(point):
+                index = self._browser_page*6+slot
+                return f'browser:item:{index}' if index < len(self._browser_files) else 'browser:outside'
+        return 'browser:outside'
+
+    def _browse_folder(self):
+        if self._file_dialog_open:
+            return
+        dialog = QFileDialog(self, 'Choose saved whiteboards folder',
+                             str(self._browser_folder))
+        dialog.setOption(QFileDialog.DontUseNativeDialog, True)
+        dialog.setOption(QFileDialog.ShowDirsOnly, True)
+        dialog.setFileMode(QFileDialog.Directory)
+        dialog.setAcceptMode(QFileDialog.AcceptOpen)
+        dialog.setWindowModality(Qt.WindowModal)
+        dialog.setWindowFlag(Qt.WindowStaysOnTopHint, True)
+        self._save_dialog = dialog
+        self._dialog_purpose = 'folder'
+        self._file_dialog_open = True
+        self._hand_strokes = {'left': None, 'right': None}
+        self._hand_ready = {'left': False, 'right': False}
+        self._save_hand_pinch_side = None
+        self._save_hand_pinch_started = None
+        self._save_hand_pinch_origin = None
+        self._save_hand_pinch_last = None
+        self._save_hand_wait_release = True
+        dialog.finished.connect(self._on_save_dialog_finished)
+        dialog.open()
+        dialog.raise_()
+
+    def _apply_browser_control(self, action):
+        if action == 'browser:close':
+            self._browser_open = False
+        elif action == 'browser:folder':
+            self._browse_folder()
+        elif action == 'browser:prev':
+            self._browser_page = max(0, self._browser_page-1)
+        elif action == 'browser:next':
+            self._browser_page = min(max(0, (len(self._browser_files)-1)//6),
+                                     self._browser_page+1)
+        elif action.startswith('browser:item:'):
+            index = int(action.rsplit(':', 1)[1])
+            if index < len(self._browser_files):
+                self._browser_selected = self._browser_files[index]
+                self._browser_open_confirmation = None
+        elif action == 'browser:open' and self._browser_selected is not None:
+            selected = self._browser_selected
+            # A second explicit action is required before replacing drawing
+            # content; do not discard an unsaved board on a thumbnail tap.
+            has_content = bool(self._stroke_segments or not self._loaded_board.isNull())
+            now = time.monotonic()
+            if has_content and (self._browser_open_confirmation != selected or
+                                now-self._browser_open_confirmation_at > 6.0):
+                self._browser_open_confirmation = selected
+                self._browser_open_confirmation_at = now
+                self._feedback = 'Press OPEN BOARD again to replace current drawing'
+                self.update()
+                return
+            reader = QImageReader(str(selected))
+            reader.setAutoTransform(True)
+            image = reader.read()
+            if image.isNull():
+                self._feedback = f'Unable to open {selected.name}'
+            else:
+                self._loaded_board = image
+                self._image.fill(Qt.transparent)
+                self._stroke_segments.clear()
+                self._browser_open = False
+                self._browser_open_confirmation = None
+                self._feedback = f'Opened: {selected.name} · add new marks and Save PNG'
+        self.update()
+
+    def _browser_thumbnail(self, path):
+        key = str(path)
+        cached = self._browser_thumbnails.get(key)
+        if cached is not None:
+            return cached
+        reader = QImageReader(key)
+        reader.setAutoTransform(True)
+        size = reader.size()
+        if size.isValid():
+            factor = min(180/max(1, size.width()), 128/max(1, size.height()), 1.0)
+            reader.setScaledSize(size * factor)
+        image = reader.read()
+        if len(self._browser_thumbnails) >= 12:
+            self._browser_thumbnails.clear()
+        self._browser_thumbnails[key] = image
+        return image
+
+    def _paint_browser(self, painter):
+        panel, controls, cells = self._browser_layout()
+        painter.save()
+        painter.setPen(QPen(QColor('#72c9db'), 1.8))
+        painter.setBrush(QColor(10, 24, 40, 248))
+        painter.drawRoundedRect(panel, 15, 15)
+        painter.setPen(QColor('#efffff'))
+        painter.setFont(QFont('Sans', 13, QFont.Bold))
+        painter.drawText(QRectF(panel.x()+15, panel.y()+12, panel.width()-78, 30),
+                         Qt.AlignVCenter, 'SAVED WHITEBOARDS')
+        painter.setPen(QColor('#a4c9d9'))
+        painter.setFont(QFont('Sans', 9))
+        label = str(self._browser_folder)
+        metrics = QFontMetricsF(painter.font())
+        painter.drawText(QRectF(panel.x()+16, panel.y()+44, panel.width()-32, 20),
+                         Qt.AlignVCenter, metrics.elidedText(label, Qt.ElideMiddle, int(panel.width()-35)))
+        # Reuse the floating palette / Glass Menu hover and press feedback.
+        # The last pressed control flashes briefly even after the pinch releases.
+        hovered = {self._palette_mouse_hover_control}
+        hovered.update(self._browser_hit(point) for point in self._hand_cursors.values())
+        pressed = {stroke.get("control") for stroke in
+                   [self._mouse_stroke, *self._hand_strokes.values()]
+                   if stroke is not None and stroke.get("kind") == "control"}
+        pressed_age = time.monotonic() - self._palette_pressed_at
+        if 0.0 <= pressed_age < 0.30:
+            pressed.add(self._palette_pressed_control)
+        for name, rect in controls.items():
+            is_selected = name == 'browser:open' and self._browser_selected is not None
+            over, down = name in hovered, name in pressed
+            if over or down:
+                for expansion, alpha in ((7.0, 38), (3.5, 78)):
+                    painter.setPen(QPen(QColor(255, 105, 105, alpha) if name == 'browser:close'
+                                        else QColor(100, 255, 255, alpha), 2.3))
+                    painter.setBrush(Qt.NoBrush)
+                    painter.drawRoundedRect(rect.adjusted(-expansion, -expansion,
+                                                          expansion, expansion),
+                                            7.0 + expansion, 7.0 + expansion)
+            fill = QLinearGradient(rect.topLeft(), rect.bottomRight())
+            if name == 'browser:close':
+                fill.setColorAt(0, QColor('#e64b57') if (over or down) else QColor('#a74350'))
+                fill.setColorAt(1, QColor('#802232') if (over or down) else QColor('#5c1e29'))
+            elif down:
+                fill.setColorAt(0, QColor(165, 255, 255, 245))
+                fill.setColorAt(1, QColor(20, 115, 150, 250))
+            elif over:
+                fill.setColorAt(0, QColor(165, 255, 255, 225))
+                fill.setColorAt(1, QColor(20, 100, 135, 235))
+            elif is_selected:
+                fill.setColorAt(0, QColor('#2c8ba1'))
+                fill.setColorAt(1, QColor('#17485e'))
+            else:
+                fill.setColorAt(0, QColor('#244b60'))
+                fill.setColorAt(1, QColor('#122c40'))
+            painter.setPen(QPen(QColor('#dbffff') if (over or down) else
+                                QColor('#7edfe9') if is_selected else QColor('#5b879b'),
+                                2.1 if (over or down) else 1.2))
+            painter.setBrush(QBrush(fill))
+            painter.drawRoundedRect(rect, 7, 7)
+            if name == 'browser:open':
+                label = ('OPEN SELECTED BOARD' if self._browser_selected else 'SELECT A BOARD TO OPEN')
+                if (self._browser_open_confirmation == self._browser_selected and
+                        time.monotonic()-self._browser_open_confirmation_at <= 6.0):
+                    label = 'CONFIRM REPLACE CURRENT BOARD'
+            else:
+                label = {'browser:close': '×', 'browser:folder': 'SELECT FOLDER',
+                         'browser:prev': '◀ PREV', 'browser:next': 'NEXT ▶'}[name]
+            painter.setPen(QColor('#f1fcff'))
+            painter.setFont(QFont('Sans', 9, QFont.DemiBold))
+            painter.drawText(rect, Qt.AlignCenter, label)
+        for slot, rect in cells:
+            index = self._browser_page*6+slot
+            if index >= len(self._browser_files):
+                continue
+            path = self._browser_files[index]
+            selected = path == self._browser_selected
+            control_name = f'browser:item:{index}'
+            over, down = control_name in hovered, control_name in pressed
+            if over or down:
+                for expansion, alpha in ((7.0, 38), (3.5, 78)):
+                    painter.setPen(QPen(QColor(100, 255, 255, alpha), 2.3))
+                    painter.setBrush(Qt.NoBrush)
+                    painter.drawRoundedRect(rect.adjusted(-expansion, -expansion,
+                                                          expansion, expansion),
+                                            7.0 + expansion, 7.0 + expansion)
+            painter.setPen(QPen(QColor('#dbffff') if (over or down) else
+                                QColor('#52f3e6') if selected else QColor('#486b7f'),
+                                2.5 if (over or down or selected) else 1.0))
+            painter.setBrush(QColor('#347e91') if down else
+                             QColor('#27677d') if over else
+                             QColor('#193a4a') if selected else QColor('#0c2030'))
+            painter.drawRoundedRect(rect, 7, 7)
+            thumbnail = self._browser_thumbnail(path)
+            image_rect = rect.adjusted(6, 6, -6, -26)
+            if not thumbnail.isNull():
+                scaled = thumbnail.size()
+                fit = min(image_rect.width()/max(1, scaled.width()),
+                          image_rect.height()/max(1, scaled.height()))
+                target_w, target_h = scaled.width()*fit, scaled.height()*fit
+                target = QRectF(image_rect.center().x()-target_w/2,
+                                image_rect.center().y()-target_h/2, target_w, target_h)
+                painter.drawImage(target, thumbnail)
+            painter.setPen(QColor('#f0f8fc'))
+            painter.setFont(QFont('Sans', 8))
+            name_text = QFontMetricsF(painter.font()).elidedText(
+                path.stem, Qt.ElideMiddle, max(15, int(rect.width()-12)))
+            painter.drawText(QRectF(rect.x()+5, rect.bottom()-24, rect.width()-10, 21),
+                             Qt.AlignCenter, name_text)
+        total_pages = max(1, (len(self._browser_files)+5)//6)
+        painter.setPen(QColor('#bcdfeb'))
+        painter.setFont(QFont('Sans', 9))
+        painter.drawText(QRectF(panel.x()+112, panel.bottom()-86, panel.width()-224, 34),
+                         Qt.AlignCenter,
+                         f'{len(self._browser_files)} PNG files · {self._browser_page+1}/{total_pages}')
+        if not self._browser_files:
+            painter.drawText(QRectF(panel.x()+24, panel.y()+175, panel.width()-48, 70),
+                             Qt.AlignCenter, 'No PNG boards in this folder')
+        painter.restore()
+
     def _hit_control(self, point):
+        # When the gallery is visible, only its controls and floating palette
+        # can accept pinches. A contact elsewhere must never paint underneath.
+        if self._browser_open:
+            browser_hit = self._browser_hit(point)
+            if browser_hit is not None:
+                return browser_hit
         panel, colors, buttons = self._controls()
         for name, rect in buttons.items():
             if rect.contains(point):
@@ -5695,12 +6120,16 @@ class FreehandWhiteboard(QWidget):
         for name, rect, _ in colors:
             if rect.contains(point):
                 return name
-        return "panel" if panel.contains(point) else None
+        if panel.contains(point):
+            return "panel"
+        return "browser:outside" if self._browser_open else None
 
     def _apply_control(self, action):
-        if not action or action == "panel":
+        if not action or action in ("panel", "browser:outside"):
             return
-        if action.startswith("color:"):
+        if action.startswith("browser:"):
+            self._apply_browser_control(action)
+        elif action.startswith("color:"):
             idx = int(action.partition(":")[2])
             if 0 <= idx < len(self.PALETTE):
                 self.pen_color = QColor(self.PALETTE[idx])
@@ -5724,16 +6153,26 @@ class FreehandWhiteboard(QWidget):
         elif action == "clear":
             self._image.fill(Qt.transparent)
             self._stroke_segments.clear()
+            self._loaded_board = QImage()
             self._feedback = "Whiteboard cleared"
         elif action == "dark_mode":
-            self.dark_mode = not self.dark_mode
-            self.background = QColor("#000000" if self.dark_mode else "#ffffff")
-            if self._auto_ink:
-                self.pen_color = QColor("#ffffff" if self.dark_mode else "#152535")
-            # Repaint recorded ink, including erasures, on the new background.
-            # Other palette colours remain exactly as the user selected them.
-            self._rebuild_canvas()
-            self._feedback = "Blackboard mode" if self.dark_mode else "Whiteboard mode"
+            # Auto -> opposite of current appearance -> Auto.
+            if self._theme_override is None:
+                self._theme_override = not self.dark_mode
+                self._set_board_theme(self._theme_override)
+                self._feedback = "Manual blackboard" if self.dark_mode else "Manual whiteboard"
+            else:
+                self._theme_override = None
+                self._sync_clock_theme()
+                self._feedback = "Automatic day/night mode restored"
+        elif action == "browser":
+            self._browser_open = not self._browser_open
+            self._browser_open_confirmation = None
+            if self._browser_open:
+                self._refresh_browser()
+                self._feedback = "Saved boards · select a thumbnail or choose a folder"
+            else:
+                self._feedback = "Saved-board browser closed"
         elif action == "save":
             self.save_png()
         elif action == "close":
@@ -5782,6 +6221,8 @@ class FreehandWhiteboard(QWidget):
         output = QImage(self._image.size(), QImage.Format_ARGB32_Premultiplied)
         output.fill(self.background)
         painter = QPainter(output)
+        if not self._loaded_board.isNull():
+            painter.drawImage(self._loaded_board_rect(), self._loaded_board)
         painter.drawImage(0, 0, self._image)
         painter.end()
         return output
@@ -5793,6 +6234,8 @@ class FreehandWhiteboard(QWidget):
             return {"kind": "draw", "last": QPointF(point)}
         if control == "panel":
             return {"kind": "palette_drag", "last": QPointF(point)}
+        if control == "browser:outside":
+            return {"kind": "ignored"}
         # Play on contact, just like the Glass Menu, so a longer held pinch
         # never makes the sound feel late. The release still decides whether
         # the intended control is actually activated.
@@ -5941,6 +6384,8 @@ class FreehandWhiteboard(QWidget):
         if dialog is None:
             return
         paths = dialog.selectedFiles() if result == QDialog.Accepted else []
+        purpose = self._dialog_purpose
+        self._dialog_purpose = None
         self._save_dialog = None
         self._file_dialog_open = False
         self._save_hand_pinch_side = None
@@ -5952,13 +6397,21 @@ class FreehandWhiteboard(QWidget):
         self._hand_ready = {'left': False, 'right': False}
         self.setCursor(Qt.BlankCursor)
         dialog.deleteLater()
-        if not paths or not paths[0]:
+        if purpose == "folder":
+            if paths and paths[0] and Path(paths[0]).is_dir():
+                self._choose_browser_folder(Path(paths[0]))
+            else:
+                self._feedback = "Folder selection cancelled"
+        elif not paths or not paths[0]:
             self._feedback = 'Save cancelled'
         else:
             filename = str(paths[0])
             if not filename.lower().endswith('.png'):
                 filename += '.png'
             success = self._export_image().save(filename, 'PNG')
+            if success:
+                self._choose_browser_folder(Path(filename).parent, refresh=False)
+                self._refresh_browser()
             self._feedback = (f'Saved: {Path(filename).name}' if success else
                               'Unable to save PNG · check the destination')
         self.update()
@@ -5975,10 +6428,8 @@ class FreehandWhiteboard(QWidget):
             if self._save_dialog is not None:
                 self._save_dialog.raise_()
             return False
-        directory = Path.home() / 'Pictures'
-        if not directory.is_dir():
-            directory = Path.home()
-        proposed = directory / f'Freehand-whiteboard-{datetime.now():%Y%m%d-%H%M%S}.png'
+        directory = self._browser_folder if self._browser_folder.is_dir() else Path.home()
+        proposed = directory / f'Freehand-whiteboard-{datetime.now():%Y%m%d-%H%M%S}.png' 
         dialog = QFileDialog(self, 'Save whiteboard as PNG', str(directory),
                              'PNG image (*.png)')
         # Critical: do not use the native Windows COM file picker. The Qt-based
@@ -5991,6 +6442,7 @@ class FreehandWhiteboard(QWidget):
         dialog.setWindowModality(Qt.WindowModal)
         dialog.setWindowFlag(Qt.WindowStaysOnTopHint, True)
         self._save_dialog = dialog
+        self._dialog_purpose = "save"
         self._file_dialog_open = True
         self._hand_strokes = {'left': None, 'right': None}
         self._hand_ready = {'left': False, 'right': False}
@@ -6042,7 +6494,11 @@ class FreehandWhiteboard(QWidget):
 
     def keyPressEvent(self, event):
         if event.key() == Qt.Key_Escape:
-            self.owner._close_whiteboard()
+            if self._browser_open:
+                self._browser_open = False
+                self.update()
+            else:
+                self.owner._close_whiteboard()
             event.accept()
         elif event.key() == Qt.Key_S and event.modifiers() & Qt.ControlModifier:
             self.save_png()
@@ -6054,6 +6510,8 @@ class FreehandWhiteboard(QWidget):
         painter = QPainter(self)
         painter.setRenderHint(QPainter.Antialiasing, True)
         painter.fillRect(self.rect(), self.background)
+        if not self._loaded_board.isNull():
+            painter.drawImage(self._loaded_board_rect(), self._loaded_board)
         if not self._image.isNull():
             painter.drawImage(QPointF(0, 0), self._image)
         panel, colors, buttons = self._controls()
@@ -6095,7 +6553,8 @@ class FreehandWhiteboard(QWidget):
         for name, rect in buttons.items():
             chosen = ((name == "eraser" and self.eraser) or
                       (name == "pen" and not self.eraser) or
-                      (name == "dark_mode" and self.dark_mode))
+                      (name == "dark_mode" and self._theme_override is not None) or
+                      (name == "browser" and self._browser_open))
             over, down = name in hovered, name in active
             if over or down:
                 # The same two-stage cyan halo and light pressed border used
@@ -6132,7 +6591,9 @@ class FreehandWhiteboard(QWidget):
             painter.setFont(QFont("Sans", 9, QFont.DemiBold))
             label = {"pen": "PEN", "eraser": "ERASER", "smaller": "−",
                      "larger": "+", "save": "SAVE PNG", "clear": "CLEAR",
-                     "dark_mode": "DARK MODE  ·  ON" if self.dark_mode else "DARK MODE  ·  OFF",
+                     "dark_mode": ("DARK MODE  ·  AUTO" if self._theme_override is None else
+                                   ("DARK MODE  ·  ON" if self.dark_mode else "DARK MODE  ·  OFF")),
+                     "browser": "SAVED BOARDS  ·  CLOSE" if self._browser_open else "SAVED BOARDS  ·  OPEN",
                      "close": "×"}.get(name, name)
             painter.drawText(rect, Qt.AlignCenter, label)
         painter.setPen(QColor("#e1f5fb"))
@@ -6140,6 +6601,8 @@ class FreehandWhiteboard(QWidget):
         pen_text = f"{self.pen_size}px" + (" · eraser" if self.eraser else "")
         painter.drawText(QRectF(panel.x()+60, panel.y()+225, panel.width()-120, 35),
                          Qt.AlignCenter, pen_text)
+        if self._browser_open:
+            self._paint_browser(painter)
         # Render the same virtual hands as the normal desktop, inside the
         # whiteboard's own window. Reusing the existing hand renderer preserves
         # skeleton/flat/3D selection, transparency and tracking alignment.
@@ -6162,6 +6625,13 @@ class FreehandWhiteboard(QWidget):
                     # this same translated coordinate space so the badge sits
                     # directly on the hand, regardless of board/owner origin.
                     owner._paint_gesture_disabled_indicator(painter, points, side)
+            # The Whiteboard is its own topmost window, so the desktop HUD's
+            # peace-sign countdown is otherwise hidden behind it. Reuse the
+            # same renderer and live per-hand hold state here for both detaching
+            # and re-enabling gestures. Other gesture rings stay disabled.
+            now = time.monotonic()
+            for side in ("left", "right"):
+                owner._paint_peace_sign_timer(painter, side, now)
             painter.restore()
         # Cursor indicators are drawn above the canvas, not included in exports.
         for side, point in self._hand_cursors.items():
@@ -6371,8 +6841,6 @@ class SpatialDesktop(QWidget):
         self.hand_display_fps = snap_hand_display_fps(settings.get("hand_display_fps", 30))
         self.hand_capture_fps = clamp_hand_capture_fps(settings.get("hand_capture_fps", 15))
         self.hand_recognition_threshold = float(settings.get("hand_recognition_threshold", 0.60))
-        self.hand_contact_band_ratio = settings.get("hand_contact_band_ratio", 0.02)
-        self.palm_attract_acceleration = settings.get("palm_attract_acceleration", 0.33)
         self.skin_tone_darkness = settings.get("skin_tone_darkness", -50.0)
         self.finger_thickness = settings.get("finger_thickness", 4.24)
         self.palm_width_scale = settings.get("palm_width_scale", 1.26)
@@ -6422,6 +6890,10 @@ class SpatialDesktop(QWidget):
         self.custom_gesture_key_capture = None  # gesture row awaiting a physical keyboard shortcut
         self._native_shortcut_capture = None
         self.custom_gesture_triggers = {"left": HoldTrigger(), "right": HoldTrigger(), "overlap": HoldTrigger()}
+        # The two-TPI Glass Menu sound begins with its circle, not after it.
+        # Keep this independent of cancellable gesture-timer audio: a half-second
+        # hold must not cut off the Glass Menu sound partway through.
+        self._glass_overlap_sound_started_at = None
         # Track which timer starts have already played the delayed timer-during sound.
         self._timer_during_sound_played_at = {}
         self._timer_during_sound_stop_events = {}
@@ -6762,15 +7234,13 @@ class SpatialDesktop(QWidget):
         self.tli_calibration_sample_count = 12
         self.tli_calibration_active_side = None
         self.tli_calibration_window = None
-        # Per-hand visual scale pivots: own wrist when apart, one shared pivot when the
-        # hands touch, so touching hands stay together even when the meshes are shrunk.
+        # Independent wrist/palm-guided visual pivot, with locally aligned tips.
+        # No cross-hand attraction or pose-induced whole-hand translation.
         self.hand_scale_origins = {}
-        # Shared contact adjustment: when the real hands are REALLY close, both virtual
-        # hands are scaled about one shared pivot so physical contact stays contact.
-        # Full effect at the calibrated touch gap; fades out over this many palm widths
-        # beyond it. Smaller = only kicks in nearer contact (snappier); larger = gentler.
-        # Loaded from gestures.txt above; set from Settings -> Hands -> CONTACT RANGE.
-        self.hand_contact_weight = 0.0
+        # Per-hand rigid palm reference: index knuckle jitter during pinches
+        # must not translate the whole rendered hand or its TPI.
+        self._hand_palm_anchor_reference = {}
+        self.hand_contact_weight = 0.0  # Legacy state, retained for compatibility.
         self.hand_contact_last_update = None
         # Touchscreen-first: both physical hands are independent inputs by default.
         # Peace-sign toggles still detach either hand independently.
@@ -6801,7 +7271,8 @@ class SpatialDesktop(QWidget):
         self.active_release_cooldown_seconds = 0.20
         self.right_click_context_active = {"left": False, "right": False}
         self.side_cursor_positions = {"left": None, "right": None}
-        # Screen offset applied when drawing each hand so it moves with the smoothed TLI.
+        # Kept for compatibility with hand renderers. TPI/index motion must not
+        # be transferred to the palm as a whole-hand drawing offset.
         self.hand_draw_offset = {"left": (0.0, 0.0), "right": (0.0, 0.0)}
         # Drawn-hand landmarks with fingertips the camera can't see folded in (see
         # hand_occlusion). Gestures and the TLI keep using hand_positions.
@@ -6992,8 +7463,6 @@ class SpatialDesktop(QWidget):
             "hand_display_fps": self.hand_display_fps,
             "hand_capture_fps": self.hand_capture_fps,
             "hand_recognition_threshold": self.hand_recognition_threshold,
-            "hand_contact_band_ratio": self.hand_contact_band_ratio,
-            "palm_attract_acceleration": self.palm_attract_acceleration,
             "skin_tone_darkness": self.skin_tone_darkness,
             "finger_thickness": self.finger_thickness,
             "palm_width_scale": self.palm_width_scale,
@@ -9976,7 +10445,9 @@ class SpatialDesktop(QWidget):
                 stack("sound:" + key, h=43.0, after=7.0)
             texts["help"] = (L, y, W, 42.0)
             y += 42.0 + gap
-            right_h = max(right_h, 340.0)
+            # The sound picker can show eleven items plus its heading and
+            # Preview button; reserve their full height within the glass panel.
+            right_h = max(right_h, 405.0)
         elif page == "notifications":
             for key, _label, _default in NOTIFICATION_SETTING_ROWS:
                 stack("notify:" + key)
@@ -10124,11 +10595,17 @@ class SpatialDesktop(QWidget):
         left = cx + right*scale
         panel_top = cy + top*scale
         width = self.SETTINGS_COLUMN_W*scale
-        panel = QRectF(left, panel_top, width, (len(options)+1)*item_h)
+        # Keep the preview target in this shared layout: its painting and
+        # mouse/pinch hit testing must use exactly the same rectangle.
+        picker_h = (len(options)+1)*item_h
+        preview_rect = QRectF(left+8.0*scale, panel_top+picker_h+8.0*scale,
+                              width-16.0*scale, 35.0*scale)
+        panel = QRectF(left, panel_top, width, picker_h+51.0*scale)
         items = [(value, QRectF(left, panel_top+(i+1)*item_h, width, item_h))
                  for i, value in enumerate(options)]
         return {"panel": panel, "items": items, "key": key,
-                "header": QRectF(left, panel_top, width, item_h)}
+                "header": QRectF(left, panel_top, width, item_h),
+                "preview": preview_rect}
 
     def _paint_sound_dropdown(self, painter, cx, cy, scale):
         layout = self._sound_dropdown_layout(cx, cy, scale)
@@ -10150,6 +10627,18 @@ class SpatialDesktop(QWidget):
             painter.setFont(self._ui_font(max(7, int(9*scale)), QFont.DemiBold))
             label = "None (silent)" if value == "None" else value
             self._draw_fitted_button_label(painter, rect, label, base_size=max(7, int(9*scale)), min_size=6, inset=9*scale)
+        # Preview the saved selection for the currently highlighted sound event.
+        # Selecting a different event or sound updates what this button plays.
+        has_sound = bool(selected and selected != "None")
+        preview = layout["preview"]
+        painter.setBrush(QBrush(QColor(29, 119, 79, 235) if has_sound else QColor(39, 53, 64, 210)))
+        painter.setPen(QPen(QColor(152, 249, 188, 225) if has_sound else QColor(110, 130, 143, 175),
+                            1.4*scale))
+        painter.drawRoundedRect(preview, 8*scale, 8*scale)
+        painter.setPen(QColor(242, 255, 247) if has_sound else QColor(166, 176, 183))
+        self._draw_fitted_button_label(painter, preview,
+                                       "▶  PREVIEW SELECTED SOUND" if has_sound else "PREVIEW · NONE (SILENT)",
+                                       base_size=max(8, int(10*scale)), min_size=6, inset=9*scale)
 
     def _notification_rect(self, position, width, height, margin=18):
         """Position a notification in one of six screen anchors."""
@@ -10193,9 +10682,10 @@ class SpatialDesktop(QWidget):
         self.update()
 
 
-    def _toggle_glass_menu_from_gesture(self):
+    def _toggle_glass_menu_from_gesture(self, *, play_sound=True):
         visible = not (self.menu_open and self.hub_visible)
-        self._set_menu_open(visible, reset_settings=not visible)
+        self._set_menu_open(visible, reset_settings=not visible,
+                            play_toggle_sound=play_sound)
         self.status = "Glass menu " + ("shown" if visible else "hidden")
         self.update()
 
@@ -10269,7 +10759,8 @@ class SpatialDesktop(QWidget):
             self._glass_deferred_reset_settings = False
         self.update()
 
-    def _set_menu_open(self, visible, now=None, reset_settings=False):
+    def _set_menu_open(self, visible, now=None, reset_settings=False,
+                       *, play_toggle_sound=True):
         visible = bool(visible)
         changed = (self.menu_open != visible or self.hub_visible != visible)
         if not changed:
@@ -10309,7 +10800,8 @@ class SpatialDesktop(QWidget):
             QTimer.singleShot(int(self.menu_transition_duration*1000)+30,
                               lambda token=self._glass_fade_serial:
                               self._finish_glass_menu_close(token))
-        play_ui_sound(self.ui_preferences.get("sound_glass_toggle", "None"))
+        if play_toggle_sound:
+            play_ui_sound(self.ui_preferences.get("sound_glass_toggle", "None"))
         self.update()
         return True
 
@@ -10782,8 +11274,6 @@ class SpatialDesktop(QWidget):
                 ("skin_tone_darkness", self.skin_tone_darkness, 0.0, 100.0, "SKIN TONE DARKNESS"),
                 ("skeleton_line_thickness", self.skeleton_line_thickness, 0.5, 4.0, "SKELETON LINE THICKNESS"),
                 ("hand_transparency", self.hand_transparency, 10.0, 100.0, "HAND OPACITY"),
-                ("hand_contact_band_ratio", self.hand_contact_band_ratio, 0.0, 0.9, "PALM ATTRACT DISTANCE"),
-                ("palm_attract_acceleration", self.palm_attract_acceleration, 0.2, 5.0, "PALM ATTRACT ACCELERATION"),
             ]
         return []
 
@@ -10845,15 +11335,44 @@ class SpatialDesktop(QWidget):
         distance, name = min(candidates)
         return name if distance <= y_limit else None
 
-    def _point_on_recent_selection(self, point, now=None):
-        """Hit test the area selected via a native pinch-drag, not all nearby text."""
+    def _point_on_recent_selection(self, point, now=None, side=None):
+        """Hit a native text selection even as the index curls into a fist.
+
+        The TPI correctly follows the scaled index finger, but that means a
+        fist can move the TPI away from the just-selected text even though the
+        wrist/palm has not moved. Only for the hand which made the selection,
+        also test its *original* selection endpoint carried by the palm's
+        translation. This is a pickup hit test, not a pointer/hand correction;
+        other gestures retain the normal live TPI and visual geometry.
+        """
         selection = getattr(self, "_recent_text_selection", None)
         if (selection is None or point is None or self.desktop_mode != "os" or
                 self.menu_open or
                 (self.floating_clipboard_visible and self._floating_clipboard_contains(point))):
             return False
         now = time.monotonic() if now is None else float(now)
-        return now-selection["created"] <= 75.0 and selection["rect"].contains(point)
+        if now-selection["created"] > 75.0:
+            return False
+        if selection["rect"].contains(point):
+            return True
+        # Never use this fallback for an unrelated hand, stale detection, or a
+        # selection created before palm tracking was available.
+        if side != selection.get("side"):
+            return False
+        release_palm = selection.get("release_palm")
+        release_tip = selection.get("release_tip")
+        current_palm = getattr(self, "hand_scale_origins", {}).get(side)
+        if release_palm is None or release_tip is None or current_palm is None:
+            return False
+        shift_x = current_palm.x()-release_palm.x()
+        shift_y = current_palm.y()-release_palm.y()
+        # Limit the pose bridge to a nearby palm: ordinary fist scrolling
+        # elsewhere must not pick up an old highlighted selection.
+        if math.hypot(shift_x, shift_y) > 85.0:
+            return False
+        pose_stable_tip = QPointF(release_tip.x()+shift_x,
+                                  release_tip.y()+shift_y)
+        return selection["rect"].contains(pose_stable_tip)
 
     @staticmethod
     def _clone_clipboard_mime(mime):
@@ -10879,7 +11398,7 @@ class SpatialDesktop(QWidget):
         """Copy a confirmed OS selection on demand without changing the source."""
         if pyautogui is None or self._selection_drag is not None:
             return False
-        if not self._point_on_recent_selection(point, now):
+        if not self._point_on_recent_selection(point, now, side):
             return False
         clipboard = getattr(self, "_system_clipboard", None) or QApplication.clipboard()
         original_mime = clipboard.mimeData()
@@ -10973,7 +11492,7 @@ class SpatialDesktop(QWidget):
                 return False
             if self._selection_pickup_latched.get(side, False):
                 return True
-            if self._point_on_recent_selection(point, now):
+            if self._point_on_recent_selection(point, now, side):
                 self._selection_pickup_latched[side] = True
                 return self._start_selected_item_drag(side, point, now)
             return False
@@ -12538,8 +13057,6 @@ class SpatialDesktop(QWidget):
             "tli_border_thickness": ("tli_border_thickness", 0.05),
             "tli_diameter": ("tli_diameter", 0.5),
             "skeleton_line_thickness": ("skeleton_line_thickness", 0.02),
-            "hand_contact_band_ratio": ("hand_contact_band_ratio", 0.005),
-            "palm_attract_acceleration": ("palm_attract_acceleration", 0.02),
             "virtual_grid_brightness": ("virtual_grid_brightness", 0.5),
             "virtual_grid_glow": ("virtual_grid_glow", 0.5),
             "virtual_grid_spacing": ("virtual_grid_spacing", 1.0),
@@ -12610,8 +13127,12 @@ class SpatialDesktop(QWidget):
             return "pinch"
 
         if self.settings_page == "sounds":
-            if any(rect.contains(point) for _, rect in
-                   self._sound_dropdown_layout(cx, cy, scale)["items"]):
+            sound_picker = self._sound_dropdown_layout(cx, cy, scale)
+            if sound_picker["preview"].contains(point):
+                # Do not play the normal Glass Menu button click over the
+                # selected audio: the preview should be heard on its own.
+                return "preview"
+            if any(rect.contains(point) for _, rect in sound_picker["items"]):
                 return "button"
 
         if (self._settings_back_rect(cx, cy, scale).contains(point) or
@@ -12680,6 +13201,7 @@ class SpatialDesktop(QWidget):
             elif sound_target == "pinch":
                 play_ui_sound(self.ui_preferences.get("sound_pinch", "None"))
             # "toggle": _set_menu_open() plays sound_glass_toggle itself.
+            # "preview": the Sounds page plays the chosen audio directly.
             if not self.settings_open:
                 if self._main_menu_close_rect(cx, cy, scale).contains(point):
                     self._set_menu_open(False, now, reset_settings=True)
@@ -12727,6 +13249,17 @@ class SpatialDesktop(QWidget):
                         self.status = f"{key.replace('sound_', '').replace('_', ' ').title()} sound: {value}"
                         self.update()
                         return
+                if popup["preview"].contains(point):
+                    # Preview only, never change/save preferences or trigger a
+                    # second Glass button sound over the chosen audio.
+                    chosen_sound = self.ui_preferences.get(popup["key"], "None")
+                    if chosen_sound and chosen_sound != "None":
+                        play_ui_sound(chosen_sound)
+                        self.status = f"Preview: {chosen_sound}"
+                    else:
+                        self.status = "No sound selected to preview"
+                    self.update()
+                    return
 
             # Back and the three Settings sub-pages share a stable navigation row.
             if self._settings_back_rect(cx, cy, scale).contains(point):
@@ -13721,9 +14254,16 @@ class SpatialDesktop(QWidget):
                 math.hypot(selection_end.x()-selection_origin.x(),
                            selection_end.y()-selection_origin.y()) >= 8.0):
             rect = QRectF(QPointF(selection_origin), QPointF(selection_end)).normalized()
+            # Preserve the real pinch endpoint relative to the *palm*, not the
+            # index fingertip. As the hand closes into a fist its fingertip TPI
+            # moves, but its palm remains over the selected text. This snapshot
+            # lets the clipboard pickup recognise that same stationary hand.
+            palm = getattr(self, "hand_scale_origins", {}).get(side)
             self._recent_text_selection = {
                 "rect": rect.adjusted(-26, -26, 26, 26),
                 "created": time.monotonic(), "side": side,
+                "release_palm": QPointF(palm) if palm is not None else None,
+                "release_tip": QPointF(selection_end),
             }
         self.pinch_drag_active[side] = False
         self.pinch_drag_origin_points[side] = None
@@ -14175,7 +14715,7 @@ class SpatialDesktop(QWidget):
         window.show()
         window.raise_()
         window.activateWindow()
-        self.status = "Hand setup: screen touch, palm-size, and two-hand proximity calibration"
+        self.status = "Hand setup: screen touch, palm size, and independent two-hand alignment"
         self.update()
 
     def _cancel_hand_onboarding(self, announce=True):
@@ -14415,11 +14955,10 @@ class SpatialDesktop(QWidget):
         if window is None or not window.isVisible():
             return
         points = [(float(lm.x), float(lm.y), float(getattr(lm, "z", 0.0))) for lm in landmarks]
-        origin, user_scale = self._hand_visual_transform(points, side)
+        screen_joints = self._hybrid_hand_screen_joints(side, points)
         mapped_points = []
-        for x, y, _z in points:
-            q = self.interactive_visual_point(x, y)
-            sx, sy = scale_hand_point((q.x(), q.y()), (origin.x(), origin.y()), user_scale)
+        for i in range(21):
+            sx, sy = screen_joints[i]
             global_point = self._virtual_point_to_global(QPointF(sx, sy))
             local = window.mapFromGlobal(global_point)
             mapped_points.append(QPointF(float(local.x()), float(local.y())))
@@ -14562,7 +15101,9 @@ class SpatialDesktop(QWidget):
 
         tx, ty = xy(landmarks[4])
         ix, iy = xy(landmarks[8])
-        return (tx+ix)*0.5, (ty+iy)*0.5
+        # Without a stored palm-relative calibration use the index fingertip.
+        # The thumb's motion during pinch formation must not drag the TPI down.
+        return ix, iy
 
     def interactive_point(self, x, y):
         """Map the calibrated camera area to the physical screen and clamp it there."""
@@ -14654,6 +15195,7 @@ class SpatialDesktop(QWidget):
 
     def _reset_custom_gesture_triggers(self):
         self.custom_gesture_triggers = {"left": HoldTrigger(), "right": HoldTrigger(), "overlap": HoldTrigger()}
+        self._glass_overlap_sound_started_at = None
         self.custom_gesture_live = {}
         self.custom_gesture_rings = {}
 
@@ -14873,12 +15415,23 @@ class SpatialDesktop(QWidget):
         hold = float(self.custom_gesture_hold_seconds)
         fired = trigger.update("glass_menu" if overlapping else None, now, hold)
         if overlapping and not trigger.fired:
+            # The circle and its sound must begin together. The current code
+            # only played sound_glass_toggle AFTER the hold, which made the
+            # overlap countdown completely silent. One sound per fresh hold;
+            # don't restart it on every camera frame or play it twice at toggle.
+            if (trigger.since is not None and
+                    trigger.since != self._glass_overlap_sound_started_at):
+                self._glass_overlap_sound_started_at = trigger.since
+                play_ui_sound(self.ui_preferences.get("sound_glass_toggle", "None"))
             progress = trigger.progress(now, hold)
             rings["overlap"] = ("GLASS MENU", progress, max(0.0, hold*(1.0-progress)))
+        elif not overlapping:
+            self._glass_overlap_sound_started_at = None
         if fired is not None:
             was_garden = (self.desktop_mode == "virtual" and self.virtual_garden_mode)
             lesson = self._onboarding_stage()
-            self._toggle_glass_menu_from_gesture()
+            # The overlap countdown already played the toggle effect.
+            self._toggle_glass_menu_from_gesture(play_sound=False)
             if (was_garden and lesson is not None and lesson[0] == "glass_menu" and
                     self.menu_open and self.hub_visible):
                 self._onboarding_complete_step("glass_menu")
@@ -15213,76 +15766,84 @@ class SpatialDesktop(QWidget):
             painter.setFont(font(9))
             painter.drawText(row["delete"], Qt.AlignCenter, "×")
 
-    def _update_hand_scale_origins(self, hands_by_side):
-        """Per-hand wrist pivots, blended to one shared pivot when the hands touch.
+    def _palm_screen_geometry(self, points):
+        """Palm centre and orientation from wrist and non-index MCP joints.
 
-        Apart, each virtual hand scales about its own wrist so moving one hand never
-        moves the other. When the real hands are really close (fingertips, fingertip to
-        palm, or palm to palm), both hands blend to scaling about the midpoint of the
-        wrists. A common pivot preserves relative geometry exactly, so touching hands
-        render touching at any hand scale. The blend is eased over a few frames so it
-        reads as the hands meeting rather than snapping. Points are screen-space.
+        These joints are behind the articulating index finger and thumb. The
+        index MCP itself can be incorrectly pulled by MediaPipe during occlusion;
+        it must not serve as a continuously moving whole-hand anchor.
         """
-        wrists = {}
-        screen_points = {}
-        palm_sizes_screen = {}
+        projected = {i: self.interactive_visual_point(
+            float(points[i].x) if hasattr(points[i], 'x') else float(points[i][0]),
+            float(points[i].y) if hasattr(points[i], 'y') else float(points[i][1]))
+            for i in (0, 9, 13, 17)}
+        w, m, r, p = (projected[i] for i in (0, 9, 13, 17))
+        # A palm centroid is less noisy than a single wrist or knuckle.
+        centre = (0.30*w.x()+0.32*m.x()+0.23*r.x()+0.15*p.x(),
+                  0.30*w.y()+0.32*m.y()+0.23*r.y()+0.15*p.y())
+        # The wrist-to-MCP direction follows actual translation, rotation and
+        # approach to camera without using the bending index finger.
+        axis = ((0.46*m.x()+0.34*r.x()+0.20*p.x())-w.x(),
+                (0.46*m.y()+0.34*r.y()+0.20*p.y())-w.y())
+        return centre, axis
+
+    def _update_hand_scale_origins(self, hands_by_side):
+        """Track each palm rigidly without magnifying index-MCP pinch jitter.
+
+        The original palm/index anchor is retained when a hand first appears,
+        preserving the user's existing hand positioning. After that it travels
+        with the wrist/middle/ring/pinky *palm* as a rigid 2D similarity
+        transform. The index and thumb remain free to bend; their movement
+        cannot pull the entire hand (or its TPI) downward.
+        """
+        origins = {}
+        previous = getattr(self, '_hand_palm_anchor_reference', {})
+        references = {}
         for side, (landmarks, _score) in hands_by_side.items():
-            if len(landmarks) < 21:
+            if side not in ('left', 'right') or len(landmarks) < 21:
                 continue
-            pts = []
-            for lm in landmarks[:21]:
-                q = self.interactive_visual_point(float(lm.x), float(lm.y))
-                pts.append((q.x(), q.y()))
-            screen_points[side] = pts
-            wrists[side] = pts[0]
-            palm_length = math.hypot(pts[9][0]-pts[0][0], pts[9][1]-pts[0][1])
-            palm_width = math.hypot(pts[17][0]-pts[5][0], pts[17][1]-pts[5][1])
-            if palm_length > 1.0 and palm_width > 1.0:
-                palm_sizes_screen[side] = math.sqrt(palm_length*palm_width)
-
-        # Thresholds are palm-relative, so behaviour is the same near or far from camera.
-        calibration = getattr(self, "hand_calibration", {})
-        touch_ratio = float(calibration.get("proximity_touch_ratio", 0.28))
-        interaction_ratio = float(calibration.get("proximity_interaction_ratio", 2.5))
-        touch_distance, _interaction_distance = proximity_thresholds(
-            palm_sizes_screen, touch_ratio, interaction_ratio
-        )
-        palm_unit = (sum(palm_sizes_screen.values())/len(palm_sizes_screen)
-                     if palm_sizes_screen else 40.0)
-        band = max(0.0, palm_unit*max(0.0, float(getattr(self, "hand_contact_band_ratio", 0.02))))
-
-        target = 0.0
-        if band <= 1e-6:
-            # Hard bypass at zero: no contact detection, shared pivot, or residual easing.
-            # Each virtual hand remains anchored to its own current wrist independently.
-            self.hand_contact_last_update = None
-            self.hand_contact_weight = 0.0
-            self.hand_scale_origins = {side: QPointF(x, y) for side, (x, y) in wrists.items()}
-            base_scale = min(1.0, max(0.1, float(getattr(self, "hand_visual_scale", 0.3))))
-            self.hand_contact_scales = {side: base_scale for side in wrists}
-            return
-        elif "left" in screen_points and "right" in screen_points:
-            gap = hand_contact_gap(screen_points["left"], screen_points["right"])
-            target = shared_contact_weight(gap, touch_distance, touch_distance + band)
-            now = time.monotonic()
-            last = getattr(self, "hand_contact_last_update", None)
-            dt = (now - last) if last is not None else 1.0
-            self.hand_contact_last_update = now
-            weight = ease_toward(
-                getattr(self, "hand_contact_weight", 0.0), target, dt,
-                engage_seconds=0.05 / max(0.2, float(getattr(self, "palm_attract_acceleration", 0.33))),
-                release_seconds=0.09 / max(0.2, float(getattr(self, "palm_attract_acceleration", 0.33))),
-            )
-        else:
-            # One hand only: there is no partner to share a pivot with.
-            self.hand_contact_last_update = None
-            weight = 0.0
-        self.hand_contact_weight = weight
-
-        origins = shared_contact_origins(wrists, weight)
-        self.hand_scale_origins = {side: QPointF(x, y) for side, (x, y) in origins.items()}
-        base_scale = min(1.0, max(0.1, float(getattr(self, "hand_visual_scale", 0.3))))
-        self.hand_contact_scales = {side: base_scale for side in wrists}
+            centre, axis = self._palm_screen_geometry(landmarks)
+            axis_length = math.hypot(*axis)
+            if axis_length < 1e-4 or not all(math.isfinite(v) for v in (*centre, *axis)):
+                continue
+            reference = previous.get(side)
+            if reference is None:
+                # Keep the previous visual placement exactly at reacquisition.
+                initial = self.interactive_visual_point(
+                    *_freehand_palm_index_origin(landmarks))
+                reference = (centre, axis,
+                             (initial.x()-centre[0], initial.y()-centre[1]))
+            initial_centre, initial_axis, initial_offset = reference
+            initial_length_sq = initial_axis[0]**2 + initial_axis[1]**2
+            if initial_length_sq < 1e-8:
+                continue
+            # Complex multiplication computes rotation *and* palm-size change.
+            # A real hand sweep moves centre immediately; a pinch changes only
+            # fingers, so there is no artificial translation or movement lag.
+            cosine_scale = (axis[0]*initial_axis[0] +
+                            axis[1]*initial_axis[1]) / initial_length_sq
+            sine_scale = (axis[1]*initial_axis[0] -
+                          axis[0]*initial_axis[1]) / initial_length_sq
+            scale = math.hypot(cosine_scale, sine_scale)
+            if not 0.35 <= scale <= 2.8:
+                # Major occlusion/reacquisition: rebase rather than use an
+                # invalid, potentially screen-wide jump.
+                initial = self.interactive_visual_point(
+                    *_freehand_palm_index_origin(landmarks))
+                reference = (centre, axis,
+                             (initial.x()-centre[0], initial.y()-centre[1]))
+                cosine_scale, sine_scale = 1.0, 0.0
+                initial_offset = reference[2]
+            dx = initial_offset[0]*cosine_scale-initial_offset[1]*sine_scale
+            dy = initial_offset[0]*sine_scale+initial_offset[1]*cosine_scale
+            origins[side] = QPointF(centre[0]+dx, centre[1]+dy)
+            references[side] = reference
+        # A missing hand gets a fresh reference on its next appearance; the
+        # other hand never contributes to these coordinates.
+        self._hand_palm_anchor_reference = references
+        self.hand_scale_origins = origins
+        self.hand_contact_weight = 0.0
+        self.hand_contact_last_update = None
 
     def _draw_fitted_button_label(self, painter, rect, text, base_size=10, min_size=7,
                                   weight=QFont.DemiBold, inset=4):
@@ -15337,10 +15898,6 @@ class SpatialDesktop(QWidget):
             return f"{value:.2f}s"
         if name == "custom_gesture_tolerance":
             return f"{value:.2f}"
-        if name == "hand_contact_band_ratio":
-            return f"{value:.2f} PALM"
-        if name == "palm_attract_acceleration":
-            return f"{value:.2f}x"
         if name in ("skin_tone_darkness", "hand_transparency", "scroll_backdrop_opacity",
                     "detached_notice_opacity", "ui_font_scale"):
             return f"{value:.0f}%"
@@ -15428,79 +15985,89 @@ class SpatialDesktop(QWidget):
                 painter.drawText(text_rect, Qt.AlignLeft | Qt.AlignVCenter, text)
                 yy += line_h
 
-    def _update_hand_contact_display(self):
-        """Let nearly touching fingertips of the two drawn hands touch (see hand_contact).
+    def _hand_display_pinch_alignment(self, side, raw_points, display_points, scale):
+        """Correct display-only smoothing from the rigid palm, not moving tips.
 
-        Works in the drawn hands' screen space, with the same mapping as
-        _paint_hand_skeleton, and stores the result as display landmarks only.
+        The former thumb/index-midpoint alignment shifted the *entire hand* as
+        the thumb approached the index finger. Wrist/knuckle alignment avoids
+        this pose-dependent translation for the flat, glow and mesh renderers.
         """
-        style = getattr(self, "hand_render_style", "flat")
-        if style not in ("3d", "flat", "glow"):
-            return
-        displays = getattr(self, "hand_display_positions", {})
-        screen, palms, scales = {}, {}, {}
-        for side in ("left", "right"):
-            points = self.hand_positions.get(side)
-            display = displays.get(side)
-            if not points or len(points) < 21 or display is None or display[0] is not points:
-                return
-            shown = display[1]
-            origin, user_scale = self._hand_visual_transform(points, side)
-            if self.side_cursor_positions.get(side) is not None:
-                off_x, off_y = self.hand_draw_offset.get(side, (0.0, 0.0))
-            else:
-                off_x = off_y = 0.0
-            pts = []
-            for p in shown[:21]:
-                q = self.interactive_visual_point(p[0], p[1])
-                x, y = scale_hand_point((q.x(), q.y()), (origin.x(), origin.y()), user_scale)
-                pts.append((x+off_x, y+off_y))
-            palm = math.hypot(pts[9][0]-pts[0][0], pts[9][1]-pts[0][1])
-            screen[side] = pts
-            palms[side] = palm*self._landmark_foreshortening(shown, 0, 9)
-            scales[side] = user_scale
-        thickness = min(10.0, max(0.8, float(getattr(self, "finger_thickness", 4.24))))/4.24
-        offsets = hand_contact_offsets(screen["left"], screen["right"], palms["left"], palms["right"],
-                                       "flat" if style == "glow" else style, thickness)
-        # These landmarks are already in primary-screen coordinates. Use the same
-        # physical screen dimensions for the contact correction; QWidget.height()
-        # can reflect Qtile's reserved work area and truncate the lower screen band.
-        contact_geometry = self._interaction_screen_geometry()
-        contact_width = contact_geometry.width() if contact_geometry is not None else self.width()
-        contact_height = contact_geometry.height() if contact_geometry is not None else self.height()
-        px_x = max(1.0, contact_width-1)/0.60
-        px_y = max(1.0, contact_height-1)/0.68
-        for side in ("left", "right"):
-            moves = offsets.get(side)
-            if not moves:
-                continue
-            points, shown = displays[side]
-            adjusted = list(shown)
-            for index, (dx, dy) in moves.items():
-                p = adjusted[index]
-                nx = p[0] + dx/(px_x*scales[side])
-                ny = p[1] + dy/(px_y*scales[side])
-                adjusted[index] = (nx, ny) + tuple(p[2:])
-            displays[side] = (points, adjusted)
+        if (side not in ("left", "right") or not raw_points or not display_points or
+                len(raw_points) < 21 or len(display_points) < 21 or
+                raw_points is display_points):
+            return 0.0, 0.0
+        try:
+            indices_weights = ((0, 0.26), (5, 0.20), (9, 0.24), (13, 0.17), (17, 0.13))
+            def centroid(points):
+                mapped = {i: self.interactive_visual_point(points[i][0], points[i][1])
+                          for i, _w in indices_weights}
+                return (sum(mapped[i].x() * w for i, w in indices_weights),
+                        sum(mapped[i].y() * w for i, w in indices_weights))
+            rx, ry = centroid(raw_points)
+            dx, dy = centroid(display_points)
+            return (rx-dx)*scale, (ry-dy)*scale
+        except (TypeError, ValueError, IndexError, AttributeError):
+            return 0.0, 0.0
 
     def _hand_visual_transform(self, points, side=None):
-        """Return one consistent fixed-scale transform for landmarks and the TPI.
+        """Return a stable palm pivot and one uniform hand/finger scale.
 
-        The user-selected scale never changes with hand proximity. When the two hands
-        are touching, both share one pivot (see _update_hand_scale_origins).
+        A live index-fingertip pivot pulls the entire wrist/palm down when
+        pinching. The wrist/index-knuckle pivot follows hand translation and
+        rotation, not the thumb/index articulation.
         """
-        visual_scale = min(1.0, max(0.1, float(
-            getattr(self, "hand_contact_scales", {}).get(
-                side, getattr(self, "hand_visual_scale", 0.3)))))
+        visual_scale = min(1.0, max(0.1, float(getattr(self, "hand_visual_scale", 0.3))))
         if not points or len(points) < 21:
             return QPointF(0.0, 0.0), visual_scale
         origin = self.hand_scale_origins.get(side) if side is not None else None
         if origin is None:
-            origin = self.interactive_visual_point(points[0][0], points[0][1])
+            # Calibration/first paint can occur before the per-frame cache.
+            origin = self.interactive_visual_point(
+                *_freehand_palm_index_origin(points))
         return QPointF(origin), visual_scale
 
+    def _hybrid_hand_screen_joints(self, side, raw_points, display_points=None,
+                                   cursor_offset=(0.0, 0.0)):
+        """Draw every bone and its movement using the SAME palm-anchored scale.
+
+        Display-only smoothing can affect fingers and palm at different rates.
+        Align the *display palm* with the raw palm as a rigid translation,
+        then uniformly scale all 21 joints. Crucially, never align by fingertip
+        8: it bends during a pinch and previously moved the whole hand down.
+        """
+        if not raw_points or len(raw_points) < 21:
+            return {}
+        display_points = display_points if display_points is not None else raw_points
+        if len(display_points) < 21:
+            display_points = raw_points
+        raw_origin, scale = self._hand_visual_transform(raw_points, side)
+        # Display smoothing may lag the *palm*. Compensate only that common
+        # translation; do not pick another pivot from the display index MCP.
+        # Doing so would reintroduce a whole-hand jump when it curls in a pinch.
+        if display_points is raw_points:
+            palm_dx = palm_dy = 0.0
+        else:
+            raw_centre, _ = self._palm_screen_geometry(raw_points)
+            display_centre, _ = self._palm_screen_geometry(display_points)
+            palm_dx = raw_centre[0]-display_centre[0]
+            palm_dy = raw_centre[1]-display_centre[1]
+        base_x = raw_origin.x() + float(cursor_offset[0])
+        base_y = raw_origin.y() + float(cursor_offset[1])
+        joints = {}
+        for i, entry in enumerate(display_points[:21]):
+            q = self.interactive_visual_point(entry[0], entry[1])
+            joints[i] = (base_x + (q.x()+palm_dx-raw_origin.x())*scale,
+                         base_y + (q.y()+palm_dy-raw_origin.y())*scale)
+        return joints
+
     def _scale_hand_tli_point(self, cursor, points=None, side=None):
-        """Transform the actual interaction point with the same origin/scale as the hand."""
+        """Transform the TPI with the same palm pivot and scale as the fingers.
+
+        Without a stored palm-relative calibration the input is the real index
+        tip. Its articulation is now scaled *like the visible finger* instead
+        of being restored to 100% screen movement and dragging the whole hand.
+        Gesture recognition itself continues to use original camera landmarks.
+        """
         if cursor is None:
             return None
         if points is None:
@@ -15508,7 +16075,8 @@ class SpatialDesktop(QWidget):
         if not points or len(points) < 21:
             return QPointF(cursor)
         origin, visual_scale = self._hand_visual_transform(points, side)
-        x, y = scale_hand_point((cursor.x(), cursor.y()), (origin.x(), origin.y()), visual_scale)
+        x, y = scale_hand_point((cursor.x(), cursor.y()),
+                                (origin.x(), origin.y()), visual_scale)
         # Clamp to the physical screen, not the Qtile work area. On Linux the reserved
         # top/bottom bars are outside availableGeometry(), but are still valid targets.
         geometry = self._interaction_screen_geometry()
@@ -15649,13 +16217,15 @@ class SpatialDesktop(QWidget):
                 display is not None and display[0] is source_points):
             points = display[1]
 
-        origin, visual_scale = self._hand_visual_transform(source_points, side)
+        if self.side_cursor_positions.get(side) is not None:
+            cursor_offset = self.hand_draw_offset.get(side, (0.0, 0.0))
+        else:
+            cursor_offset = (0.0, 0.0)
+        visual_joints = self._hybrid_hand_screen_joints(
+            side, source_points, points, cursor_offset)
 
         def mapped(index):
-            q = self.interactive_visual_point(points[index][0], points[index][1])
-            x, y = scale_hand_point((q.x(), q.y()),
-                                    (origin.x(), origin.y()), visual_scale)
-            return QPointF(x, y)
+            return QPointF(*visual_joints[index])
 
         # Centre the mark on the palm rather than on the TLI, which is deliberately
         # hidden while disabled. Use the same transformed landmarks as the hand mesh.
@@ -15695,42 +16265,29 @@ class SpatialDesktop(QWidget):
         """
         if not points or len(points) < 21:
             return
-        scale_origin, user_scale = self._hand_visual_transform(points, side)
+        _scale_origin, user_scale = self._hand_visual_transform(points, side)
         projection_scale = self._hand_projection_scale(points, side)
         width_scale = user_scale*projection_scale
 
-        # Follow the smoothed TLI (see update_scene) so the TLI never drifts off the
-        # thumb/index gap while the hand moves; no offset when the hand has no TLI.
+        # The palm is independent of TPI smoothing while fingers articulate.
         if side in ("left", "right") and self.side_cursor_positions.get(side) is not None:
-            off_x, off_y = getattr(self, "hand_draw_offset", {}).get(side, (0.0, 0.0))
+            cursor_offset = getattr(self, "hand_draw_offset", {}).get(side, (0.0, 0.0))
         else:
-            off_x = off_y = 0.0
+            cursor_offset = (0.0, 0.0)
 
-        def sp(index):
-            q = self.interactive_visual_point(points[index][0], points[index][1])
-            x, y = scale_hand_point((q.x(), q.y()), (scale_origin.x(), scale_origin.y()), user_scale)
-            return QPointF(x+off_x, y+off_y)
-
-        # Flat, 3D and glowing hands tuck fingertips that the camera cannot see, instead
-        # of MediaPipe's guess; the skeleton style keeps showing the raw tracking.
         style = getattr(self, "hand_render_style", "flat")
-        display = getattr(self, "hand_display_positions", {}).get(side) if side in ("left", "right") else None
+        display = (getattr(self, "hand_display_positions", {}).get(side)
+                   if side in ("left", "right") else None)
+        raw_points = points
         if display is not None and display[0] is points:
             if style == "skeleton":
                 points = self.hand_stable_positions.get(side) or points
             else:
                 points = display[1]
-
-        joints = {i: sp(i) for i in range(21)}
-        # Rendering is user-scaled, recognition is always camera-space. When
-        # camera landmarks say the fingertips actually touch, close residual
-        # smoothed visual gaps as well, so the user sees the contact that fired.
-        if side in ("left", "right") and _real_thumb_index_gap(
-                getattr(self, "hand_positions", {}).get(side)) <= 0.18:
-            shared = QPointF((joints[4].x()+joints[8].x())*0.5,
-                             (joints[4].y()+joints[8].y())*0.5)
-            joints[4] = QPointF(shared)
-            joints[8] = QPointF(shared)
+        screen_joints = self._hybrid_hand_screen_joints(
+            side, raw_points, points, cursor_offset)
+        joints = {i: QPointF(*xy) for i, xy in screen_joints.items()}
+        # No cross-hand attraction and no artificial joint snapping on contact.
         painter.save()
         painter.setOpacity(painter.opacity() * min(1.0, max(0.10, float(getattr(self, "hand_transparency", 50.0)) / 100.0)))
         darkness = min(1.0, max(0.0, float(getattr(self, "skin_tone_darkness", -50.0))/100.0))
@@ -16922,6 +17479,12 @@ class SpatialDesktop(QWidget):
                 _real_thumb_index_gap(landmarks) > 0.18):
             self._pinch_pose_confirm_frames[side] = 0
             return False
+        # At low camera FPS a brief, unmistakable physical contact can last
+        # fewer than two frames. The fist guard above still applies, and only
+        # direct thumb/index contact (not TPI overlap) qualifies immediately.
+        if _real_thumb_index_gap(landmarks) <= 0.16:
+            self._pinch_pose_confirm_frames[side] = 2
+            return True
         self._pinch_pose_confirm_frames[side] = min(
             2, self._pinch_pose_confirm_frames[side] + 1)
         return self._pinch_pose_confirm_frames[side] >= 2
@@ -18355,6 +18918,9 @@ class SpatialDesktop(QWidget):
                 if side in hands_by_side else []
                 for side in ("left", "right")
             }
+            # The calibration overlay also paints the live hand. Refresh its
+            # palm pivot here instead of reusing the previous normal-mode frame.
+            self._update_hand_scale_origins(hands_by_side)
             self.tli_overrides = {}
             self.active_push_sides = set()
             self.pointer_side = None
@@ -18391,8 +18957,8 @@ class SpatialDesktop(QWidget):
                 window.set_phase("Hand not detected — show the hand and pinch on the highlighted target", 0)
                 window.set_hand_overlay([], [])
 
-        # Pointer and TLI share one transformed anchor: the calibrated palm-relative point
-        # where available, otherwise the live thumb/index fingertip midpoint.
+        # Pointer and TLI share the same palm-anchored transform as the hand:
+        # a calibrated local point when available, otherwise the scaled index tip.
         for side, (landmarks, _score) in hands_by_side.items():
             self.hand_positions[side] = [(float(lm.x), float(lm.y), float(lm.z)) for lm in landmarks]
             was_missing = self.hand_missing_since.get(side)
@@ -18400,13 +18966,11 @@ class SpatialDesktop(QWidget):
             mapped_anchor = self._scale_hand_tli_point(
                 self.interactive_hand_anchor(landmarks, side), self.hand_positions[side], side)
             cursor = self._smooth_cursor(side, mapped_anchor, now)
-            # The TLI is smoothed; draw the hand with the same offset so it moves with
-            # the TLI and the TLI stays on the same spot between thumb and index finger.
-            dx, dy = cursor.x()-mapped_anchor.x(), cursor.y()-mapped_anchor.y()
-            lag = math.hypot(dx, dy)
-            if lag > 90.0:  # a jump (re-acquired hand): don't drag the hand far behind
-                dx, dy = dx*90.0/lag, dy*90.0/lag
-            self.hand_draw_offset[side] = (dx, dy)
+            # The TPI's cursor smoothing follows finger articulation. Applying
+            # that residual as a translation to the entire drawn hand makes the
+            # wrist and palm slide when thumb and index close. Keep the palm at
+            # its rigid tracked origin instead of following fingertip lag.
+            self.hand_draw_offset[side] = (0.0, 0.0)
             # Stabilise the drawn shape, not the camera data used for gestures,
             # cursor tracking or the existing two-hand contact calibration.
             stable_pair = self._stabilised_hand_cache.get(side)
@@ -18685,7 +19249,8 @@ class SpatialDesktop(QWidget):
                 "fingers_closed": fingers_closed_pose(landmarks, edge_tolerant),
             }
 
-        self._update_hand_contact_display()
+        # Each hand is anchored independently at its own stable palm projection.
+        # No inter-hand magnetism or fingertip pull is applied to the display.
 
         # Publish camera-derived relative reach to the separate Spatial Workspace.
         # Reuse the *actual calibrated TPI* and existing effective pinch state,
@@ -20983,7 +21548,7 @@ class SpatialDesktop(QWidget):
                             painter.setPen(QColor(205, 235, 242))
                             self._draw_wrapped_fitted_text(
                                 painter, help_rect,
-                                "Select a row to choose a sound from assets/sounds. Add WAV, OGG, MP3, FLAC or AIFF files to populate the lists. Changes save automatically.",
+                                "Select a row to choose a sound, then use Preview to hear it. Add WAV, OGG, MP3, FLAC or AIFF files to assets/sounds. Changes save automatically.",
                                 base_size=max(7, int(8*scale)), min_size=6)
 
                     elif self.settings_page == "notifications":
